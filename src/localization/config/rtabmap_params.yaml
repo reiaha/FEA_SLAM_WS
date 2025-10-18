@@ -1,0 +1,19 @@
+rtabmap:
+  ros__parameters:
+    frame_id: base_link
+    odom_frame_id: odom
+    map_frame_id: map
+    subscribe_scan: true
+    subscribe_odom_info: true
+    scan_topic: /scan_fused
+    odom_topic: /odom
+    use_sim_time: false
+    approx_sync: true
+    RGBD/LoopClosureReextractFeatures: false
+    RGBD/NeighborLinkRefining: true
+    Grid/RangeMin: 0.1
+    Grid/RangeMax: 8.0
+    Grid/CellSize: 0.05
+    Grid/DepthDecimation: 1
+    Optimizer/Strategy: 1        # G2O optimization
+    Reg/Strategy: 1              # ICP-based registration
