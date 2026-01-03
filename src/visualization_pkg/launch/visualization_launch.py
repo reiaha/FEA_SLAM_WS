@@ -13,7 +13,7 @@ def generate_launch_description():
             package='rviz2',
             executable='rviz2',
             name='rviz2',
-            argurments=['-d', '/home/pi/FEA_SLAM_WS/src/visualization_pkg/config/visualization.rviz'],
+            arguments=['-d', '/home/pi/FEA_SLAM_WS/src/visualization_pkg/config/visualization.rviz'],
             output='screen'
         ),
     ])
