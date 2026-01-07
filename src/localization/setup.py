@@ -26,6 +26,9 @@ setup(
     entry_points={
         'console_scripts': [
             'sensor_fusion = localization.sensor_fusion:main',
+            'arduino_motor_bridge = localization.arduino_motor_bridge:main',
+            'frontier_detector = localization.frontier_detector:main',
+            'exploration_coordinator = localization.exploration_coordinator:main',
         ],
     },
 )
