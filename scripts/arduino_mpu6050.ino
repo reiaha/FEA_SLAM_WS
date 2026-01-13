@@ -11,15 +11,17 @@
   
   Data Format (CSV):
   ax,ay,az,gx,gy,gz,distance,motorA,motorB
+  
+  Library Required: Adafruit MPU6050
+  Install via: Sketch -> Include Library -> Manage Libraries -> "Adafruit MPU6050"
 */
 
 #include <Wire.h>
-#include <MPU6050.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // MPU-6050 Configuration
-MPU6050 mpu;
-const float ACCEL_SCALE = 16384.0;  // For ±2g
-const float GYRO_SCALE = 131.0;     // For ±250 deg/s
+Adafruit_MPU6050 mpu;
 
 // Calibrated offsets (near 0)
 float gx_offset = -2.8;
@@ -56,22 +58,18 @@ void setup() {
   Serial.begin(115200);
   delay(2000);
   
-  // Initialize I2C
-  Wire.begin();
-  Wire.setClock(400000);
-  
   // Initialize MPU-6050
-  if (!mpu.begin(MPU6050_SCALE_2000DPS, MPU6050_RANGE_2G)) {
+  if (!mpu.begin()) {
     Serial.println("MPU6050 init failed!");
-    while(1);
+    while(1) {
+      delay(100);
+    }
   }
   
   // Configure MPU-6050
-  mpu.setClockSource(MPU6050_CLOCK_PLL_XGYRO);
-  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-  mpu.setDLPFMode(MPU6050_DLPF_BW_256);
-  mpu.setRate(49);  // ~50Hz
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   
   delay(100);
   
@@ -107,17 +105,19 @@ void loop() {
   }
   
   // Read IMU
-  Vector rawAccel = mpu.getRawAcceleration();
-  Vector rawGyro = mpu.getRawRotation();
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
   
-  // Convert to m/s² and deg/s with calibration offsets
-  float ax = (rawAccel.XAxis / ACCEL_SCALE) + ax_offset;
-  float ay = (rawAccel.YAxis / ACCEL_SCALE) + ay_offset;
-  float az = (rawAccel.ZAxis / ACCEL_SCALE) + az_offset;
+  // Apply calibration offsets
+  // Acceleration in m/s²
+  float ax = a.acceleration.x + ax_offset;
+  float ay = a.acceleration.y + ay_offset;
+  float az = a.acceleration.z + az_offset;
   
-  float gx = (rawGyro.XAxis / GYRO_SCALE) + gx_offset;
-  float gy = (rawGyro.YAxis / GYRO_SCALE) + gy_offset;
-  float gz = (rawGyro.ZAxis / GYRO_SCALE) + gz_offset;
+  // Gyro in deg/s (converted from rad/s to deg/s)
+  float gx = (g.gyro.x * 57.2958) + gx_offset;
+  float gy = (g.gyro.y * 57.2958) + gy_offset;
+  float gz = (g.gyro.z * 57.2958) + gz_offset;
   
   // Read Ultrasonic
   float distance = readUltrasonic();

@@ -58,12 +58,13 @@ ls -la /dev/ttyUSB0
 
 ### Step 5: Source ROS2 Setup
 ```bash
-cd /home/pi/FEA_SLAM_WS
-source install/setup.bash
+source /opt/ros/humble/setup.bash
+source /home/pi/FEA_SLAM_WS/install/setup.bash
 
 # Verify setup
-echo $ROS_PACKAGE_PATH | grep FEA_SLAM_WS
-# Should show path containing FEA_SLAM_WS
+echo $AMENT_PREFIX_PATH | tr ':' '\n' | grep FEA_SLAM_WS
+ros2 pkg list | grep -E 'fea_slam|localization'
+# Note: ROS_PACKAGE_PATH can be empty on ROS2; AMENT_PREFIX_PATH is the one to check
 ```
 
 ### Step 6: Verify Build Status
@@ -93,10 +94,13 @@ date
 #### Setup
 ```bash
 # Open terminal
-cd /dev
+ls -l /dev/ttyACM*
 
-# Start serial monitor
-screen /dev/ttyACM0 115200
+# Start serial monitor (sudo avoids dialout permission issues)
+sudo screen /dev/ttyACM0 115200
+
+# If screen immediately terminates, quick fallback to confirm data:
+# sudo cat /dev/ttyACM0 | head
 ```
 
 #### What You'll See
@@ -166,7 +170,7 @@ ros2 topic hz /scan
 
 #### Terminal 3: View Scan Data
 ```bash
-ros2 topic echo /scan --rate=1 | head -30
+ros2 topic echo /scan | head -30
 
 # Expected output (first few lines):
 # header:
@@ -298,7 +302,7 @@ ros2 launch fea_slam robot_full.launch.py exploration:=false
 #### Terminal 2: Monitor IMU Data
 ```bash
 # Subscribe to IMU data
-ros2 topic echo /imu/data_raw --rate=5
+ros2 topic echo /imu/data_raw
 
 # You'll see (update every ~200ms with --rate=5):
 # linear_acceleration:
@@ -544,7 +548,7 @@ Very large (20×20m):    25-40 minutes
 
 **Terminal 2: Watch Frontiers**
 ```bash
-ros2 topic echo /frontiers --rate=1
+ros2 topic echo /frontiers
 
 # You'll see MarkerArray with sphere data:
 # markers:
@@ -560,7 +564,7 @@ ros2 topic echo /frontiers --rate=1
 
 **Terminal 3: Watch Current Goal**
 ```bash
-ros2 topic echo /current_frontier_goal --rate=1
+ros2 topic echo /current_frontier_goal
 
 # Shows which frontier robot is heading toward:
 # point:
@@ -596,7 +600,7 @@ ros2 topic hz /map
 #### What to Verify
 ```bash
 # Monitor frontiers during exploration
-ros2 topic echo /frontiers --rate=2
+ros2 topic echo /frontiers
 
 # For each frontier sphere:
 # ✅ Position is at boundary of known/unknown map
@@ -658,7 +662,7 @@ Troubleshooting:
 ```bash
 # After exploration (or let it run 10 minutes):
 
-ros2 topic echo /map --rate=1 | head -1000 > /tmp/map_data.txt
+ros2 topic echo /map | head -1000 > /tmp/map_data.txt
 
 # Count map cells:
 # - Unknown cells (< 50): to explore

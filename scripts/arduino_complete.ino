@@ -1,5 +1,5 @@
 /*
-  Complete Arduino Code for FEA-SLAM Robot
+  Complete Arduino Code for FEA-SLAM Robota
   
   Sensors:
   - MPU-6050 IMU (I2C: SDA=A4, SCL=A5)
@@ -11,15 +11,17 @@
   
   Data Format (CSV):
   ax,ay,az,gx,gy,gz,distance,motorA,motorB
+  
+  Library Required: Adafruit MPU6050
+  Install via: Sketch -> Include Library -> Manage Libraries -> "Adafruit MPU6050"
 */
 
 #include <Wire.h>
-#include <MPU6050.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
 // MPU-6050 Configuration
-MPU6050 mpu;
-const float ACCEL_SCALE = 16384.0;  // For ±2g
-const float GYRO_SCALE = 131.0;     // For ±250 deg/s
+Adafruit_MPU6050 mpu;
 
 // Calibrated offsets (near 0)
 float gx_offset = -2.8;
@@ -30,19 +32,22 @@ float ay_offset = 0.0;
 float az_offset = 0.0;
 
 // Ultrasonic Sensor Pins
-const int TRIG_PIN = 8;
-const int ECHO_PIN = 9;
+const int TRIG_PIN = A0;
+const int ECHO_PIN = A1;
 
 // Motor Control Pins
 // Motor A (Left)
-const int MOTOR_A_IN1 = 2;
-const int MOTOR_A_IN2 = 3;
-const int MOTOR_A_PWM = 5;
+const int MOTOR_A_IN1 = 4;   // AIN1
+const int MOTOR_A_IN2 = 5;   // AIN2
+const int MOTOR_A_PWM = 6;   // PWMA
 
 // Motor B (Right)
-const int MOTOR_B_IN1 = 4;
-const int MOTOR_B_IN2 = 7;
-const int MOTOR_B_PWM = 6;
+const int MOTOR_B_IN1 = 8;   // BIN1 (CORRECTED)
+const int MOTOR_B_IN2 = 7;   // BIN2 (CORRECTED)
+const int MOTOR_B_PWM = 11;  // PWMB
+
+// TB6612FND Standby Pin (CRITICAL - must be HIGH to enable driver)
+const int MOTOR_STBY = 3;
 
 // Motor speed variables
 int motorA_speed = 0;
@@ -52,44 +57,53 @@ int motorB_speed = 0;
 String inputBuffer = "";
 const char COMMAND_DELIMITER = '\n';
 
+// Global flag to track if IMU is working
+bool imu_initialized = false;
+
 void setup() {
   Serial.begin(115200);
   delay(2000);
   
-  // Initialize I2C
-  Wire.begin();
-  Wire.setClock(400000);
-  
-  // Initialize MPU-6050
-  if (!mpu.begin(MPU6050_SCALE_2000DPS, MPU6050_RANGE_2G)) {
-    Serial.println("MPU6050 init failed!");
-    while(1);
-  }
-  
-  // Configure MPU-6050
-  mpu.setClockSource(MPU6050_CLOCK_PLL_XGYRO);
-  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-  mpu.setDLPFMode(MPU6050_DLPF_BW_256);
-  mpu.setRate(49);  // ~50Hz
-  
-  delay(100);
-  
-  // Initialize Ultrasonic
-  pinMode(TRIG_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-  
-  // Initialize Motor Control Pins
+  // Initialize Motor Control Pins FIRST (before MPU attempt)
   pinMode(MOTOR_A_IN1, OUTPUT);
   pinMode(MOTOR_A_IN2, OUTPUT);
   pinMode(MOTOR_A_PWM, OUTPUT);
   pinMode(MOTOR_B_IN1, OUTPUT);
   pinMode(MOTOR_B_IN2, OUTPUT);
   pinMode(MOTOR_B_PWM, OUTPUT);
+  pinMode(MOTOR_STBY, OUTPUT);
+  digitalWrite(MOTOR_STBY, HIGH);  // Enable motor driver immediately
+  
+  // Initialize Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
   
   // Stop motors at startup
   stopMotors();
   
+  // Try to Initialize MPU-6050 (non-blocking - continue if fails)
+  Serial.print("Initializing MPU6050...");
+  int mpu_retries = 3;
+  while (mpu_retries > 0 && !imu_initialized) {
+    if (mpu.begin()) {
+      // Configure MPU-6050
+      mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+      mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+      mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+      imu_initialized = true;
+      Serial.println(" OK");
+    } else {
+      mpu_retries--;
+      Serial.print(".");
+      delay(500);
+    }
+  }
+  
+  if (!imu_initialized) {
+    Serial.println(" FAILED - Motors still operational");
+  }
+  
+  delay(100);
   Serial.println("IMU-Motor-Ultrasonic System Ready");
 }
 
@@ -106,18 +120,24 @@ void loop() {
     }
   }
   
-  // Read IMU
-  Vector rawAccel = mpu.getRawAcceleration();
-  Vector rawGyro = mpu.getRawRotation();
+  // Read IMU only if initialized
+  float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
   
-  // Convert to m/s² and deg/s with calibration offsets
-  float ax = (rawAccel.XAxis / ACCEL_SCALE) + ax_offset;
-  float ay = (rawAccel.YAxis / ACCEL_SCALE) + ay_offset;
-  float az = (rawAccel.ZAxis / ACCEL_SCALE) + az_offset;
-  
-  float gx = (rawGyro.XAxis / GYRO_SCALE) + gx_offset;
-  float gy = (rawGyro.YAxis / GYRO_SCALE) + gy_offset;
-  float gz = (rawGyro.ZAxis / GYRO_SCALE) + gz_offset;
+  if (imu_initialized) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    
+    // Apply calibration offsets
+    // Acceleration in m/s²
+    ax = a.acceleration.x + ax_offset;
+    ay = a.acceleration.y + ay_offset;
+    az = a.acceleration.z + az_offset;
+    
+    // Gyro in deg/s (converted from rad/s to deg/s)
+    gx = (g.gyro.x * 57.2958) + gx_offset;
+    gy = (g.gyro.y * 57.2958) + gy_offset;
+    gz = (g.gyro.z * 57.2958) + gz_offset;
+  }
   
   // Read Ultrasonic
   float distance = readUltrasonic();
