@@ -1,0 +1,637 @@
+/*
+  Arduino Motor Bridge for FEA-SLAM Robot (ROS2 Compatible)
+  
+  This code provides a MOTOR BRIDGE for ROS2 control:
+  - Receives motor commands via serial (MOTOR:speedA,speedB)
+  - Receives servo commands via serial (SERVO:angle)
+  - Publishes IMU data via CSV to ROS2
+  - Publishes ultrasonic readings via CSV to ROS2
+  
+  ALL AUTONOMOUS LOGIC IS IN ROS2 (frontier_detector, exploration_coordinator, ultrasonic_explorer)
+  Arduino ONLY handles: Motors, Servo, Sensor Data Publishing
+*/
+
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <Servo.h>
+
+// ============= MPU-6050 IMU Configuration =============
+Adafruit_MPU6050 mpu;
+bool imu_initialized = false;
+
+// Calibrated offsets (adjust based on your hardware calibration)
+float gx_offset = -2.8;
+float gy_offset = -1.4;
+float gz_offset = -1.1;
+float ax_offset = 0.0;
+float ay_offset = 0.0;
+float az_offset = 0.0;
+
+// ============= Ultrasonic Sensor Configuration =============
+const int TRIG_PIN = A0;
+const int ECHO_PIN = A1;
+
+// ============= Servo Configuration =============
+const int SERVO_PIN = 10;
+Servo ultrasonic_servo;
+int servo_angle = 80;  // Current angle (0-180)
+int servo_target_angle = 80;  // Target angle for slow movement
+unsigned long last_servo_move = 0;
+const int SERVO_MOVE_DELAY = 20;  // milliseconds between 1-degree steps
+const bool SERVO_INVERT = false;  // Set to true if servo turns opposite direction
+
+// ============= Motor Control Configuration =============
+// Motor A (Left)
+const int MOTOR_A_IN1 = 4;
+const int MOTOR_A_IN2 = 5;
+const int MOTOR_A_PWM = 6;
+
+// Motor B (Right)
+const int MOTOR_B_IN1 = 8;
+const int MOTOR_B_IN2 = 7;
+const int MOTOR_B_PWM = 11;
+
+// Standby pin
+const int MOTOR_STBY = 3;
+
+// Current motor speeds
+int motorA_speed = 0;
+int motorB_speed = 0;
+
+// ============= Serial Communication =============
+String inputBuffer = "";
+const char COMMAND_DELIMITER = '\n';
+
+int mapServoAngle(int logical_angle) {
+  int clamped = constrain(logical_angle, 0, 180);
+  return SERVO_INVERT ? (180 - clamped) : clamped;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+  
+  // Initialize Motor Control Pins FIRST (before MPU attempt)
+  pinMode(MOTOR_A_IN1, OUTPUT);
+  pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_A_PWM, OUTPUT);
+  pinMode(MOTOR_B_IN1, OUTPUT);
+  pinMode(MOTOR_B_IN2, OUTPUT);
+  pinMode(MOTOR_B_PWM, OUTPUT);
+  pinMode(MOTOR_STBY, OUTPUT);
+  digitalWrite(MOTOR_STBY, HIGH);  
+  
+  // Initialize Ultrasonic
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  
+  // Initialize Servo
+  ultrasonic_servo.attach(SERVO_PIN);
+  ultrasonic_servo.write(mapServoAngle(90));  // Start at 90 degrees (center)
+  
+  // Stop motors at startup
+  stopMotors();
+  
+  // Try to Initialize MPU-6050 (non-blocking - continue if fails)
+  // I2C Device Scanner (diagnostic - won't block motor operation)
+  Serial.println("\n[DIAGNOSTIC] I2C Device Scan:");
+  int i2c_found = 0;
+  for (byte i = 1; i < 127; i++) {
+    Wire.beginTransmission(i);
+    byte error = Wire.endTransmission();
+    if (error == 0) {
+      Serial.print("  Device at 0x");
+      Serial.print(i, HEX);
+      Serial.println(" (found)");
+      i2c_found++;
+    }
+    delayMicroseconds(10);  // Small delay to prevent I2C bus issues
+  }
+  if (i2c_found == 0) {
+    Serial.println("  [WARNING] No I2C devices found!");
+  }
+  Serial.println("");
+  
+  Serial.print("Initializing MPU6050...");
+  int mpu_retries = 10;
+  while (mpu_retries > 0 && !imu_initialized) {
+    if (mpu.begin()) {
+      // Configure MPU-6050
+      mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+      mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+      mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+      imu_initialized = true;
+      Serial.println(" OK");
+    } else {
+      mpu_retries--;
+      Serial.print(".");
+      delay(500);
+    }
+  }
+  
+  if (!imu_initialized) {
+    Serial.println(" FAILED - Motors still operational");
+  }
+  
+  delay(100);
+  Serial.println("IMU-Motor-Ultrasonic System Ready");
+}
+
+void loop() {
+  // Check for incoming serial commands (non-blocking)
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == COMMAND_DELIMITER) {
+      // Process complete command
+      processCommand(inputBuffer);
+      inputBuffer = "";
+    } else {
+      inputBuffer += c;
+    }
+  }
+  
+  // --- IMU Data Acquisition and CSV Output (as in your previous code) ---
+  float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+  if (imu_initialized) {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    ax = a.acceleration.x + ax_offset;
+    ay = a.acceleration.y + ay_offset;
+    az = a.acceleration.z + az_offset;
+    gx = (g.gyro.x * 57.2958) + gx_offset;
+    gy = (g.gyro.y * 57.2958) + gy_offset;
+    gz = (g.gyro.z * 57.2958) + gz_offset;
+  }
+  // Read Ultrasonic for CSV output
+  float distance_csv = readUltrasonic();
+  // DIAGNOSTIC: Print ultrasonic distance in real-time
+  Serial.print("DISTANCE:");
+  Serial.println(distance_csv);
+  // Send data as CSV
+  Serial.print(ax, 4); Serial.print(",");
+  Serial.print(ay, 4); Serial.print(",");
+  Serial.print(az, 4); Serial.print(",");
+  Serial.print(gx, 4); Serial.print(",");
+  Serial.print(gy, 4); Serial.print(",");
+  Serial.print(gz, 4); Serial.print(",");
+  Serial.print(distance_csv, 2); Serial.print(",");
+  Serial.print(motorA_speed); Serial.print(",");
+  Serial.println(motorB_speed);
+
+  // --- Reference Logic: Sweep, Find Closest, Decide ---
+  float minDistance = 999;
+  int obstacleAngle = 90;
+  float maxDistance = 0;
+  int clearestAngle = SWEEP_MIN_ANGLE;
+  // Sweep left to right, find the closest obstacle and the clearest (farthest) direction
+  for (int angle = SWEEP_MIN_ANGLE; angle <= SWEEP_MAX_ANGLE; angle += SWEEP_STEP) {
+    ultrasonic_servo.write(mapServoAngle(angle));
+    delay(100); // Allow servo to move and echo to settle
+    float distance = readUltrasonic();
+    Serial.print("Angle: "); Serial.print(angle);
+    Serial.print("  Distance: "); Serial.println(distance);
+    if (distance > 0 && distance < minDistance) {
+      minDistance = distance;
+      obstacleAngle = angle;
+    }
+    if (distance > maxDistance && distance < 400 && distance > 0) {
+      maxDistance = distance;
+      clearestAngle = angle;
+    }
+  }
+
+  // Obstacle avoidance logic
+  if (minDistance < 40) {
+    Serial.print("Obstacle detected at angle: ");
+    Serial.print(obstacleAngle);
+    Serial.print(" (distance: ");
+    Serial.print(minDistance);
+    Serial.println(" cm), avoiding obstacle.");
+    ultrasonic_servo.write(mapServoAngle(obstacleAngle));
+    delay(200);
+    // Decide avoidance direction: if obstacle is left, turn right; if right, turn left; if center, move backward
+    if (obstacleAngle < 120) {
+      Serial.println("Obstacle left, turning right to avoid.");
+      turnRight(150);
+      delay(500);
+      stopMotors();
+    } else if (obstacleAngle > 150) {
+      Serial.println("Obstacle right, turning left to avoid.");
+      turnLeft(150);
+      delay(500);
+      stopMotors();
+    } else {
+      Serial.println("Obstacle center, moving backward.");
+      moveBackward(150);
+      delay(600);
+      stopMotors();
+    }
+  } else if (maxDistance > 40) {
+    // Move servo to face the clearest direction
+    ultrasonic_servo.write(mapServoAngle(clearestAngle));
+    delay(200);
+    Serial.print("Moving toward clearest direction at angle: ");
+    Serial.print(clearestAngle);
+    Serial.print(" (distance: ");
+    Serial.print(maxDistance);
+    Serial.println(" cm)");
+    // Turn toward clearest direction
+    int steer = (clearestAngle - 135) * 2;
+    int leftSpeed = constrain(150 - steer, 0, 255);
+    int rightSpeed = constrain(150 + steer, 0, 255);
+    setMotors(leftSpeed, rightSpeed);
+    delay(600);
+    stopMotors();
+  } else {
+    Serial.println("No clear path detected, stopping.");
+    stopMotors();
+  }
+  // Return servo to center
+  int returnAngle = (minDistance < 40) ? obstacleAngle : clearestAngle;
+  for (int a = returnAngle; a != 90; a += (returnAngle > 90 ? -1 : 1)) {
+    ultrasonic_servo.write(mapServoAngle(a));
+    delay(10);
+  }
+  ultrasonic_servo.write(mapServoAngle(90));
+  delay(100);
+
+  // --- Send IMU and motor data to Raspberry Pi (CSV) ---
+  Serial.print(ax, 4); Serial.print(",");
+  Serial.print(ay, 4); Serial.print(",");
+  Serial.print(az, 4); Serial.print(",");
+  Serial.print(gx, 4); Serial.print(",");
+  Serial.print(gy, 4); Serial.print(",");
+  Serial.print(gz, 4); Serial.print(",");
+  Serial.print(minDistance, 2); Serial.print(",");
+  Serial.print(motorA_speed); Serial.print(",");
+  Serial.println(motorB_speed);
+}
+
+// Read ultrasonic distance in cm
+float readUltrasonic() {
+  // Send trigger pulse
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  // Measure echo duration
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  
+  // Convert to distance (cm)
+  // Speed of sound = 343 m/s = 0.0343 cm/µs
+  // Distance = (duration * 0.0343) / 2
+  float distance = (duration * 0.0343) / 2.0;
+  
+  // Debug: Log distance reading issues
+  if (duration == 0) {
+    Serial.println("[DEBUG] Ultrasonic: No echo received (timeout)");
+  } else if (distance > 400) {
+    Serial.println("[DEBUG] Ultrasonic: Out of range (>400cm)");
+  }
+  
+  return distance;
+}
+
+// Motor control functions
+void setMotorA(int speed) {
+  motorA_speed = constrain(speed, -255, 255);
+  if (motorA_speed > 0) {
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, HIGH);
+  } else if (motorA_speed < 0) {
+    digitalWrite(MOTOR_A_IN1, HIGH);
+    digitalWrite(MOTOR_A_IN2, LOW);
+  } else {
+    digitalWrite(MOTOR_A_IN1, LOW);
+    digitalWrite(MOTOR_A_IN2, LOW);
+  }
+  analogWrite(MOTOR_A_PWM, abs(motorA_speed));
+}
+
+void setMotorB(int speed) {
+  motorB_speed = constrain(speed, -255, 255);
+  if (motorB_speed > 0) {
+    digitalWrite(MOTOR_B_IN1, LOW);
+    digitalWrite(MOTOR_B_IN2, HIGH);
+  } else if (motorB_speed < 0) {
+    digitalWrite(MOTOR_B_IN1, HIGH);
+    digitalWrite(MOTOR_B_IN2, LOW);
+  } else {
+    digitalWrite(MOTOR_B_IN1, LOW);
+    digitalWrite(MOTOR_B_IN2, LOW);
+  }
+  analogWrite(MOTOR_B_PWM, abs(motorB_speed));
+}
+
+void setMotors(int speedA, int speedB) {
+  setMotorA(speedA);
+  setMotorB(speedB);
+}
+
+void stopMotors() {
+  setMotorA(0);
+  setMotorB(0);
+}
+
+void moveForward(int speed) {
+  setMotors(speed, speed);
+}
+
+void moveBackward(int speed) {
+  setMotors(-speed, -speed);
+}
+
+void turnLeft(int speed) {
+  setMotors(0, speed);
+}
+
+void turnRight(int speed) {
+  setMotors(speed, 0);
+}
+
+// Helper function to update servo position (non-blocking)
+void updateServo() {
+  unsigned long now = millis();
+  if (now - last_servo_move >= SERVO_MOVE_DELAY) {
+    if (servo_angle < servo_target_angle) {
+      servo_angle++;
+      ultrasonic_servo.write(mapServoAngle(servo_angle));
+      last_servo_move = now;
+    } else if (servo_angle > servo_target_angle) {
+      servo_angle--;
+      ultrasonic_servo.write(mapServoAngle(servo_angle));
+      last_servo_move = now;
+    }
+  }
+}
+
+// Wall-follow helpers
+void startWallFollow(int lock_angle) {
+  robot_mode = MODE_FOLLOW;
+  servo_lock_angle = constrain(lock_angle, SWEEP_MIN_ANGLE, SWEEP_MAX_ANGLE);
+  servo_local_dir = 1;
+  servo_target_angle = servo_lock_angle;
+  Serial.println("[FOLLOW] Locking onto obstacle and starting wall-follow");
+}
+
+void stopWallFollow() {
+  robot_mode = MODE_EXPLORE;
+  stopMotors();
+}
+
+void wallFollowStep(float distance) {
+  // If hand is detected (distance in range), track and follow hand
+  if (distance > 10 && distance < GAP_THRESHOLD) {
+    // Steer toward hand: if too close, turn away; if too far, turn toward
+    float error = WALL_TARGET_DISTANCE - distance;
+    int steer = constrain(static_cast<int>(error * 3.0f), -FOLLOW_STEER_LIMIT, FOLLOW_STEER_LIMIT);
+    int left = constrain(FOLLOW_BASE_SPEED + steer, -200, 200);
+    int right = constrain(FOLLOW_BASE_SPEED - steer, -200, 200);
+    setMotors(left, right);
+    // Oscillate servo slightly to keep tracking
+    int min_local = max(SWEEP_MIN_ANGLE, servo_lock_angle - 10);
+    int max_local = min(SWEEP_MAX_ANGLE, servo_lock_angle + 10);
+    servo_target_angle = (servo_local_dir > 0) ? max_local : min_local;
+    if (servo_angle == servo_target_angle) {
+      servo_local_dir *= -1;
+    }
+  } else {
+    // If hand is lost (distance out of range), revert to exploration
+    Serial.println("[FOLLOW] Hand lost, switching to exploration");
+    stopWallFollow();
+    performSweep();
+    int clearest = findClearestDirection();
+    turnTowardsAngle(clearest);
+    moveForward(120);
+    delay(1500);
+    stopMotors();
+  }
+}
+
+// Reference-based: Perform a sweep and find closest object
+void performSweep() {
+  Serial.println("\n[SCAN] Reference sweep: 45-135 deg");
+  stopMotors();
+  scan_count = 0;
+  is_scanning = true;
+  float minDistance = 999;
+  int bestAngle = 90;
+  for (int angle = SWEEP_MIN_ANGLE; angle <= SWEEP_MAX_ANGLE; angle += SWEEP_STEP) {
+    servo_target_angle = angle;
+    while (servo_angle != angle && !Serial.available()) {
+      updateServo();
+      delay(10);
+    }
+    float distance = readUltrasonic();
+    scan_angles[scan_count] = angle;
+    scan_distances[scan_count] = distance;
+    Serial.print("Angle: "); Serial.print(angle);
+    Serial.print("  Distance: "); Serial.println(distance);
+    if (distance > 0 && distance < minDistance) {
+      minDistance = distance;
+      bestAngle = angle;
+    }
+    scan_count++;
+    delay(30);
+  }
+  servo_target_angle = 90;
+  while (servo_angle != 90 && !Serial.available()) {
+    updateServo();
+    delay(10);
+  }
+  Serial.print("[SCAN] Closest object at ");
+  Serial.print(bestAngle);
+  Serial.print(" deg, distance: ");
+  Serial.println(minDistance);
+  is_scanning = false;
+}
+
+// Find the direction with the clearest path (maximum distance)
+int findClearestDirection() {
+  if (scan_count == 0) {
+    return 90;  // Default to center if no data
+  }
+  
+  float max_distance = 0;
+  int best_angle = SWEEP_MIN_ANGLE;
+  
+  for (int i = 0; i < scan_count; i++) {
+    if (scan_distances[i] > max_distance) {
+      max_distance = scan_distances[i];
+      best_angle = scan_angles[i];
+    }
+  }
+  
+  Serial.print("[DECISION] Clearest direction: ");
+  Serial.print(best_angle);
+  Serial.print("° with ");
+  Serial.print(max_distance);
+  Serial.println(" cm clearance");
+  
+  return best_angle;
+}
+
+// Turn robot to face a specific direction based on servo angle
+void turnTowardsAngle(int target_servo_angle) {
+  // Center position (80°) = robot faces forward
+  // Left side (<80°) = robot should turn left
+  // Right side (>80°) = robot should turn right
+  
+  int angle_offset = target_servo_angle - 80;
+  
+  if (angle_offset < -10) {
+    // Turn left
+    Serial.print("[MOVE] Turning LEFT to face angle ");
+    Serial.print(target_servo_angle);
+    Serial.println("°");
+    turnLeft(150);
+    delay(500);
+  } else if (angle_offset > 10) {
+    // Turn right
+    Serial.print("[MOVE] Turning RIGHT to face angle ");
+    Serial.print(target_servo_angle);
+    Serial.println("°");
+    turnRight(150);
+    delay(500);
+  } else {
+    // Already facing the direction
+    Serial.println("[MOVE] Already facing the clear direction");
+  }
+  
+  stopMotors();
+}
+
+// Execute full autonomous navigation cycle
+void autonomousNavigationCycle() {
+  Serial.println("\n===== AUTONOMOUS NAVIGATION CYCLE START =====");
+  
+  // Step 1: Scan for obstacles
+  performSweep();
+  delay(500);
+  
+  // Step 2: Find clearest direction
+  int clearest_angle = findClearestDirection();
+  delay(500);
+  
+  // Step 3: Turn robot toward the clear direction
+  turnTowardsAngle(clearest_angle);
+  delay(500);
+  
+  // Step 4: Move forward in that direction
+  Serial.println("[MOVE] Moving forward into clear area...");
+  moveForward(120);
+  delay(2000);
+  stopMotors();
+  
+  Serial.println("===== AUTONOMOUS NAVIGATION CYCLE END =====");
+}
+
+// Sweep servo through full logical range to observe mechanical limits
+void servoRangeTest() {
+  Serial.println("\n[SERVO TEST] Sweeping 0->180->0 to measure travel");
+  stopMotors();
+  bool prev_scan = is_scanning;
+  is_scanning = true;  // Pause autonomous actions while testing
+
+  // Sweep up
+  for (int angle = 0; angle <= 180; angle += 10) {
+    servo_target_angle = angle;
+    while (servo_angle != angle && !Serial.available()) {
+      updateServo();
+      delay(10);
+    }
+    Serial.print("  Angle set: ");
+    Serial.println(angle);
+    delay(150);
+  }
+
+  // Sweep down
+  for (int angle = 180; angle >= 0; angle -= 10) {
+    servo_target_angle = angle;
+    while (servo_angle != angle && !Serial.available()) {
+      updateServo();
+      delay(10);
+    }
+    Serial.print("  Angle set: ");
+    Serial.println(angle);
+    delay(150);
+  }
+
+  // Return to center
+  servo_target_angle = 80;
+  while (servo_angle != 80 && !Serial.available()) {
+    updateServo();
+    delay(10);
+  }
+  Serial.println("[SERVO TEST] Done. Returned to 80 deg.");
+  is_scanning = prev_scan;
+}
+
+void processCommand(String cmd) {
+  cmd.trim();
+  
+  if (cmd.startsWith("MOTOR:")) {
+    String speedStr = cmd.substring(6);
+    int commaPos = speedStr.indexOf(',');
+    if (commaPos > 0) {
+      int speedA = speedStr.substring(0, commaPos).toInt();
+      int speedB = speedStr.substring(commaPos + 1).toInt();
+      setMotors(speedA, speedB);
+      Serial.print("ACK:MOTOR:");
+      Serial.print(speedA); Serial.print(",");
+      Serial.println(speedB);
+    }
+  }
+  else if (cmd == "STOP") {
+    stopMotors();
+    Serial.println("ACK:STOP");
+  }
+  else if (cmd.startsWith("SERVO:")) {
+    int angle = cmd.substring(6).toInt();
+    angle = constrain(angle, 0, 180);
+    servo_target_angle = angle;
+    Serial.print("ACK:SERVO:");
+    Serial.println(angle);
+  }
+  else if (cmd == "SCAN") {
+    performSweep();
+    Serial.println("ACK:SCAN");
+  }
+  else if (cmd.startsWith("AUTO:")) {
+    int mode = cmd.substring(5).toInt();
+    autonomous_mode = (mode != 0);
+    Serial.print("ACK:AUTO:");
+    Serial.println(autonomous_mode ? "1" : "0");
+  }
+  else if (cmd == "NAV") {
+    autonomousNavigationCycle();
+    Serial.println("ACK:NAV");
+  }
+  else if (cmd == "SERVO_TEST") {
+    servoRangeTest();
+    Serial.println("ACK:SERVO_TEST");
+  }
+  else if (cmd.startsWith("FWD:")) {
+    int speed = cmd.substring(4).toInt();
+    moveForward(speed);
+    Serial.print("ACK:FWD:"); Serial.println(speed);
+  }
+  else if (cmd.startsWith("BWD:")) {
+    int speed = cmd.substring(4).toInt();
+    moveBackward(speed);
+    Serial.print("ACK:BWD:"); Serial.println(speed);
+  }
+  else if (cmd.startsWith("LEFT:")) {
+    int speed = cmd.substring(5).toInt();
+    turnLeft(speed);
+    Serial.print("ACK:LEFT:"); Serial.println(speed);
+  }
+  else if (cmd.startsWith("RIGHT:")) {
+    int speed = cmd.substring(6).toInt();
+    turnRight(speed);
+    Serial.print("ACK:RIGHT:"); Serial.println(speed);
+  }
+}

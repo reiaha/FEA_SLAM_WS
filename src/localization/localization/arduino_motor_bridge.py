@@ -9,12 +9,15 @@ Handles bidirectional communication with Arduino:
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TransformStamped
 from sensor_msgs.msg import Imu, Range
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Header
+from tf2_ros import TransformBroadcaster
 import serial
 import time
 import math
+import numpy as np
 
 class ArduinoMotorBridge(Node):
     def __init__(self):
@@ -43,10 +46,23 @@ class ArduinoMotorBridge(Node):
         # Publishers
         self.imu_pub = self.create_publisher(Imu, 'imu/data_raw', 10)
         self.ultrasonic_pub = self.create_publisher(Range, 'ultrasonic', 10)
+        self.odom_pub = self.create_publisher(Odometry, 'odom', 10)
+        self.tf_broadcaster = TransformBroadcaster(self)
+        
+        # Odometry state
+        self.odom_x = 0.0
+        self.odom_y = 0.0
+        self.odom_theta = 0.0
+        self.last_odom_time = self.get_clock().now()
+        self.last_linear = 0.0
+        self.last_angular = 0.0
         
         # Subscriber for motor commands
         self.cmd_vel_sub = self.create_subscription(
             Twist, 'cmd_vel', self.cmd_vel_callback, 10)
+        
+        # Create timer to publish odometry periodically
+        self.odom_timer = self.create_timer(0.02, self.publish_odom)  # 50Hz
         
         # Serial connection
         try:
@@ -63,6 +79,9 @@ class ArduinoMotorBridge(Node):
         # Timer for reading sensor data
         self.timer = self.create_timer(0.02, self.read_sensors)  # 50Hz
         
+        # Publish initial TF immediately so SLAM has it available at startup
+        self.publish_odom()
+        
         self.get_logger().info('Arduino Motor Bridge initialized')
     
     def cmd_vel_callback(self, msg: Twist):
@@ -74,6 +93,10 @@ class ArduinoMotorBridge(Node):
         
         linear = msg.linear.x   # m/s
         angular = msg.angular.z  # rad/s
+        
+        # Track velocity for odometry integration
+        self.last_linear = linear
+        self.last_angular = angular
         
         # Differential drive kinematics
         # v_left = linear - (angular * wheel_base / 2)
@@ -114,7 +137,17 @@ class ArduinoMotorBridge(Node):
     
     def read_sensors(self):
         """Read sensor data from Arduino"""
-        if not self.ser or not self.ser.in_waiting:
+        if not self.ser:
+            return
+        
+        try:
+            # Check if data is available with error handling
+            if not self.ser.in_waiting:
+                return
+        except (OSError, serial.SerialException) as e:
+            # Serial port error - likely disconnected or I/O issue
+            self.get_logger().warn(f'Serial port error during check: {e}')
+            self.ser = None
             return
         
         try:
@@ -129,9 +162,13 @@ class ArduinoMotorBridge(Node):
             if not line:
                 return
             
-            # Skip acknowledgment messages
+            # Skip acknowledgment and debug messages
             if line.startswith('ACK:'):
                 self.get_logger().debug(f'Arduino ACK: {line}')
+                return
+            
+            if line.startswith('[DEBUG]'):
+                self.get_logger().debug(f'Arduino debug: {line}')
                 return
             
             # Parse CSV: ax,ay,az,gx,gy,gz,distance,motorA,motorB
@@ -195,6 +232,66 @@ class ArduinoMotorBridge(Node):
             self.get_logger().debug(f'Parse error (malformed data): {e}')
         except Exception as e:
             self.get_logger().warn(f'Read error: {e}')
+    
+    def publish_odom(self):
+        """Publish odometry by integrating velocity commands"""
+        now = self.get_clock().now()
+        dt = (now - self.last_odom_time).nanoseconds * 1e-9
+        if dt <= 0 or dt > 0.1:
+            dt = 0.02
+        self.last_odom_time = now
+        
+        # Integrate velocity to update pose
+        linear = self.last_linear
+        angular = self.last_angular
+        
+        if abs(linear) > 0.001 or abs(angular) > 0.001:
+            # Update heading
+            self.odom_theta += angular * dt
+            
+            # Update position (body frame to world frame)
+            self.odom_x += linear * math.cos(self.odom_theta) * dt
+            self.odom_y += linear * math.sin(self.odom_theta) * dt
+        
+        # Publish odometry message
+        odom = Odometry()
+        odom.header.stamp = now.to_msg()
+        odom.header.frame_id = 'odom'
+        odom.child_frame_id = 'base_link'
+        
+        odom.pose.pose.position.x = self.odom_x
+        odom.pose.pose.position.y = self.odom_y
+        odom.pose.pose.position.z = 0.0
+        
+        # Quaternion from yaw
+        qz = math.sin(self.odom_theta / 2.0)
+        qw = math.cos(self.odom_theta / 2.0)
+        odom.pose.pose.orientation.x = 0.0
+        odom.pose.pose.orientation.y = 0.0
+        odom.pose.pose.orientation.z = qz
+        odom.pose.pose.orientation.w = qw
+        
+        # Velocity
+        odom.twist.twist.linear.x = self.last_linear
+        odom.twist.twist.linear.y = 0.0
+        odom.twist.twist.angular.z = self.last_angular
+        
+        self.odom_pub.publish(odom)
+        
+        # Broadcast TF odom->base_link
+        # Use current time for TF to ensure it's available for SLAM lookups
+        t = TransformStamped()
+        t.header.stamp = now.to_msg()
+        t.header.frame_id = 'odom'
+        t.child_frame_id = 'base_link'
+        t.transform.translation.x = self.odom_x
+        t.transform.translation.y = self.odom_y
+        t.transform.translation.z = 0.0
+        t.transform.rotation.x = 0.0
+        t.transform.rotation.y = 0.0
+        t.transform.rotation.z = qz
+        t.transform.rotation.w = qw
+        self.tf_broadcaster.sendTransform(t)
 
 def main(args=None):
     rclpy.init(args=args)

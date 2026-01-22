@@ -56,6 +56,7 @@ class ExplorationCoordinator(Node):
     def exploration_loop(self):
         """Main exploration control loop"""
         if not self.current_frontiers:
+            self.get_logger().debug('No frontiers available yet')
             return
         
         # Check time limit
@@ -78,9 +79,12 @@ class ExplorationCoordinator(Node):
         
         # Send new goal if not currently navigating
         if self.goal_handle is None and len(self.current_frontiers) > 0:
+            self.get_logger().info(f'🎯 Selecting frontier from {len(self.current_frontiers)} candidates...')
             selected_frontier = self.select_frontier()
             if selected_frontier:
                 self.send_goal_to_frontier(selected_frontier)
+            else:
+                self.get_logger().warn('❌ Failed to select frontier')
     
     def select_frontier(self):
         """Select best frontier using configured method"""
@@ -153,7 +157,8 @@ class ExplorationCoordinator(Node):
         goal_msg.pose = goal_pose
         
         # Send goal asynchronously
-        if self.nav_client.wait_for_server(timeout_sec=1.0):
+        self.get_logger().info(f'🔍 Checking for nav server... (timeout 2.0s)')
+        if self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().info(f'🚀 Sending goal to frontier: ({goal_pose.pose.position.x:.2f}, {goal_pose.pose.position.y:.2f})')
             
             future = self.nav_client.send_goal_async(goal_msg)
@@ -161,7 +166,7 @@ class ExplorationCoordinator(Node):
             
             self.exploring = True
         else:
-            self.get_logger().warn('⚠️ Navigation server not available')
+            self.get_logger().error('❌ Navigation server NOT available! Nav2 may not be running.')
     
     def goal_response_callback(self, future):
         """Handle navigation goal response"""

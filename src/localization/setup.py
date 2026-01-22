@@ -29,6 +29,8 @@ setup(
             'arduino_motor_bridge = localization.arduino_motor_bridge:main',
             'frontier_detector = localization.frontier_detector:main',
             'exploration_coordinator = localization.exploration_coordinator:main',
+            'ultrasonic_explorer = localization.ultrasonic_explorer:main',
+            'ultrasonic_servo_sweeper = localization.ultrasonic_servo_sweeper:main',
         ],
     },
 )

@@ -160,13 +160,13 @@ float readUltrasonic() {
 void setMotorA(int speed) {
   motorA_speed = constrain(speed, -255, 255);
   if (motorA_speed > 0) {
-    // Forward
-    digitalWrite(MOTOR_A_IN1, HIGH);
-    digitalWrite(MOTOR_A_IN2, LOW);
-  } else if (motorA_speed < 0) {
-    // Backward
+    // Forward (INVERTED - swapped IN1/IN2)
     digitalWrite(MOTOR_A_IN1, LOW);
     digitalWrite(MOTOR_A_IN2, HIGH);
+  } else if (motorA_speed < 0) {
+    // Backward (INVERTED - swapped IN1/IN2)
+    digitalWrite(MOTOR_A_IN1, HIGH);
+    digitalWrite(MOTOR_A_IN2, LOW);
   } else {
     // Stop
     digitalWrite(MOTOR_A_IN1, LOW);
@@ -178,13 +178,13 @@ void setMotorA(int speed) {
 void setMotorB(int speed) {
   motorB_speed = constrain(speed, -255, 255);
   if (motorB_speed > 0) {
-    // Forward
-    digitalWrite(MOTOR_B_IN1, HIGH);
-    digitalWrite(MOTOR_B_IN2, LOW);
-  } else if (motorB_speed < 0) {
-    // Backward
+    // Forward (INVERTED - swapped IN1/IN2)
     digitalWrite(MOTOR_B_IN1, LOW);
     digitalWrite(MOTOR_B_IN2, HIGH);
+  } else if (motorB_speed < 0) {
+    // Backward (INVERTED - swapped IN1/IN2)
+    digitalWrite(MOTOR_B_IN1, HIGH);
+    digitalWrite(MOTOR_B_IN2, LOW);
   } else {
     // Stop
     digitalWrite(MOTOR_B_IN1, LOW);

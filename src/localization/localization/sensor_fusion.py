@@ -18,6 +18,7 @@ import serial
 import time
 import math
 import numpy as np
+import re
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 
@@ -108,22 +109,17 @@ class IMULidarEKF(Node):
         if not raw:
             return
 
-        # Ignore non-numeric header lines (e.g., "Initializing...")
-        if not any(ch.isdigit() for ch in raw):
-            # debug returned header maybe once
-            self.get_logger().debug(f"Ignored non-numeric serial line: {raw}")
-            return
-
-        # Try parse floats (accelerations in g, gyro in deg/s)
-        parts = [p.strip() for p in raw.split(',') if p.strip() != '']
-        if len(parts) < 6:
-            self.get_logger().warn(f"Invalid IMU data (wrong columns): {raw}")
+        # Extract numeric fields only (filter out debug text from Arduino)
+        # Expect at least 6 numbers: ax_g, ay_g, az_g, gx_deg, gy_deg, gz_deg
+        numeric = re.findall(r"[-+]?[0-9]*\.?[0-9]+", raw)
+        if len(numeric) < 6:
+            self.get_logger().warn(f"Invalid IMU data (not enough numbers): {raw}")
             return
 
         try:
-            ax_g, ay_g, az_g, gx_d, gy_d, gz_d = map(float, parts[:6])
-        except ValueError:
-            self.get_logger().warn(f"Invalid IMU data (non-float): {raw}")
+            ax_g, ay_g, az_g, gx_d, gy_d, gz_d = map(float, numeric[:6])
+        except Exception:
+            self.get_logger().warn(f"Invalid IMU data (parse error): {raw}")
             return
 
         # Convert to SI units
