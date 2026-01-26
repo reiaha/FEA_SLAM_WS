@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-Arduino Motor Bridge Node
-Handles bidirectional communication with Arduino:
-- Receives cmd_vel from ROS2 navigation/teleop
-- Sends motor commands to Arduino
-- Publishes sensor data (IMU, ultrasonic) to ROS2
-"""
 
 import rclpy
 from rclpy.node import Node
@@ -23,16 +16,14 @@ class ArduinoMotorBridge(Node):
     def __init__(self):
         super().__init__('arduino_motor_bridge')
         
-        # Parameters
+        
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
-        self.declare_parameter('wheel_base', 0.18)  # Distance between wheels (m)
-        self.declare_parameter('max_speed', 200)     # Max motor PWM speed
+        self.declare_parameter('wheel_base', 0.18)
+        self.declare_parameter('max_speed', 200)    
         # Motion shaping
-        self.declare_parameter('velocity_deadband', 0.03)  # m/s below which we command 0
-        self.declare_parameter('min_pwm', 70)               # minimum |PWM| when moving
-        # If true, interpret a distance reading of 0 from the Arduino ultrasonic
-        # as "no echo" and publish max_range instead of 0.0 meters.
+        self.declare_parameter('velocity_deadband', 0.03)  #Lower for more sensitivity; higher for more stability
+        self.declare_parameter('min_pwm', 70)              
         self.declare_parameter('ultrasonic_zero_means_no_echo', True)
         
         serial_port = self.get_parameter('serial_port').value
@@ -72,6 +63,11 @@ class ArduinoMotorBridge(Node):
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
             self.get_logger().info(f'Arduino connected on {serial_port}')
+            
+            # Auto-enable motors for autonomous operation
+            self.ser.write(b'START\n')
+            time.sleep(0.1)
+            self.get_logger().info('✅ Motors ENABLED - Robot ready for autonomous operation')
         except serial.SerialException as e:
             self.get_logger().error(f'Failed to open {serial_port}: {e}')
             self.ser = None
@@ -99,9 +95,6 @@ class ArduinoMotorBridge(Node):
         self.last_angular = angular
         
         # Differential drive kinematics
-        # v_left = linear - (angular * wheel_base / 2)
-        # v_right = linear + (angular * wheel_base / 2)
-        
         v_left = linear - (angular * self.wheel_base / 2.0)
         v_right = linear + (angular * self.wheel_base / 2.0)
         
@@ -131,9 +124,53 @@ class ArduinoMotorBridge(Node):
         command = f"MOTOR:{speed_left},{speed_right}\n"
         try:
             self.ser.write(command.encode())
-            self.get_logger().info(f'🚀 Sent motor command: {command.strip()}')
+            
+            # Decode and display human-readable action
+            action = self.decode_motor_action(speed_left, speed_right)
+            self.get_logger().info(f'🚀 {action} | MOTOR:{speed_left},{speed_right}')
         except Exception as e:
             self.get_logger().error(f'Serial write error: {e}')
+    
+    def decode_motor_action(self, left, right):
+        """Convert motor speeds to human-readable action"""
+        if left == 0 and right == 0:
+            return "⏸️  STOPPED"
+        
+        # Both wheels moving forward
+        if left > 0 and right > 0:
+            if abs(left - right) < 20:  # Similar speeds
+                return "⬆️  FORWARD"
+            elif left > right:
+                return "↗️  FORWARD + SLIGHT RIGHT"
+            else:
+                return "↖️  FORWARD + SLIGHT LEFT"
+        
+        # Both wheels moving backward
+        if left < 0 and right < 0:
+            if abs(left - right) < 20:
+                return "⬇️  BACKWARD"
+            elif abs(left) > abs(right):
+                return "↙️  BACKWARD + SLIGHT RIGHT"
+            else:
+                return "↘️  BACKWARD + SLIGHT LEFT"
+        
+        # Opposite directions = turning in place
+        if left > 0 and right < 0:
+            return "↻  TURN RIGHT (rotate)"
+        if left < 0 and right > 0:
+            return "↺  TURN LEFT (rotate)"
+        
+        # One wheel stopped, other moving
+        if left == 0 and right > 0:
+            return "⤴️  PIVOT LEFT"
+        if left == 0 and right < 0:
+            return "⤵️  PIVOT LEFT (back)"
+        if right == 0 and left > 0:
+            return "⤴️  PIVOT RIGHT"
+        if right == 0 and left < 0:
+            return "⤵️  PIVOT RIGHT (back)"
+        
+        return "❓ UNKNOWN"
     
     def read_sensors(self):
         """Read sensor data from Arduino"""
@@ -205,8 +242,8 @@ class ArduinoMotorBridge(Node):
             ultrasonic_msg.header.frame_id = 'ultrasonic_link'
             ultrasonic_msg.radiation_type = Range.ULTRASOUND
             ultrasonic_msg.field_of_view = 0.26  # ~15 degrees
-            ultrasonic_msg.min_range = 0.02  # 2 cm
-            ultrasonic_msg.max_range = 4.0   # 4 meters
+            ultrasonic_msg.min_range = 0.02  
+            ultrasonic_msg.max_range = 4.0  
             # Convert cm to meters
             dist_m = distance / 100.0
 
@@ -225,7 +262,7 @@ class ArduinoMotorBridge(Node):
             
             self.ultrasonic_pub.publish(ultrasonic_msg)
             
-            # Log successful parse (debug level to avoid spam)
+            # Log successful parse
             self.get_logger().debug(f'Sensor data: ax={ax:.2f} distance={distance:.1f}cm motors=[{motorA:.0f},{motorB:.0f}]')
                 
         except ValueError as e:

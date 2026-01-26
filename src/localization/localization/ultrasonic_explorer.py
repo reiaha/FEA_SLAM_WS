@@ -7,7 +7,7 @@ Provides autonomous exploration to bootstrap SLAM mapping.
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import SensorDataQoS
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
@@ -32,8 +32,14 @@ class LidarExplorer(Node):
         
         # Subscribers
         # Match LiDAR publisher QoS (Best Effort, sensor profile)
+        scan_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5
+        )
         self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, SensorDataQoS())
+            LaserScan, '/scan', self.scan_callback, scan_qos)
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, 10)
         
@@ -117,7 +123,7 @@ class LidarExplorer(Node):
         if not self.exploring:
             return
         
-        # Check timeout
+        # Check timeout (only stop when time limit reached, keep moving entire time)
         elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
         if elapsed > self.timeout:
             self.get_logger().info('⏱️ Exploration timeout reached. Stopping LiDAR explorer.')
@@ -125,14 +131,8 @@ class LidarExplorer(Node):
             self.exploring = False
             return
         
-        # If map is received and has data, let frontier exploration take over
-        if self.map_received:
-            # Give frontier exploration some time to take over
-            if elapsed > 30.0:  # After 30 seconds of map building
-                self.get_logger().info('🎯 SLAM map built. Handing over to frontier exploration...')
-                self.stop_robot()
-                self.exploring = False
-                return
+        # Keep exploring - don't stop even if map is built
+        # Nav2 exploration_coordinator will take over cmd_vel when ready
         
         # 180-degree obstacle avoidance logic
         cmd = Twist()

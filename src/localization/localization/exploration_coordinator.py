@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
-"""
-Exploration Coordinator Node for FEA-SLAM Robot
-Manages autonomous frontier-based exploration using Nav2
-"""
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import SaveMap
 from geometry_msgs.msg import PoseStamped, PointStamped
 from visualization_msgs.msg import MarkerArray
 import math
+import os
+from datetime import datetime
+import time
 
 class ExplorationCoordinator(Node):
     def __init__(self):
         super().__init__('exploration_coordinator')
         
         # Parameters
-        self.declare_parameter('max_exploration_time', 600.0)  # 10 minutes
+        self.declare_parameter('max_exploration_time', 3600.0)  # 60 minutes - stops only when no frontiers
         self.declare_parameter('frontier_selection_method', 'closest')  # or 'gain'
+        # Wait for Nav2 stack to initialize (ultrasonic_explorer moves robot during this time)
+        self.declare_parameter('nav2_init_delay', 90.0)  # 90s for full lifecycle activation
         
         self.max_time = self.get_parameter('max_exploration_time').value
         self.selection_method = self.get_parameter('frontier_selection_method').value
+        self.nav2_init_delay = self.get_parameter('nav2_init_delay').value
         
         # Navigation client
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        
+        # Map saver service client
+        self.map_saver_client = self.create_client(SaveMap, '/map_saver/save_map')
         
         # Subscribers
         self.frontiers_sub = self.create_subscription(
@@ -38,23 +44,52 @@ class ExplorationCoordinator(Node):
         self.exploring = False
         self.start_time = None
         self.goal_handle = None
+        self.nav2_ready = False
+        self.init_time = self.get_clock().now()
         
         # Timer for exploration logic
         self.timer = self.create_timer(2.0, self.exploration_loop)
         
         self.get_logger().info('Exploration Coordinator initialized')
         self.get_logger().info(f'Selection method: {self.selection_method}')
+        self.get_logger().info(f'Waiting {self.nav2_init_delay}s for Nav2 to initialize...')
     
     def frontiers_callback(self, msg: MarkerArray):
         """Receive frontier detections"""
         self.current_frontiers = msg.markers
         
         if len(msg.markers) == 0:
-            self.get_logger().info('⭐ Exploration Complete! No more frontiers detected.')
-            self.exploring = False
+            self.get_logger().info('Exploration Complete! No more frontiers detected.')
+            self.exploring = False            # Auto-save map when exploration ends
+            self.save_map_auto()
     
+    def frontiers_callback(self, msg: MarkerArray):
+        """Receive frontier detections"""
+        self.current_frontiers = msg.markers
+        
+        if len(msg.markers) == 0:
+            self.get_logger().info('Exploration Complete! No more frontiers detected.')
+            self.exploring = False            # Auto-save map when exploration ends
+            self.save_map_auto()    
     def exploration_loop(self):
         """Main exploration control loop"""
+        # Wait for Nav2 to initialize on first run
+        if not self.nav2_ready:
+            elapsed = (self.get_clock().now() - self.init_time).nanoseconds / 1e9
+            if elapsed < self.nav2_init_delay:
+                if elapsed % 2 < 0.1:  # Log every 2 seconds
+                    remaining = self.nav2_init_delay - elapsed
+                    self.get_logger().info(f'Waiting for Nav2... ({remaining:.1f}s remaining)')
+                return
+            else:
+                self.get_logger().info('Nav2 init delay complete, checking server availability...')
+                if self.nav_client.wait_for_server(timeout_sec=5.0):
+                    self.nav2_ready = True
+                    self.get_logger().info('Navigation server is READY!')
+                else:
+                    self.get_logger().error('Navigation server still not available after init delay!')
+                    return
+        
         if not self.current_frontiers:
             self.get_logger().debug('No frontiers available yet')
             return
@@ -65,7 +100,7 @@ class ExplorationCoordinator(Node):
         
         elapsed_time = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
         if elapsed_time > self.max_time:
-            self.get_logger().warn(f'⏱️ Max exploration time ({self.max_time}s) exceeded!')
+            self.get_logger().warn(f'Max exploration time ({self.max_time}s) exceeded!')
             self.exploring = False
             return
         
@@ -74,17 +109,17 @@ class ExplorationCoordinator(Node):
             if self.goal_handle.done():
                 result = self.goal_handle.result()
                 if result:
-                    self.get_logger().info('✅ Frontier reached! Selecting next frontier...')
+                    self.get_logger().info('Frontier reached! Selecting next frontier...')
                     self.goal_handle = None
         
         # Send new goal if not currently navigating
         if self.goal_handle is None and len(self.current_frontiers) > 0:
-            self.get_logger().info(f'🎯 Selecting frontier from {len(self.current_frontiers)} candidates...')
+            self.get_logger().info(f'Selecting frontier from {len(self.current_frontiers)} candidates...')
             selected_frontier = self.select_frontier()
             if selected_frontier:
                 self.send_goal_to_frontier(selected_frontier)
             else:
-                self.get_logger().warn('❌ Failed to select frontier')
+                self.get_logger().warn('Failed to select frontier')
     
     def select_frontier(self):
         """Select best frontier using configured method"""
@@ -117,7 +152,7 @@ class ExplorationCoordinator(Node):
                 closest_frontier = frontier
         
         if closest_frontier:
-            self.get_logger().info(f'📍 Selected closest frontier at distance: {min_distance:.2f}m')
+            self.get_logger().info(f'Selected closest frontier at distance: {min_distance:.2f}m')
         
         return closest_frontier
     
@@ -135,12 +170,17 @@ class ExplorationCoordinator(Node):
                 best_frontier = frontier
         
         if best_frontier:
-            self.get_logger().info(f'🎯 Selected max-gain frontier with gain: {max_gain:.3f}')
+            self.get_logger().info(f'Selected max-gain frontier with gain: {max_gain:.3f}')
         
         return best_frontier
     
     def send_goal_to_frontier(self, frontier_marker):
         """Send navigation goal to frontier"""
+        # Ensure Nav2 is ready
+        if not self.nav2_ready:
+            self.get_logger().warn('Nav2 not ready yet, skipping goal send')
+            return
+        
         # Create goal pose
         goal_pose = PoseStamped()
         goal_pose.header.frame_id = frontier_marker.header.frame_id
@@ -157,26 +197,20 @@ class ExplorationCoordinator(Node):
         goal_msg.pose = goal_pose
         
         # Send goal asynchronously
-        self.get_logger().info(f'🔍 Checking for nav server... (timeout 2.0s)')
-        if self.nav_client.wait_for_server(timeout_sec=2.0):
-            self.get_logger().info(f'🚀 Sending goal to frontier: ({goal_pose.pose.position.x:.2f}, {goal_pose.pose.position.y:.2f})')
-            
-            future = self.nav_client.send_goal_async(goal_msg)
-            future.add_done_callback(self.goal_response_callback)
-            
-            self.exploring = True
-        else:
-            self.get_logger().error('❌ Navigation server NOT available! Nav2 may not be running.')
+        self.get_logger().info(f'Sending goal to frontier: ({goal_pose.pose.position.x:.2f}, {goal_pose.pose.position.y:.2f})')
+        
+        future = self.nav_client.send_goal_async(goal_msg)
+        future.add_done_callback(self.goal_response_callback)
     
     def goal_response_callback(self, future):
         """Handle navigation goal response"""
         self.goal_handle = future.result()
         
         if not self.goal_handle.accepted:
-            self.get_logger().info('❌ Goal rejected by navigation server')
+            self.get_logger().info('Goal rejected by navigation server')
             return
         
-        self.get_logger().info('✨ Goal accepted, robot navigating to frontier...')
+        self.get_logger().info('Goal accepted, robot navigating to frontier...')
         
         # Get result when done
         result_future = self.goal_handle.get_result_async()
@@ -187,10 +221,43 @@ class ExplorationCoordinator(Node):
         result = future.result()
         
         if result and result.result:
-            self.get_logger().info('✅ Successfully reached frontier!')
+            self.get_logger().info('Successfully reached frontier!')
         else:
-            self.get_logger().warn('⚠️ Failed to reach frontier (obstacle or timeout)')
-
+            self.get_logger().warn('Failed to reach frontier (obstacle or timeout)')    
+    def save_map_auto(self):
+        """Auto-save map with timestamped filename when exploration completes"""
+        # Create timestamped filename: exploration_2026-01-23_143045.pgm
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H%M%S')
+        map_name = f'exploration_{timestamp}'
+        
+        # Create maps directory if it doesn't exist
+        maps_dir = os.path.expanduser('~/maps')
+        os.makedirs(maps_dir, exist_ok=True)
+        
+        map_path = os.path.join(maps_dir, map_name)
+        
+        # Create and send save request
+        request = SaveMap.Request()
+        request.map_topic = '/map'
+        request.map_url = map_path
+        
+        if self.map_saver_client.service_is_ready():
+            self.get_logger().info(f'Saving map: {map_path}')
+            future = self.map_saver_client.call_async(request)
+            future.add_done_callback(self.save_map_callback)
+        else:
+            self.get_logger().warn('Map saver service not available. Map not saved.')
+    
+    def save_map_callback(self, future):
+        """Handle map save response"""
+        try:
+            result = future.result()
+            if result.success:
+                self.get_logger().info('Map saved successfully!')
+            else:
+                self.get_logger().error(f'Failed to save map: {result.message}')
+        except Exception as e:
+            self.get_logger().error(f'Map save error: {e}')
 def main(args=None):
     rclpy.init(args=args)
     node = ExplorationCoordinator()
