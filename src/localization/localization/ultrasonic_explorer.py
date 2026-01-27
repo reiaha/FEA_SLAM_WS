@@ -11,6 +11,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import OccupancyGrid
+from rclpy.action import ActionClient
+from nav2_msgs.action import NavigateToPose
 import math
 
 class LidarExplorer(Node):
@@ -18,11 +20,11 @@ class LidarExplorer(Node):
         super().__init__('lidar_explorer')
         
         # Parameters
-        self.declare_parameter('obstacle_distance', 0.5)  # meters - stop if closer
-        self.declare_parameter('safe_distance', 0.8)      # meters - slow down
-        self.declare_parameter('forward_speed', 0.15)     # m/s
-        self.declare_parameter('turn_speed', 0.5)         # rad/s
-        self.declare_parameter('exploration_timeout', 300.0)  # 5 minutes max
+        self.declare_parameter('obstacle_distance', 0.35)  
+        self.declare_parameter('safe_distance', 0.45)     
+        self.declare_parameter('forward_speed', 0.15)     
+        self.declare_parameter('turn_speed', 0.4)         
+        self.declare_parameter('exploration_timeout', 300.0)  
         
         self.obstacle_dist = self.get_parameter('obstacle_distance').value
         self.safe_dist = self.get_parameter('safe_distance').value
@@ -46,17 +48,24 @@ class LidarExplorer(Node):
         # Publisher
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         
+        # Nav2 action client (to check if Nav2 is ready)
+        self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
+        
         # State
         self.front_distance = float('inf')      # distance straight ahead (0-90°)
         self.left_distance = float('inf')       # distance to left (90-180°)
         self.right_distance = float('inf')      # distance to right (-90 to 0°)
         self.map_received = False
         self.exploring = True
+        self.nav2_ready = False  # Track if Nav2 is ready to take over
         self.start_time = self.get_clock().now()
         self.turn_direction = 0  # 0=forward, 1=turn left, -1=turn right
         
         # Control loop timer
         self.control_timer = self.create_timer(0.1, self.control_loop)  # 10Hz
+        
+        # Nav2 readiness check timer (slower, every 2 seconds)
+        self.nav2_check_timer = self.create_timer(2.0, self.check_nav2_ready)
         
         self.get_logger().info('🤖 LiDAR Explorer started - 180° obstacle detection active')
         self.get_logger().info(f'   Obstacle threshold: {self.obstacle_dist}m, Safe distance: {self.safe_dist}m')
@@ -120,6 +129,7 @@ class LidarExplorer(Node):
     
     def control_loop(self):
         """Main control loop for LiDAR-based 180° exploration"""
+        # If Nav2 took over, don't publish anything
         if not self.exploring:
             return
         
@@ -174,6 +184,20 @@ class LidarExplorer(Node):
         cmd.angular.z = 0.0
         self.cmd_vel_pub.publish(cmd)
         self.get_logger().info('🛑 Robot stopped')
+    
+    def check_nav2_ready(self):
+        """Check if Nav2 navigate_to_pose action server is ready"""
+        if self.nav2_ready:
+            return  # Already marked ready
+        
+        if self.nav_client.server_is_ready():
+            self.nav2_ready = True
+            self.exploring = False  # Stop publishing cmd_vel
+            self.stop_robot()
+            self.get_logger().info('✅ Nav2 /navigate_to_pose is READY! Handing off control to frontier exploration.')
+            self.get_logger().info('   Stopping ultrasonic_explorer to avoid cmd_vel conflicts.')
+        else:
+            self.get_logger().debug('⏳ Waiting for Nav2 /navigate_to_pose action server...')
 
 def main(args=None):
     rclpy.init(args=args)

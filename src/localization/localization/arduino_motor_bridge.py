@@ -22,8 +22,9 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('wheel_base', 0.18)
         self.declare_parameter('max_speed', 200)    
         # Motion shaping
-        self.declare_parameter('velocity_deadband', 0.03)  #Lower for more sensitivity; higher for more stability
-        self.declare_parameter('min_pwm', 70)              
+        self.declare_parameter('velocity_deadband', 0.015)  #Lower for more sensitivity; higher for more stability
+        self.declare_parameter('min_pwm', 50)
+        self.declare_parameter('pwm_slew_rate', 40)  # Faster ramp to avoid pauses
         self.declare_parameter('ultrasonic_zero_means_no_echo', True)
         
         serial_port = self.get_parameter('serial_port').value
@@ -33,6 +34,7 @@ class ArduinoMotorBridge(Node):
         self.ultrasonic_zero_means_no_echo = self.get_parameter('ultrasonic_zero_means_no_echo').value
         self.velocity_deadband = self.get_parameter('velocity_deadband').value
         self.min_pwm = int(self.get_parameter('min_pwm').value)
+        self.pwm_slew_rate = int(self.get_parameter('pwm_slew_rate').value)
         
         # Publishers
         self.imu_pub = self.create_publisher(Imu, 'imu/data_raw', 10)
@@ -47,6 +49,8 @@ class ArduinoMotorBridge(Node):
         self.last_odom_time = self.get_clock().now()
         self.last_linear = 0.0
         self.last_angular = 0.0
+        self.last_cmd_left = 0
+        self.last_cmd_right = 0
         
         # Subscriber for motor commands
         self.cmd_vel_sub = self.create_subscription(
@@ -121,6 +125,12 @@ class ArduinoMotorBridge(Node):
         speed_right = max(-255, min(255, speed_right))
         
         # Send command to Arduino
+        # Slew-limit to reduce jerkiness
+        speed_left = self.slew_limit(self.last_cmd_left, speed_left)
+        speed_right = self.slew_limit(self.last_cmd_right, speed_right)
+        self.last_cmd_left = speed_left
+        self.last_cmd_right = speed_right
+
         command = f"MOTOR:{speed_left},{speed_right}\n"
         try:
             self.ser.write(command.encode())
@@ -130,6 +140,13 @@ class ArduinoMotorBridge(Node):
             self.get_logger().info(f'🚀 {action} | MOTOR:{speed_left},{speed_right}')
         except Exception as e:
             self.get_logger().error(f'Serial write error: {e}')
+
+    def slew_limit(self, current, target):
+        """Limit PWM change per cycle to smooth motion"""
+        delta = target - current
+        if abs(delta) <= self.pwm_slew_rate:
+            return target
+        return current + self.pwm_slew_rate * (1 if delta > 0 else -1)
     
     def decode_motor_action(self, left, right):
         """Convert motor speeds to human-readable action"""

@@ -20,7 +20,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('max_exploration_time', 3600.0)  # 60 minutes - stops only when no frontiers
         self.declare_parameter('frontier_selection_method', 'closest')  # or 'gain'
         # Wait for Nav2 stack to initialize (ultrasonic_explorer moves robot during this time)
-        self.declare_parameter('nav2_init_delay', 90.0)  # 90s for full lifecycle activation
+        self.declare_parameter('nav2_init_delay', 60.0)  # 60s for Nav2 initialization
         
         self.max_time = self.get_parameter('max_exploration_time').value
         self.selection_method = self.get_parameter('frontier_selection_method').value
@@ -63,14 +63,6 @@ class ExplorationCoordinator(Node):
             self.exploring = False            # Auto-save map when exploration ends
             self.save_map_auto()
     
-    def frontiers_callback(self, msg: MarkerArray):
-        """Receive frontier detections"""
-        self.current_frontiers = msg.markers
-        
-        if len(msg.markers) == 0:
-            self.get_logger().info('Exploration Complete! No more frontiers detected.')
-            self.exploring = False            # Auto-save map when exploration ends
-            self.save_map_auto()    
     def exploration_loop(self):
         """Main exploration control loop"""
         # Wait for Nav2 to initialize on first run

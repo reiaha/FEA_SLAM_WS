@@ -86,7 +86,7 @@ class UltrasonicServoSweeper(Node):
                 # Publish Range message
                 range_msg = Range()
                 range_msg.header = Header()
-                range_msg.header.stamp = self.get_clock().now()
+                range_msg.header.stamp = self.get_clock().now().to_msg()
                 range_msg.header.frame_id = f'{self.frame_id}_angle_{angle}'
                 
                 range_msg.radiation_type = Range.ULTRASOUND
