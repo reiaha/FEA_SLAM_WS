@@ -5,7 +5,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
 from sensor_msgs.msg import Imu, Range
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Int32
 from tf2_ros import TransformBroadcaster
 import serial
 import time
@@ -20,11 +20,11 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('wheel_base', 0.18)
-        self.declare_parameter('max_speed', 200)    
+        self.declare_parameter('max_speed', 255)    # INCREASED from 200 to 255 (max PWM)
         # Motion shaping
         self.declare_parameter('velocity_deadband', 0.015)  #Lower for more sensitivity; higher for more stability
-        self.declare_parameter('min_pwm', 50)
-        self.declare_parameter('pwm_slew_rate', 40)  # Faster ramp to avoid pauses
+        self.declare_parameter('min_pwm', 80)  # INCREASED from 50 to 80 for better initial torque
+        self.declare_parameter('pwm_slew_rate', 60)  # INCREASED from 40 to 60 for faster acceleration
         self.declare_parameter('ultrasonic_zero_means_no_echo', True)
         
         serial_port = self.get_parameter('serial_port').value
@@ -55,11 +55,19 @@ class ArduinoMotorBridge(Node):
         # Subscriber for motor commands
         self.cmd_vel_sub = self.create_subscription(
             Twist, 'cmd_vel', self.cmd_vel_callback, 10)
+
+        # Subscriber for servo commands (angle in degrees)
+        self.servo_sub = self.create_subscription(
+            Int32, 'servo_angle', self.servo_angle_callback, 10)
         
         # Create timer to publish odometry periodically
         self.odom_timer = self.create_timer(0.02, self.publish_odom)  # 50Hz
         
         # Serial connection
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
+        self.reconnect_backoff = 0.1  # Start with 100ms, exponential backoff
+        self.last_reconnect_attempt = 0  # Timestamp of last attempt
         try:
             self.ser = serial.Serial(serial_port, baud_rate, timeout=1)
             time.sleep(2)  # Allow Arduino reset
@@ -72,6 +80,7 @@ class ArduinoMotorBridge(Node):
             self.ser.write(b'START\n')
             time.sleep(0.1)
             self.get_logger().info('✅ Motors ENABLED - Robot ready for autonomous operation')
+            self.reconnect_backoff = 0.1  # Reset backoff on success
         except serial.SerialException as e:
             self.get_logger().error(f'Failed to open {serial_port}: {e}')
             self.ser = None
@@ -79,10 +88,33 @@ class ArduinoMotorBridge(Node):
         # Timer for reading sensor data
         self.timer = self.create_timer(0.02, self.read_sensors)  # 50Hz
         
-        # Publish initial TF immediately so SLAM has it available at startup
-        self.publish_odom()
-        
         self.get_logger().info('Arduino Motor Bridge initialized')
+    
+    def try_reconnect(self):
+        """Attempt to reconnect to Arduino if connection is lost (with backoff)"""
+        if self.ser is None:
+            now = time.time()
+            # Only try to reconnect if backoff delay has passed
+            if now - self.last_reconnect_attempt < self.reconnect_backoff:
+                return
+            
+            self.last_reconnect_attempt = now
+            try:
+                self.ser = serial.Serial(self.serial_port, self.baud_rate, timeout=1)
+                time.sleep(0.5)  # Give Arduino time to reset
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                self.get_logger().info(f'✅ Reconnected to Arduino on {self.serial_port}')
+                # Re-enable motors
+                self.ser.write(b'START\n')
+                time.sleep(0.1)
+                self.get_logger().info('✅ Motors re-enabled')
+                self.reconnect_backoff = 0.1  # Reset backoff on success
+            except Exception as e:
+                # Exponential backoff: 0.1s → 0.2s → 0.4s → 0.8s → cap at 2s
+                self.reconnect_backoff = min(2.0, self.reconnect_backoff * 2)
+                self.get_logger().debug(f'Reconnection failed (retry in {self.reconnect_backoff:.2f}s): {e}')
+                self.ser = None
     
     def cmd_vel_callback(self, msg: Twist):
         """
@@ -141,6 +173,18 @@ class ArduinoMotorBridge(Node):
         except Exception as e:
             self.get_logger().error(f'Serial write error: {e}')
 
+    def servo_angle_callback(self, msg: Int32):
+        """Send servo angle command to Arduino (0-180)"""
+        if not self.ser:
+            return
+
+        angle = max(0, min(180, int(msg.data)))
+        command = f"SERVO:{angle}\n"
+        try:
+            self.ser.write(command.encode())
+        except Exception as e:
+            self.get_logger().error(f'Serial write error (servo): {e}')
+
     def slew_limit(self, current, target):
         """Limit PWM change per cycle to smooth motion"""
         delta = target - current
@@ -192,6 +236,8 @@ class ArduinoMotorBridge(Node):
     def read_sensors(self):
         """Read sensor data from Arduino"""
         if not self.ser:
+            # Try to reconnect if disconnected
+            self.try_reconnect()
             return
         
         try:
@@ -201,6 +247,12 @@ class ArduinoMotorBridge(Node):
         except (OSError, serial.SerialException) as e:
             # Serial port error - likely disconnected or I/O issue
             self.get_logger().warn(f'Serial port error during check: {e}')
+            # Don't crash, just disconnect and try reconnecting later
+            try:
+                if self.ser:
+                    self.ser.close()
+            except:
+                pass
             self.ser = None
             return
         
@@ -311,7 +363,7 @@ class ArduinoMotorBridge(Node):
         odom = Odometry()
         odom.header.stamp = now.to_msg()
         odom.header.frame_id = 'odom'
-        odom.child_frame_id = 'base_link'
+        odom.child_frame_id = 'base_footprint'
         
         odom.pose.pose.position.x = self.odom_x
         odom.pose.pose.position.y = self.odom_y
@@ -332,12 +384,11 @@ class ArduinoMotorBridge(Node):
         
         self.odom_pub.publish(odom)
         
-        # Broadcast TF odom->base_link
-        # Use current time for TF to ensure it's available for SLAM lookups
+        # Broadcast TF odom->base_footprint
         t = TransformStamped()
         t.header.stamp = now.to_msg()
         t.header.frame_id = 'odom'
-        t.child_frame_id = 'base_link'
+        t.child_frame_id = 'base_footprint'
         t.transform.translation.x = self.odom_x
         t.transform.translation.y = self.odom_y
         t.transform.translation.z = 0.0
@@ -345,7 +396,11 @@ class ArduinoMotorBridge(Node):
         t.transform.rotation.y = 0.0
         t.transform.rotation.z = qz
         t.transform.rotation.w = qw
-        self.tf_broadcaster.sendTransform(t)
+        
+        try:
+            self.tf_broadcaster.sendTransform(t)
+        except Exception as e:
+            self.get_logger().error(f'Failed to broadcast TF: {e}')
 
 def main(args=None):
     rclpy.init(args=args)

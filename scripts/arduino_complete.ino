@@ -1,13 +1,19 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <Servo.h>
 
 
-#define MIN_SPEED       0       
-#define MAX_SPEED       255    
-#define FORWARD_SPEED   210     
-#define BACKWARD_SPEED  180    
-#define TURN_SPEED      180     
+#define MIN_SPEED       0
+#define MAX_SPEED       255
+#define FORWARD_SPEED   210
+#define BACKWARD_SPEED  150
+#define TURN_SPEED      180
+
+#define OBSTACLE_CM         30.0
+#define OBSTACLE_CLEAR_CM   35.0
+#define AVOID_BACKUP_MS     350
+#define AVOID_TURN_MS       450
 
 Adafruit_MPU6050 mpu;
 
@@ -19,9 +25,17 @@ float ax_offset = 0.0;
 float ay_offset = 0.0;
 float az_offset = 0.0;
 
-// Ultrasonic Sensor Pins
+// Servo + Ultrasonic Pins
+const int SERVO_PIN = 10;
 const int TRIG_PIN = A0;
 const int ECHO_PIN = A1;
+
+// Servo positions (degrees)
+#define SERVO_LEFT   110
+#define SERVO_CENTER 150
+#define SERVO_RIGHT  170
+Servo scan_servo;
+int servo_angle = SERVO_CENTER;
 
 // Motor Control Pins
 const int MOTOR_A_IN1 = 5;   
@@ -38,6 +52,16 @@ int motorB_speed = 0;
 
 // Safety: motors disabled until START command
 bool motors_enabled = false;
+
+// Local autonomy (obstacle avoidance on Arduino). ALWAYS ENABLED for safety!
+// ROS2 commands still work - Arduino checks obstacles BEFORE applying motor speeds
+bool local_autonomy_enabled = true;
+
+// Obstacle avoidance state
+enum AvoidState { AVOID_NONE, AVOID_BACKUP, AVOID_TURN };
+AvoidState avoid_state = AVOID_NONE;
+unsigned long avoid_start_ms = 0;
+int turn_direction = 1; // 1 = left, -1 = right
 
 // Serial buffer
 String inputBuffer = "";
@@ -62,6 +86,10 @@ void setup() {
 
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
+
+  // Servo setup
+  scan_servo.attach(SERVO_PIN);
+  scan_servo.write(servo_angle);
 
   stopMotors();
 
@@ -116,6 +144,11 @@ void loop() {
   // Ultrasonic
   float distance = readUltrasonic();
 
+  // Obstacle avoidance override (prevents corner revisits)
+  if (local_autonomy_enabled) {
+    handleObstacle(distance);
+  }
+
   // CSV output for Raspberry Pi
   Serial.print(ax, 4); Serial.print(",");
   Serial.print(ay, 4); Serial.print(",");
@@ -128,6 +161,59 @@ void loop() {
   Serial.println(motorB_speed);
 
   delay(20); // ~50Hz
+}
+
+void handleObstacle(float distance_cm) {
+  if (!motors_enabled) {
+    avoid_state = AVOID_NONE;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (avoid_state == AVOID_NONE) {
+    if (distance_cm > 0 && distance_cm < OBSTACLE_CM) {
+      avoid_state = AVOID_BACKUP;
+      avoid_start_ms = now;
+      turn_direction = (now / 1000) % 2 == 0 ? 1 : -1; // alternate turns
+      Serial.print("🚨 OBSTACLE DETECTED at ");
+      Serial.print(distance_cm);
+      Serial.println("cm - STARTING BACKUP");
+    }
+  }
+
+  if (avoid_state == AVOID_BACKUP) {
+    moveBackward(BACKWARD_SPEED);
+    if (now - avoid_start_ms >= AVOID_BACKUP_MS) {
+      avoid_state = AVOID_TURN;
+      avoid_start_ms = now;
+      Serial.print("⏱️  TURNING ");
+      Serial.println(turn_direction > 0 ? "LEFT" : "RIGHT");
+    }
+    return;
+  }
+
+  if (avoid_state == AVOID_TURN) {
+    if (turn_direction > 0) {
+      turnLeft(TURN_SPEED);
+    } else {
+      turnRight(TURN_SPEED);
+    }
+
+    if (now - avoid_start_ms >= AVOID_TURN_MS) {
+      if (distance_cm > OBSTACLE_CLEAR_CM) {
+        avoid_state = AVOID_NONE;
+        Serial.print("✅ OBSTACLE CLEARED (distance=");
+        Serial.print(distance_cm);
+        Serial.println("cm)");
+      } else {
+        avoid_state = AVOID_BACKUP;
+        avoid_start_ms = now;
+        Serial.println("⚠️  Still blocked - BACKUP again");
+      }
+    }
+    return;
+  }
 }
 
 
@@ -179,6 +265,15 @@ void setMotors(int speedA, int speedB) {
     Serial.println("IGNORED: Motors disabled (send START)");
     return;
   }
+  
+  // If obstacle avoidance is active, obstacle avoidance has priority
+  // But we still acknowledge the ROS2 command so Nav2 stays aware
+  if (local_autonomy_enabled && avoid_state != AVOID_NONE) {
+    Serial.print("OVERRIDE: Obstacle avoidance active (state=");
+    Serial.print(avoid_state); Serial.println(")");
+    return;  // Don't apply ROS2 speeds, let handleObstacle() control motors
+  }
+  
   setMotorA(speedA);
   setMotorB(speedB);
 }
@@ -212,13 +307,42 @@ void processCommand(String cmd) {
 
   if (cmd == "START") {
     motors_enabled = true;
-    Serial.println("ACK:START");
+    Serial.println("✅ ACK:START - Motors ENABLED - Obstacle avoidance ACTIVE");
     return;
   }
   if (cmd == "STOP") {
     motors_enabled = false;
+    avoid_state = AVOID_NONE;
     stopMotors();
     Serial.println("ACK:STOP");
+    return;
+  }
+  if (cmd.startsWith("SERVO:")) {
+    String arg = cmd.substring(6);
+    arg.trim();
+    if (arg == "LEFT") {
+      servo_angle = SERVO_LEFT;
+    } else if (arg == "CENTER") {
+      servo_angle = SERVO_CENTER;
+    } else if (arg == "RIGHT") {
+      servo_angle = SERVO_RIGHT;
+    } else {
+      int angle = arg.toInt();
+      servo_angle = constrain(angle, 0, 180);
+    }
+    scan_servo.write(servo_angle);
+    Serial.print("ACK:SERVO:");
+    Serial.println(servo_angle);
+    return;
+  }
+  if (cmd == "AUTO:ON") {
+    local_autonomy_enabled = true;
+    Serial.println("ACK:AUTO:ON");
+    return;
+  }
+  if (cmd == "AUTO:OFF") {
+    local_autonomy_enabled = false;
+    Serial.println("ACK:AUTO:OFF");
     return;
   }
   if (!motors_enabled) {
