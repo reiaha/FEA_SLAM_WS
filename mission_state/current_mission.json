@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-02-02T20:26:05.175479",
+  "timestamp": "2026-02-03T14:41:03.110834",
   "current_phase": "OBSTACLE_HANDLING",
   "robot_pose": {
     "x": 0.0,
@@ -8,33 +8,20 @@
   },
   "visited_frontiers": [
     [
-      0.11765291427314661,
-      -2.33234420581623
+      -0.7838871946673165,
+      -0.4868095008259954
     ]
   ],
-  "localization_confidence": 0.6109806224310042,
-  "time_elapsed": 200.001461,
+  "localization_confidence": 0.6057606132075471,
+  "time_elapsed": 100.001054,
   "frontiers_explored": 1,
   "recovery_attempts": 0,
   "performance_metrics": {
-    "avg_confidence": 0.4987596917804116,
-    "slam_uptime": 0.4166666666666667,
+    "avg_confidence": 0.0,
+    "slam_uptime": 0.0,
     "frontier_revisit_rate": 0.0,
     "navigation_success_rate": 0.0,
     "recovery_success_rate": 0.0
   },
-  "anomalies": [
-    {
-      "type": "FRONTIER_STAGNATION",
-      "severity": "LOW",
-      "message": "Same frontier detected 10 iterations - may be unreachable",
-      "suggestion": "Increase frontier score weight distance for exploration"
-    },
-    {
-      "type": "PERSISTENT_LOW_CONFIDENCE",
-      "severity": "HIGH",
-      "message": "Average SLAM confidence: 0.50 (threshold: 0.7)",
-      "suggestion": "Check LiDAR sensor, verify initial map quality"
-    }
-  ]
+  "anomalies": []
 }

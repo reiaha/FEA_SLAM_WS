@@ -500,9 +500,14 @@ class ExplorationCoordinator(Node):
             # Fallback: try free space exploration directly
             self.explore_free_space()
     
+    def is_path_clear(self, check_distance=0.5):
         """Check if laser scan shows clear path ahead - MORE AGGRESSIVE
-        Returns False if ANY obstacles detected"""
+        Args:
+            check_distance: Maximum distance to check for obstacles (default 0.5m)
+        Returns: 
+            False if ANY obstacles detected"""
         if self.laser_scan_data is None:
+
             return True
         
         # Get front-facing scans
