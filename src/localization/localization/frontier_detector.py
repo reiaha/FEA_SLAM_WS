@@ -17,23 +17,30 @@ class FrontierDetector(Node):
         super().__init__('frontier_detector')
         
         # Parameters
-        self.declare_parameter('min_frontier_size', 5)
+        self.declare_parameter('min_frontier_size', 3)  # Reduced from 5 to catch smaller frontiers
         self.declare_parameter('min_distance_to_frontier', 0.3)
-        self.declare_parameter('frontier_threshold', 50)  # Unknown cell threshold
+        self.declare_parameter('frontier_threshold', 15)  # Unknown cell threshold (lower = more sensitive)
+        self.declare_parameter('free_space_threshold', 20)  # Increased from default for clearer boundaries
         
         self.min_frontier_size = self.get_parameter('min_frontier_size').value
         self.min_distance = self.get_parameter('min_distance_to_frontier').value
         self.frontier_threshold = self.get_parameter('frontier_threshold').value
+        self.free_space_threshold = self.get_parameter('free_space_threshold').value
+        
+        # Performance: throttle processing to avoid slowing down RViz
+        self.last_frontier_time = 0.0
+        self.frontier_throttle_rate = 2.0  # Process at most every 0.5 seconds
         
         # Publishers
         self.frontiers_pub = self.create_publisher(MarkerArray, 'frontiers', 10)
         self.frontier_points_pub = self.create_publisher(PointStamped, 'frontier_points', 10)
         
-        # Subscriber
+        # Subscriber - use TRANSIENT_LOCAL + RELIABLE to match slam_toolbox map publisher
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, rclpy.qos.QoSProfile(
                 depth=1,
                 reliability=rclpy.qos.QoSReliabilityPolicy.RELIABLE,
+                durability=rclpy.qos.QoSDurabilityPolicy.TRANSIENT_LOCAL,
                 history=rclpy.qos.QoSHistoryPolicy.KEEP_LAST
             ))
         
@@ -42,6 +49,12 @@ class FrontierDetector(Node):
     
     def map_callback(self, msg: OccupancyGrid):
         """Analyze map for frontiers"""
+        import time
+        current_time = time.time()
+        if current_time - self.last_frontier_time < 1.0 / self.frontier_throttle_rate:
+            return  # Skip if called too frequently
+        self.last_frontier_time = current_time
+        
         self.map_data = msg
         
         # Get map dimensions
@@ -65,7 +78,8 @@ class FrontierDetector(Node):
         
         # Filter and publish frontiers
         valid_frontiers = []
-        for cluster in frontier_clusters:
+        for i, cluster in enumerate(frontier_clusters):
+            self.get_logger().debug(f'Cluster {i}: size={len(cluster)}, min_required={self.min_frontier_size}')
             if len(cluster) >= self.min_frontier_size:
                 # Calculate centroid
                 cluster_array = np.array(cluster)
@@ -82,84 +96,15 @@ class FrontierDetector(Node):
                     'cell': centroid_cell
                 })
         
-        self.get_logger().info(f'Found {len(valid_frontiers)} frontier clusters')
+        self.get_logger().info(f'Found {len(frontier_clusters)} frontier clusters, {len(valid_frontiers)} are valid (size >= {self.min_frontier_size})')
         
         # Publish frontiers as markers for RViz
-        self.publish_frontier_markers(valid_frontiers, msg.header.frame_id)
-    
-    def find_frontiers(self, map_array):
-        """Find frontier cells (edge between explored and unexplored)"""
-        height, width = map_array.shape
-        frontier_cells = []
-        
-        for y in range(1, height - 1):
-            for x in range(1, width - 1):
-                cell = map_array[y, x]
-                
-                # Skip if cell is known (occupied or free)
-                if cell >= 0 and cell < self.frontier_threshold:
-                    # Check if adjacent to unknown cell
-                    neighbors = [
-                        map_array[y-1, x],
-                        map_array[y+1, x],
-                        map_array[y, x-1],
-                        map_array[y, x+1],
-                        map_array[y-1, x-1],
-                        map_array[y-1, x+1],
-                        map_array[y+1, x-1],
-                        map_array[y+1, x+1]
-                    ]
-                    
-                    # If any neighbor is unknown (>= frontier_threshold), this is a frontier
-                    if any(n >= self.frontier_threshold or n == -1 for n in neighbors):
-                        frontier_cells.append((y, x))
-        
-        return frontier_cells
-    
-    def cluster_frontiers(self, frontier_cells, map_array):
-        """Cluster frontier cells using connected components"""
-        if not frontier_cells:
-            return []
-        
-        visited = set()
-        clusters = []
-        
-        for cell in frontier_cells:
-            if cell not in visited:
-                # BFS to find connected component
-                cluster = []
-                queue = [cell]
-                
-                while queue:
-                    y, x = queue.pop(0)
-                    if (y, x) in visited:
-                        continue
-                    
-                    visited.add((y, x))
-                    cluster.append((y, x))
-                    
-                    # Check neighbors
-                    for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1),
-                                   (-1, -1), (-1, 1), (1, -1), (1, 1)]:
-                        ny, nx = y + dy, x + dx
-                        if 0 <= ny < map_array.shape[0] and 0 <= nx < map_array.shape[1]:
-                            if (ny, nx) not in visited and (ny, nx) in frontier_cells:
-                                queue.append((ny, nx))
-                
-                if cluster:
-                    clusters.append(cluster)
-        
-        return clusters
-    
-    def publish_frontier_markers(self, frontiers, frame_id):
-        """Publish frontiers as RViz markers"""
         marker_array = MarkerArray()
-        
-        for i, frontier in enumerate(frontiers):
+        for i, frontier in enumerate(valid_frontiers):
             marker = Marker()
             marker.header = Header()
             marker.header.stamp = self.get_clock().now().to_msg()
-            marker.header.frame_id = frame_id
+            marker.header.frame_id = msg.header.frame_id
             marker.id = i
             marker.type = Marker.SPHERE
             marker.action = Marker.ADD
@@ -186,6 +131,108 @@ class FrontierDetector(Node):
             marker_array.markers.append(marker)
         
         self.frontiers_pub.publish(marker_array)
+        self.get_logger().info(f'✅ Published MarkerArray with {len(marker_array.markers)} markers to /frontiers')
+        if len(marker_array.markers) > 0:
+            self.get_logger().info(f'   First marker at: ({marker_array.markers[0].pose.position.x:.2f}, {marker_array.markers[0].pose.position.y:.2f})')
+        else:
+            self.get_logger().warn('⚠️  MarkerArray is EMPTY - no markers to publish!')
+    
+    def find_frontiers(self, map_array):
+        """Find frontier cells (edge between explored and unexplored)"""
+        height, width = map_array.shape
+        frontier_cells = []
+        
+        for y in range(1, height - 1):
+            for x in range(1, width - 1):
+                cell = map_array[y, x]
+                
+                # Only consider FREE cells (low cost) - use parameter for threshold
+                if cell >= 0 and cell < self.free_space_threshold:  # Free space only
+                    # Check 4-connectivity neighbors for speed
+                    neighbors = [
+                        map_array[y-1, x],
+                        map_array[y+1, x],
+                        map_array[y, x-1],
+                        map_array[y, x+1]
+                    ]
+                    
+                    # Count unknown neighbors
+                    unknown_count = sum(1 for n in neighbors if n == -1 or n >= self.frontier_threshold)
+                    
+                    # If has unknown neighbors, it's a frontier boundary
+                    if unknown_count > 0:
+                        frontier_cells.append((y, x))
+        
+        return frontier_cells
+    
+    def cluster_frontiers(self, frontier_cells, map_array):
+        """Cluster frontier cells using A* pathfinding-based connectivity"""
+        if not frontier_cells:
+            return []
+        
+        visited = set()
+        clusters = []
+        
+        for cell in frontier_cells:
+            if cell not in visited:
+                # A*-based region growing for more intelligent clustering
+                cluster = self._astar_cluster_region(cell, frontier_cells, map_array, visited)
+                
+                if cluster:
+                    clusters.append(cluster)
+        
+        return clusters
+    
+    def _astar_cluster_region(self, start_cell, all_frontier_cells, map_array, visited):
+        """Use A* to cluster frontier regions by path cost"""
+        import heapq
+        
+        cluster = []
+        # Priority queue: (f_score, g_score, cell)
+        open_set = [(0, 0, start_cell)]
+        g_scores = {start_cell: 0}
+        
+        while open_set:
+            f_score, g_score, current = heapq.heappop(open_set)
+            
+            if current in visited:
+                continue
+            
+            visited.add(current)
+            cluster.append(current)
+            
+            y, x = current
+            
+            # Explore 8-connected neighbors
+            for dy, dx in [(-1, 0), (1, 0), (0, -1), (0, 1),
+                           (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+                ny, nx = y + dy, x + dx
+                neighbor = (ny, nx)
+                
+                # Check bounds and if it's a frontier cell
+                if (0 <= ny < map_array.shape[0] and 
+                    0 <= nx < map_array.shape[1] and
+                    neighbor in all_frontier_cells and
+                    neighbor not in visited):
+                    
+                    # Calculate movement cost (diagonal costs more)
+                    move_cost = 1.414 if abs(dy) + abs(dx) == 2 else 1.0
+                    
+                    # Add terrain cost based on occupancy
+                    cell_cost = abs(map_array[ny, nx]) / 100.0 if map_array[ny, nx] >= 0 else 0.5
+                    
+                    tentative_g = g_score + move_cost + cell_cost
+                    
+                    if neighbor not in g_scores or tentative_g < g_scores[neighbor]:
+                        g_scores[neighbor] = tentative_g
+                        
+                        # Heuristic: Manhattan distance to start (keep cluster compact)
+                        h_score = abs(ny - start_cell[0]) + abs(nx - start_cell[1])
+                        f_score = tentative_g + h_score
+                        
+                        heapq.heappush(open_set, (f_score, tentative_g, neighbor))
+        
+        return cluster
 
 def main(args=None):
     rclpy.init(args=args)

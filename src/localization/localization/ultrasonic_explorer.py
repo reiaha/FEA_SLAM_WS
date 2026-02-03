@@ -20,8 +20,8 @@ class LidarExplorer(Node):
         super().__init__('lidar_explorer')
         
         # Parameters
-        self.declare_parameter('obstacle_distance', 0.35)  
-        self.declare_parameter('safe_distance', 0.45)     
+        self.declare_parameter('obstacle_distance', 0.25)  # Reduced from 0.35m
+        self.declare_parameter('safe_distance', 0.35)     # Reduced from 0.45m
         self.declare_parameter('forward_speed', 0.15)     
         self.declare_parameter('turn_speed', 0.4)         
         self.declare_parameter('exploration_timeout', 300.0)  
@@ -45,8 +45,12 @@ class LidarExplorer(Node):
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, 10)
         
-        # Publisher
+        # Publishers
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Publish obstacle warnings for autonomous exploration
+        from std_msgs.msg import Bool, Float32
+        self.obstacle_warning_pub = self.create_publisher(Bool, '/obstacle_warning', 10)
+        self.front_distance_pub = self.create_publisher(Float32, '/front_obstacle_distance', 10)
         
         # Nav2 action client (to check if Nav2 is ready)
         self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
@@ -56,8 +60,10 @@ class LidarExplorer(Node):
         self.left_distance = float('inf')       # distance to left (90-180°)
         self.right_distance = float('inf')      # distance to right (-90 to 0°)
         self.map_received = False
-        self.exploring = True
+        self.exploring = False  # ⚠️ Start as FALSE - don't move until Nav2 confirmed ready
         self.nav2_ready = False  # Track if Nav2 is ready to take over
+        self.nav2_init_delay = 30.0  # Match exploration_coordinator - wait 30s for Nav2
+        self.init_time = self.get_clock().now()
         self.start_time = self.get_clock().now()
         self.turn_direction = 0  # 0=forward, 1=turn left, -1=turn right
         
@@ -129,7 +135,34 @@ class LidarExplorer(Node):
     
     def control_loop(self):
         """Main control loop for LiDAR-based 180° exploration"""
-        # If Nav2 took over, don't publish anything
+        # Wait for Nav2 to be fully operational (it starts FIRST now)
+        if not self.nav2_ready:
+            elapsed = (self.get_clock().now() - self.init_time).nanoseconds / 1e9
+            if elapsed < self.nav2_init_delay:
+                remaining = self.nav2_init_delay - elapsed
+                if int(elapsed) % 3 == 0 and remaining > 1:
+                    self.get_logger().info(f'⏳ LiDAR Explorer waiting for Nav2... ({remaining:.0f}s remaining)')
+                return
+            else:
+                self.get_logger().info('✅ Nav2 is operational. Starting LiDAR exploration...')
+                if self.nav_client.wait_for_server(timeout_sec=2.0):
+                    self.nav2_ready = True
+                    self.start_time = self.get_clock().now()
+                else:
+                    self.get_logger().warn('⚠️  Nav2 server not available yet, retrying...')
+                    return
+        
+        # Publish obstacle detection data even when Nav2 is in control
+        from std_msgs.msg import Bool, Float32
+        obstacle_msg = Bool()
+        obstacle_msg.data = self.front_distance < self.obstacle_dist
+        self.obstacle_warning_pub.publish(obstacle_msg)
+        
+        distance_msg = Float32()
+        distance_msg.data = float(self.front_distance)
+        self.front_distance_pub.publish(distance_msg)
+        
+        # If Nav2 took over, don't publish cmd_vel
         if not self.exploring:
             return
         
@@ -194,8 +227,9 @@ class LidarExplorer(Node):
             self.nav2_ready = True
             self.exploring = False  # Stop publishing cmd_vel
             self.stop_robot()
-            self.get_logger().info('✅ Nav2 /navigate_to_pose is READY! Handing off control to frontier exploration.')
-            self.get_logger().info('   Stopping ultrasonic_explorer to avoid cmd_vel conflicts.')
+            self.get_logger().info('✅ Nav2 /navigate_to_pose is READY! Handing off cmd_vel control to frontier exploration.')
+            self.get_logger().info('   ultrasonic_explorer will continue monitoring obstacles in background.')
+            # Note: Keep running for continuous obstacle detection, just stop publishing cmd_vel
         else:
             self.get_logger().debug('⏳ Waiting for Nav2 /navigate_to_pose action server...')
 

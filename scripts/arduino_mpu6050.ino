@@ -50,6 +50,9 @@ const int MOTOR_B_PWM = 6;
 int motorA_speed = 0;
 int motorB_speed = 0;
 
+// Safety: motors disabled until START command
+bool motors_enabled = false;
+
 // Serial communication buffer
 String inputBuffer = "";
 const char COMMAND_DELIMITER = '\n';
@@ -194,6 +197,10 @@ void setMotorB(int speed) {
 }
 
 void setMotors(int speedA, int speedB) {
+  if (!motors_enabled) {
+    // Motors are disabled - ignore command
+    return;
+  }
   setMotorA(speedA);
   setMotorB(speedB);
 }
@@ -223,6 +230,28 @@ void turnRight(int speed) {
 void processCommand(String cmd) {
   cmd.trim();  // Remove whitespace
   
+  // Command format: START (enable motors)
+  if (cmd == "START") {
+    motors_enabled = true;
+    stopMotors();
+    Serial.println("ACK:START - Motors ENABLED");
+    return;
+  }
+  
+  // Command format: STOP (disable motors)
+  if (cmd == "STOP") {
+    motors_enabled = false;
+    stopMotors();
+    Serial.println("ACK:STOP - Motors DISABLED");
+    return;
+  }
+  
+  // If motors are disabled, ignore movement commands
+  if (!motors_enabled) {
+    Serial.println("ERR: Motors disabled (send START first)");
+    return;
+  }
+  
   // Command format: MOTOR:speedA,speedB
   // Example: "MOTOR:100,-50" - Motor A forward at 100, Motor B backward at 50
   
@@ -243,11 +272,6 @@ void processCommand(String cmd) {
       Serial.print(speedA); Serial.print(",");
       Serial.println(speedB);
     }
-  }
-  // Command format: STOP
-  else if (cmd == "STOP") {
-    stopMotors();
-    Serial.println("ACK:STOP");
   }
   // Command format: FWD:speed
   else if (cmd.startsWith("FWD:")) {

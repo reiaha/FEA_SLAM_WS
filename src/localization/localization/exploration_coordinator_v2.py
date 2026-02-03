@@ -131,6 +131,11 @@ class ExplorationCoordinator(Node):
         self.current_global_path = None
         self.path_valid = False
         
+        # ==================== UNREACHABLE FRONTIER TRACKING ====================
+        self.failed_frontiers = {}  # frontier_id (x,y tuple) -> failure_count
+        self.max_frontier_failures = 3  # Skip frontier after 3 planning failures
+        self.current_goal_pos = None  # Track current goal position for failure tracking
+        
         # ==================== LOCAL PLANNER STATE (DWA) ====================
         self.dwa_window_size = 0.5  # meters
         self.velocity_samples = 8
@@ -961,21 +966,32 @@ class ExplorationCoordinator(Node):
                     self.get_logger().debug('Waiting for frontier detection or path to clear')
                 return
             
-            # Score all frontiers
+            # Score all frontiers (skip unreachable ones)
             robot_x = self.robot_pose.pose.position.x
             robot_y = self.robot_pose.pose.position.y
             
             self.get_logger().info(f'🔍 Phase 3: Scoring {len(self.current_frontiers)} frontiers from robot position ({robot_x:.2f}, {robot_y:.2f})')
+            if self.failed_frontiers:
+                self.get_logger().info(f'   ⚠️  {len(self.failed_frontiers)} unreachable frontiers marked as failed')
             
             best_frontier = None
             best_score = float('inf')
             
             for i, frontier in enumerate(self.current_frontiers):
+                fx = frontier.pose.position.x
+                fy = frontier.pose.position.y
+                frontier_key = (round(fx, 2), round(fy, 2))
+                
+                # Skip frontiers that have failed too many times
+                if frontier_key in self.failed_frontiers:
+                    fail_count = self.failed_frontiers[frontier_key]
+                    if fail_count >= self.max_frontier_failures:
+                        self.get_logger().debug(f'   ⏭️  Frontier {i}: pos=({fx:.2f}, {fy:.2f}) - SKIPPED (failed {fail_count}x)')
+                        continue
+                
                 score = self.score_frontier(frontier, robot_x, robot_y)
                 self.frontier_scores[i] = score
                 
-                fx = frontier.pose.position.x
-                fy = frontier.pose.position.y
                 self.get_logger().info(f'   Frontier {i}: pos=({fx:.2f}, {fy:.2f}), score={score:.2f}')
                 
                 if score < best_score:
@@ -1015,6 +1031,9 @@ class ExplorationCoordinator(Node):
                 goal_pose.pose.position.x = self.current_best_frontier.pose.position.x
                 goal_pose.pose.position.y = self.current_best_frontier.pose.position.y
                 goal_pose.pose.orientation.w = 1.0
+                
+                # Track current goal for failure tracking
+                self.current_goal_pos = (goal_pose.pose.position.x, goal_pose.pose.position.y)
                 
                 # Mark as visited
                 self.visited_frontiers.append((goal_pose.pose.position.x, goal_pose.pose.position.y))
@@ -1101,13 +1120,30 @@ class ExplorationCoordinator(Node):
             self.get_logger().error(f'❌ Goal response error: {e}')
     
     def goal_result_callback(self, future):
-        """Handle goal result"""
+        """Handle goal result and track unreachable frontiers"""
         result = future.result()
+        goal_x = self.current_goal_pos[0] if self.current_goal_pos else 0.0
+        goal_y = self.current_goal_pos[1] if self.current_goal_pos else 0.0
+        frontier_key = (round(goal_x, 2), round(goal_y, 2))
+        
         if result and result.result:
-            self.get_logger().info('✅ Successfully reached frontier!')
+            self.get_logger().info(f'✅ Successfully reached frontier at ({goal_x:.2f}, {goal_y:.2f})!')
+            # Clear failure count on success
+            if frontier_key in self.failed_frontiers:
+                del self.failed_frontiers[frontier_key]
         else:
-            self.get_logger().warn('⚠️  Failed to reach frontier')
+            # Track planning or navigation failure
+            self.get_logger().warn(f'⚠️  Failed to reach frontier at ({goal_x:.2f}, {goal_y:.2f})')
+            self.failed_frontiers[frontier_key] = self.failed_frontiers.get(frontier_key, 0) + 1
+            
+            if self.failed_frontiers[frontier_key] >= self.max_frontier_failures:
+                self.get_logger().warn(f'🚫 Frontier ({goal_x:.2f}, {goal_y:.2f}) marked as unreachable after {self.max_frontier_failures} attempts')
+            else:
+                remaining = self.max_frontier_failures - self.failed_frontiers[frontier_key]
+                self.get_logger().warn(f'   {remaining} more attempts before giving up on this frontier')
+        
         self.goal_handle = None
+        self.current_goal_pos = None
     
     def is_frontier_visited(self, x, y):
         """Check if frontier is visited (with larger detection radius)"""
