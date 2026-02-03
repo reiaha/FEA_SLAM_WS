@@ -305,7 +305,14 @@ class ExplorationCoordinator(Node):
     def obstacle_distance_callback(self, msg):
         """Receive front obstacle distance from ultrasonic_explorer - REAL-TIME"""
         self.front_obstacle_distance = msg.data
-        # Log close obstacles
+        
+        # Respect startup delay - don't log warnings during initialization phase
+        if self.obstacle_enable_time is not None:
+            current_time = self.get_clock().now().nanoseconds
+            if current_time < self.obstacle_enable_time:
+                return  # Ignore during startup phase
+        
+        # Log close obstacles only after startup phase
         if self.front_obstacle_distance < 0.5 and self.obstacle_warning:
             self.get_logger().warn(f'⚠️  CLOSE OBSTACLE: {self.front_obstacle_distance:.3f}m ahead!')
     
@@ -435,6 +442,13 @@ class ExplorationCoordinator(Node):
         # Ultrasonic sensor: ACTIVE real-time obstacle detection at 50cm threshold
         # INCREASED from 0.3m (30cm) because false positives were locking up the robot
         OBSTACLE_THRESHOLD = 0.5  # 50cm
+        
+        # Check startup delay - never trigger collision handler during initialization
+        if self.obstacle_enable_time is not None:
+            current_time = self.get_clock().now().nanoseconds
+            if current_time < self.obstacle_enable_time:
+                # Startup phase - ignore obstacles
+                return True
         
         if self.obstacle_warning and self.front_obstacle_distance < OBSTACLE_THRESHOLD:
             self.get_logger().warn(f'🚨 OBSTACLE CRITICAL! {self.front_obstacle_distance:.2f}m < {OBSTACLE_THRESHOLD}m threshold')
