@@ -282,9 +282,9 @@ class ExplorationCoordinator(Node):
     
     def obstacle_warning_callback(self, msg):
         """Receive obstacle warning from ultrasonic_explorer - REAL-TIME with startup delay"""
-        # Delay obstacle detection for first 5 seconds to avoid false startup positives
+        # Delay obstacle detection for first 20 seconds to allow SLAM to stabilize transforms
         if self.obstacle_enable_time is None:
-            self.obstacle_enable_time = self.get_clock().now().nanoseconds + (5 * 10**9)  # 5 second delay
+            self.obstacle_enable_time = self.get_clock().now().nanoseconds + (20 * 10**9)  # 20 second delay
         
         current_time = self.get_clock().now().nanoseconds
         if current_time < self.obstacle_enable_time:
