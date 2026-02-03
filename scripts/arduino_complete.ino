@@ -12,8 +12,8 @@
 
 #define OBSTACLE_CM         30.0
 #define OBSTACLE_CLEAR_CM   35.0
-#define AVOID_BACKUP_MS     350
-#define AVOID_TURN_MS       450
+#define AVOID_BACKUP_MS     800
+#define AVOID_TURN_MS       900
 
 Adafruit_MPU6050 mpu;
 

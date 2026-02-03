@@ -459,7 +459,7 @@ class ExplorationCoordinator(Node):
         import time
         try:
             self.get_logger().info('📡 Opening serial connection to Arduino...')
-            ser = serial.Serial('/dev/ttyACM1', 115200, timeout=0.5)
+            ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.5)
             ser.write(b'BWD\n')
             response = ser.readline().decode().strip()
             self.get_logger().info(f'✅ Arduino backward response: {response}')
