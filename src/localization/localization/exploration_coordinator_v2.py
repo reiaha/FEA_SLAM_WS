@@ -167,6 +167,7 @@ class ExplorationCoordinator(Node):
         }
         self.startup_time = datetime.now()
         self.mission_start_time = None
+        self.obstacle_enable_time = None  # Delay obstacle detection at startup to prevent false lockups
         
         # ==================== PRODUCTION: ANOMALY DETECTION ====================
         self.confidence_history = deque(maxlen=50)
@@ -280,7 +281,16 @@ class ExplorationCoordinator(Node):
         self.map_metadata = msg.info
     
     def obstacle_warning_callback(self, msg):
-        """Receive obstacle warning from ultrasonic_explorer - REAL-TIME"""
+        """Receive obstacle warning from ultrasonic_explorer - REAL-TIME with startup delay"""
+        # Delay obstacle detection for first 5 seconds to avoid false startup positives
+        if self.obstacle_enable_time is None:
+            self.obstacle_enable_time = self.get_clock().now().nanoseconds + (5 * 10**9)  # 5 second delay
+        
+        current_time = self.get_clock().now().nanoseconds
+        if current_time < self.obstacle_enable_time:
+            # Ignore obstacle warnings during startup phase
+            return
+        
         self.obstacle_warning = msg.data
         if msg.data:
             self.consecutive_obstacle_detections += 1
@@ -417,13 +427,14 @@ class ExplorationCoordinator(Node):
     
     def is_path_clear(self, check_distance=1.5, check_width=0.6):
         """Check if path ahead is clear for forward movement using laser scan AND ultrasonic
-        THRESHOLD: 0.3m (30cm) - Move backward if obstacle detected
+        THRESHOLD: 0.5m (50cm) - Increased from 0.3m to prevent false positive lockup
         Args:
             check_distance: How far ahead to check (meters)
             check_width: Width of the path to check (meters from center)
         """
-        # Ultrasonic sensor: ACTIVE real-time obstacle detection at 30cm threshold
-        OBSTACLE_THRESHOLD = 0.3  # 30cm
+        # Ultrasonic sensor: ACTIVE real-time obstacle detection at 50cm threshold
+        # INCREASED from 0.3m (30cm) because false positives were locking up the robot
+        OBSTACLE_THRESHOLD = 0.5  # 50cm
         
         if self.obstacle_warning and self.front_obstacle_distance < OBSTACLE_THRESHOLD:
             self.get_logger().warn(f'🚨 OBSTACLE CRITICAL! {self.front_obstacle_distance:.2f}m < {OBSTACLE_THRESHOLD}m threshold')
@@ -465,32 +476,6 @@ class ExplorationCoordinator(Node):
         self.explore_free_space()  # Non-blocking - just queues next goal
         
         # Note: No time.sleep() here - allows real-time frontier updates to continue
-            
-            goal_pose = PoseStamped()
-            goal_pose.header.frame_id = 'map'
-            goal_pose.header.stamp = self.get_clock().now().to_msg()
-            goal_pose.pose.position.x = goal_x
-            goal_pose.pose.position.y = goal_y
-            goal_pose.pose.position.z = 0.0
-            goal_pose.pose.orientation = transform.transform.rotation
-            
-            goal_msg = NavigateToPose.Goal()
-            goal_msg.pose = goal_pose
-            
-            self.get_logger().info(f'⬅️  Sending BACKWARD goal: move {backward_distance}m back')
-            future = self.nav_client.send_goal_async(goal_msg)
-            future.add_done_callback(self.goal_response_callback)
-            
-            # Step 3: After short delay, find clear path
-            import time
-            time.sleep(0.5)
-            self.get_logger().info('Step 2: Finding clear path...')
-            self.explore_free_space()
-            
-        except Exception as e:
-            self.get_logger().error(f'❌ Backward movement failed: {e}')
-            # Fallback: try free space exploration directly
-            self.explore_free_space()
     
     def is_path_clear(self, check_distance=0.5):
         """Check if laser scan shows clear path ahead - MORE AGGRESSIVE
@@ -778,9 +763,9 @@ class ExplorationCoordinator(Node):
     
     def detect_blocking_obstacles(self):
         """Detect and track persistent obstacles (Phase 6)
-        THRESHOLD: 0.3m (30cm) - immediate backward + alternate path action"""
-        # AGGRESSIVE detection at 30cm threshold
-        OBSTACLE_THRESHOLD = 0.3  # 30cm
+        THRESHOLD: 0.5m (50cm) - Increased from 0.3m to prevent false lockup"""
+        # Detection threshold increased to 0.5m to avoid false positive lockups
+        OBSTACLE_THRESHOLD = 0.5  # 50cm (was 30cm)
         MIN_DETECTIONS = 2  # Only 2 detections (~0.2 seconds at 10Hz)
         
         if (self.obstacle_warning and 
