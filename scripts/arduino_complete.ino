@@ -7,7 +7,7 @@
 #define MIN_SPEED       0
 #define MAX_SPEED       255
 #define FORWARD_SPEED   210
-#define BACKWARD_SPEED  150
+#define BACKWARD_SPEED  200
 #define TURN_SPEED      220
 
 #define OBSTACLE_CM         30.0

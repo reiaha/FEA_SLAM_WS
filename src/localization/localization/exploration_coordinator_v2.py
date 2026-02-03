@@ -441,9 +441,9 @@ class ExplorationCoordinator(Node):
         return True
     
     def _handle_obstacle_collision(self):
-        """Handle obstacle collision: Move backward, then find alternate path"""
+        """Handle obstacle collision: Move backward via Arduino, then find alternate path"""
         self.get_logger().error(f'💥 OBSTACLE COLLISION at {self.front_obstacle_distance:.2f}m!')
-        self.get_logger().info('Step 1: Moving BACKWARD to clear obstacle...')
+        self.get_logger().info('Step 1: Sending DIRECT backward command to Arduino...')
         
         # Step 1: Cancel current navigation goal
         if self.goal_handle is not None:
@@ -454,25 +454,63 @@ class ExplorationCoordinator(Node):
             except:
                 pass
         
-        # Step 2: Move backward using Nav2
+        # Step 2: DIRECT ARDUINO BACKWARD - Fastest response, bypasses Nav2
+        import serial
+        import time
         try:
-            transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
-            
-            # Get current pose and orientation
-            robot_x = transform.transform.translation.x
-            robot_y = transform.transform.translation.y
-            qx = transform.transform.rotation.x
-            qy = transform.transform.rotation.y
-            qz = transform.transform.rotation.z
-            qw = transform.transform.rotation.w
-            
-            # Current yaw
-            current_yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-            
-            # Move backward 0.5m (opposite direction)
-            backward_distance = 0.5
-            goal_x = robot_x - backward_distance * math.cos(current_yaw)
-            goal_y = robot_y - backward_distance * math.sin(current_yaw)
+            self.get_logger().info('📡 Opening serial connection to Arduino...')
+            ser = serial.Serial('/dev/ttyACM1', 115200, timeout=0.5)
+            ser.write(b'BWD\n')
+            response = ser.readline().decode().strip()
+            self.get_logger().info(f'✅ Arduino backward response: {response}')
+            ser.close()
+            time.sleep(1.0)  # Wait for backward motion to complete
+            self.get_logger().info('Step 2: Finding alternate path after backward motion...')
+            self.explore_free_space()
+        except Exception as e:
+            self.get_logger().warn(f'⚠️  Direct Arduino backward failed: {e}')
+            self.get_logger().info('Fallback: Using Nav2 for backward movement...')
+            # Fallback to Nav2 for backward movement
+            try:
+                transform = self.tf_buffer.lookup_transform('map', 'base_link', rclpy.time.Time())
+                
+                # Get current pose and orientation
+                robot_x = transform.transform.translation.x
+                robot_y = transform.transform.translation.y
+                qx = transform.transform.rotation.x
+                qy = transform.transform.rotation.y
+                qz = transform.transform.rotation.z
+                qw = transform.transform.rotation.w
+                
+                # Current yaw
+                current_yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+                
+                # Move backward 0.5m (opposite direction)
+                backward_distance = 0.5
+                goal_x = robot_x - backward_distance * math.cos(current_yaw)
+                goal_y = robot_y - backward_distance * math.sin(current_yaw)
+                
+                goal_pose = PoseStamped()
+                goal_pose.header.frame_id = 'map'
+                goal_pose.header.stamp = self.get_clock().now().to_msg()
+                goal_pose.pose.position.x = goal_x
+                goal_pose.pose.position.y = goal_y
+                goal_pose.pose.position.z = 0.0
+                goal_pose.pose.orientation = transform.transform.rotation
+                
+                goal_msg = NavigateToPose.Goal()
+                goal_msg.pose = goal_pose
+                
+                self.get_logger().info(f'⬅️  Sending Nav2 backward goal: move {backward_distance}m back')
+                future = self.nav_client.send_goal_async(goal_msg)
+                future.add_done_callback(self.goal_response_callback)
+                
+                time.sleep(1.0)
+                self.get_logger().info('Step 2: Finding clear path...')
+                self.explore_free_space()
+            except Exception as nav_e:
+                self.get_logger().error(f'❌ Nav2 fallback also failed: {nav_e}')
+                self.explore_free_space()
             
             goal_pose = PoseStamped()
             goal_pose.header.frame_id = 'map'
