@@ -23,18 +23,24 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('max_speed', 255)    # INCREASED from 200 to 255 (max PWM)
         # Motion shaping
         self.declare_parameter('velocity_deadband', 0.015)  #Lower for more sensitivity; higher for more stability
-        self.declare_parameter('min_pwm', 80)  # INCREASED from 50 to 80 for better initial torque
-        self.declare_parameter('pwm_slew_rate', 60)  # INCREASED from 40 to 60 for faster acceleration
+        self.declare_parameter('min_pwm', 120)  # INCREASED to 120 for heavier robot - ensures motors always have enough torque
+        self.declare_parameter('pwm_slew_rate', 255)  # INSTANT response - no ramping delay for heavy robot
+        self.declare_parameter('recovery_speed_threshold', 0.35)  # m/s - skip slew limit only for recovery/unstuck moves
         self.declare_parameter('ultrasonic_zero_means_no_echo', True)
+        self.declare_parameter('use_cmd_vel_for_odom', True)  # Enable temporarily until real encoders added
         
         serial_port = self.get_parameter('serial_port').value
         baud_rate = self.get_parameter('baud_rate').value
         self.wheel_base = self.get_parameter('wheel_base').value
         self.max_speed = self.get_parameter('max_speed').value
         self.ultrasonic_zero_means_no_echo = self.get_parameter('ultrasonic_zero_means_no_echo').value
+        self.use_cmd_vel_for_odom = self.get_parameter('use_cmd_vel_for_odom').value
         self.velocity_deadband = self.get_parameter('velocity_deadband').value
         self.min_pwm = int(self.get_parameter('min_pwm').value)
         self.pwm_slew_rate = int(self.get_parameter('pwm_slew_rate').value)
+        self.recovery_speed_threshold = float(self.get_parameter('recovery_speed_threshold').value)
+        self.last_cmd_vel_log_time = 0.0
+        self.last_no_serial_log_time = 0.0
         
         # Publishers
         self.imu_pub = self.create_publisher(Imu, 'imu/data_raw', 10)
@@ -52,9 +58,11 @@ class ArduinoMotorBridge(Node):
         self.last_cmd_left = 0
         self.last_cmd_right = 0
         
-        # Subscriber for motor commands
+        # Subscriber for motor commands (accept both cmd_vel and cmd_vel_nav)
         self.cmd_vel_sub = self.create_subscription(
             Twist, 'cmd_vel', self.cmd_vel_callback, 10)
+        self.cmd_vel_nav_sub = self.create_subscription(
+            Twist, 'cmd_vel_nav', self.cmd_vel_callback, 10)
 
         # Subscriber for servo commands (angle in degrees)
         self.servo_sub = self.create_subscription(
@@ -69,20 +77,41 @@ class ArduinoMotorBridge(Node):
         self.reconnect_backoff = 0.1  # Start with 100ms, exponential backoff
         self.last_reconnect_attempt = 0  # Timestamp of last attempt
         try:
-            self.ser = serial.Serial(serial_port, baud_rate, timeout=1)
-            time.sleep(2)  # Allow Arduino reset
-            # Flush any residual data from startup/reset
-            self.ser.reset_input_buffer()
-            self.ser.reset_output_buffer()
-            self.get_logger().info(f'Arduino connected on {serial_port}')
+            ports_to_try = []
+            for port in [serial_port, '/dev/ttyACM0', '/dev/ttyUSB0']:
+                if port and port not in ports_to_try:
+                    ports_to_try.append(port)
+
+            self.ser = None
+            for port in ports_to_try:
+                try:
+                    self.ser = serial.Serial(port, baud_rate, timeout=1)
+                    self.serial_port = port
+                    time.sleep(2)  # Allow Arduino reset
+                    # Flush any residual data from startup/reset
+                    self.ser.reset_input_buffer()
+                    self.ser.reset_output_buffer()
+                    self.get_logger().info(f'Arduino connected on {port}')
+                    break
+                except serial.SerialException as e:
+                    self.get_logger().warn(f'Failed to open {port}: {e}')
+
+            if self.ser is None:
+                raise serial.SerialException(f'No usable serial port found (tried: {ports_to_try})')
             
             # Auto-enable motors for autonomous operation
             self.ser.write(b'START\n')
             time.sleep(0.1)
             self.get_logger().info('✅ Motors ENABLED - Robot ready for autonomous operation')
+            
+            # Disable Arduino's local obstacle avoidance (let ROS2 handle it)
+            self.ser.write(b'AUTO:OFF\n')
+            time.sleep(0.1)
+            self.get_logger().info('✅ Arduino local avoidance DISABLED - ROS2 has full control')
+            
             self.reconnect_backoff = 0.1  # Reset backoff on success
         except serial.SerialException as e:
-            self.get_logger().error(f'Failed to open {serial_port}: {e}')
+            self.get_logger().error(f'Failed to open serial port: {e}')
             self.ser = None
             
         # Timer for reading sensor data
@@ -121,14 +150,19 @@ class ArduinoMotorBridge(Node):
         Convert cmd_vel (linear.x, angular.z) to differential drive motor speeds
         """
         if not self.ser:
+            now = time.time()
+            if now - self.last_no_serial_log_time >= 1.0:
+                self.get_logger().error('cmd_vel received but serial not connected to Arduino')
+                self.last_no_serial_log_time = now
             return
         
         linear = msg.linear.x   # m/s
         angular = msg.angular.z  # rad/s
         
-        # Track velocity for odometry integration
-        self.last_linear = linear
-        self.last_angular = angular
+        # Track velocity for odometry integration (optional)
+        if self.use_cmd_vel_for_odom:
+            self.last_linear = linear
+            self.last_angular = angular
         
         # Differential drive kinematics
         v_left = linear - (angular * self.wheel_base / 2.0)
@@ -157,11 +191,31 @@ class ArduinoMotorBridge(Node):
         speed_right = max(-255, min(255, speed_right))
         
         # Send command to Arduino
-        # Slew-limit to reduce jerkiness
-        speed_left = self.slew_limit(self.last_cmd_left, speed_left)
-        speed_right = self.slew_limit(self.last_cmd_right, speed_right)
+        # Slew-limit to reduce jerkiness (skip during recovery/high-power commands)
+        if abs(linear) < self.recovery_speed_threshold:
+            speed_left = self.slew_limit(self.last_cmd_left, speed_left)
+            speed_right = self.slew_limit(self.last_cmd_right, speed_right)
+
+        # Re-enforce minimum PWM AFTER slew limiting to avoid weak commands
+        if speed_left != 0:
+            sign_l = 1 if speed_left > 0 else -1
+            speed_left = sign_l * max(self.min_pwm, abs(speed_left))
+        if speed_right != 0:
+            sign_r = 1 if speed_right > 0 else -1
+            speed_right = sign_r * max(self.min_pwm, abs(speed_right))
+
+        # Final constrain
+        speed_left = max(-255, min(255, speed_left))
+        speed_right = max(-255, min(255, speed_right))
         self.last_cmd_left = speed_left
         self.last_cmd_right = speed_right
+
+        now = time.time()
+        if now - self.last_cmd_vel_log_time >= 1.0:
+            self.get_logger().info(
+                f'cmd_vel: linear={linear:.2f} m/s angular={angular:.2f} rad/s -> PWM L={speed_left} R={speed_right}'
+            )
+            self.last_cmd_vel_log_time = now
 
         command = f"MOTOR:{speed_left},{speed_right}\n"
         try:
@@ -348,8 +402,12 @@ class ArduinoMotorBridge(Node):
         self.last_odom_time = now
         
         # Integrate velocity to update pose
-        linear = self.last_linear
-        angular = self.last_angular
+        if self.use_cmd_vel_for_odom:
+            linear = self.last_linear
+            angular = self.last_angular
+        else:
+            linear = 0.0
+            angular = 0.0
         
         if abs(linear) > 0.001 or abs(angular) > 0.001:
             # Update heading

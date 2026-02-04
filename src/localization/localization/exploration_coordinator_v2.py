@@ -29,7 +29,9 @@ from nav2_msgs.srv import SaveMap, ManageLifecycleNodes
 from geometry_msgs.msg import PoseStamped, PointStamped, TransformStamped, Twist
 from visualization_msgs.msg import MarkerArray
 from std_msgs.msg import Bool, Float32
+from std_srvs.srv import Empty
 from nav_msgs.msg import OccupancyGrid
+from action_msgs.msg import GoalStatus
 from sensor_msgs.msg import LaserScan
 from tf2_ros import TransformListener, Buffer
 import math
@@ -60,7 +62,7 @@ class ExplorationCoordinator(Node):
         # ==================== PHASE 1: SYSTEM INITIALIZATION ====================
         self.declare_parameter('max_exploration_time', 3600.0)
         self.declare_parameter('frontier_selection_method', 'astar')  # 'bfs', 'astar', 'gain'
-        self.declare_parameter('nav2_init_delay', 10.0)  # Reduced from 30s - Nav2 is usually ready faster
+        self.declare_parameter('nav2_init_delay', 15.0)  # Wait max 15s, then proceed without Nav2
         self.declare_parameter('localization_confidence_threshold', 0.7)
         self.declare_parameter('frontier_score_weight_distance', 0.4)
         self.declare_parameter('frontier_score_weight_gain', 0.6)
@@ -75,6 +77,7 @@ class ExplorationCoordinator(Node):
         self.frontier_gain_weight = self.get_parameter('frontier_score_weight_gain').value
         self.obstacle_threshold = self.get_parameter('obstacle_persistence_threshold').value
         self.coverage_threshold = self.get_parameter('coverage_threshold').value
+        self.no_frontier_cycles_required = 10  # ~5s at 2Hz before declaring completion
         
         # Phase tracking
         self.current_phase = SystemPhase.INITIALIZATION
@@ -107,12 +110,19 @@ class ExplorationCoordinator(Node):
             Float32, '/front_obstacle_distance', self.obstacle_distance_callback, 10)
         self.laser_scan_sub = self.create_subscription(
             LaserScan, '/scan', self.laser_scan_callback, 10)
+        # Monitor cmd_vel to verify Nav2 is publishing
+        self.cmd_vel_monitor_sub = self.create_subscription(
+            Twist, '/cmd_vel', self.cmd_vel_monitor_callback, 10)
         
         # Publishers
         self.current_goal_pub = self.create_publisher(PointStamped, 'current_frontier_goal', 10)
-        # NOTE: DO NOT publish to /cmd_vel - it conflicts with Nav2 controller!
-        # Arduino subscribes to /cmd_vel, and Nav2 controller is already publishing there.
-        # All movement must go through Nav2 goals to avoid conflicts.
+        # Emergency stop publisher (only for collision avoidance)
+        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_vel_nav_pub = self.create_publisher(Twist, '/cmd_vel_nav', 10)
+        
+        # ==================== CMD_VEL MONITORING ====================
+        self.last_cmd_vel_time = None
+        self.nav2_is_driving = False
         
         # ==================== SLAM STATE ====================
         self.robot_pose = PoseStamped()
@@ -125,7 +135,8 @@ class ExplorationCoordinator(Node):
         self.current_frontiers = []
         self.frontier_scores = {}  # frontier_id -> score
         self.visited_frontiers = []
-        self.min_frontier_distance = 0.8
+        self.min_frontier_distance = 1.0
+        self.no_frontier_cycles = 0
         
         # ==================== GLOBAL PLANNER STATE ====================
         self.current_global_path = None
@@ -150,6 +161,26 @@ class ExplorationCoordinator(Node):
         self.exploration_mode = 'frontier'  # 'frontier' or 'free_space' exploration mode
         self.stuck_counter = 0  # Counter for detecting if robot is stuck
         self.last_pose = None  # Track last pose to detect if stuck
+        self.obstacle_ignore_until = 0.0  # Cooldown time after backing up (seconds)
+        self.obstacle_cooldown_sec = 2.0  # Ignore repeated triggers for 2s after backup
+        self.obstacle_trigger_distance = 0.35  # meters (back up when closer than this) - adjusted for actual environment
+        self.obstacle_clear_distance = 0.45  # meters (must clear to re-arm) - adjusted for actual environment
+        self.obstacle_clear_required = 3  # consecutive clear cycles
+        self.obstacle_clear_count = 0
+        self.force_obstacle_recovery = False  # Request immediate backup on detection
+        self.in_obstacle_recovery = False  # Prevent re-entrant recovery
+        
+        # ==================== REAL-WORLD OBSTACLE RECOVERY (Auto-bypass for deployment) ====================
+        self.stuck_time = 0.0  # Time spent stuck on same obstacle
+        self.stuck_threshold = 15.0  # seconds - if stuck >15s, activate recovery
+        self.recovery_attempts = 0  # Count recovery attempts
+        self.max_recovery_attempts = 3  # Try 3 different recovery strategies before forcing bypass
+        self.recovery_direction = 0  # 0=backup, 1=turn_left, -1=turn_right
+        self.obstacle_recovery_mode = False  # Flag for active recovery
+        self.startup_grace_period = 5.0  # Disable obstacle detection for 5s at startup (avoid false lockup)
+        self.obstacle_detect_enabled_time = None  # When obstacle detection becomes active
+        self.startup_rejections = 0  # Count rejections at origin
+        self.startup_recovery_done = False  # Track if we've done startup unstuck maneuver
         
         # ==================== PRODUCTION: MISSION STATE PERSISTENCE ====================
         self.state_dir = os.path.expanduser('~/FEA_SLAM_WS/mission_state')
@@ -191,6 +222,7 @@ class ExplorationCoordinator(Node):
         self.exploring = False
         self.goal_handle = None
         self.nav2_ready = False
+        self.nav2_costmaps_ready = False
         self.start_time = None
         self.init_time = self.get_clock().now()
         
@@ -198,6 +230,15 @@ class ExplorationCoordinator(Node):
         self.frontiers_visited = 0
         self.total_distance_traveled = 0.0
         self.recovery_attempts = 0
+        
+        # ==================== NAV2 COSTMAP SERVICES ====================
+        # Service clients for Nav2 costmap management
+        self.clear_global_costmap_client = self.create_client(
+            Empty, '/global_costmap/clear_entirely_global_costmap'
+        )
+        self.clear_local_costmap_client = self.create_client(
+            Empty, '/local_costmap/clear_entirely_local_costmap'
+        )
         
         # Timer for main control loop
         self.timer = self.create_timer(2.0, self.exploration_loop)
@@ -271,9 +312,12 @@ class ExplorationCoordinator(Node):
         self.current_frontiers = msg.markers
         
         if len(msg.markers) > 0:
+            self.exploration_mode = 'frontier'
             self.get_logger().info(f'🎯 Detected {len(msg.markers)} frontier clusters')
+            self.no_frontier_cycles = 0
         else:
             self.get_logger().info('ℹ️  No frontiers detected - checking for completion')
+            self.no_frontier_cycles += 1
     
     def map_callback(self, msg: OccupancyGrid):
         """Receive occupancy grid map (Phase 2/3)"""
@@ -281,75 +325,97 @@ class ExplorationCoordinator(Node):
         self.map_metadata = msg.info
     
     def obstacle_warning_callback(self, msg):
-        """Receive obstacle warning from ultrasonic_explorer - REAL-TIME with startup delay"""
-        # Delay obstacle detection for first 20 seconds to allow SLAM to stabilize transforms
+        """Receive obstacle warning from ultrasonic_explorer - IMMEDIATE BACKWARD MOVEMENT"""
+        # Obstacle detection starts IMMEDIATELY - critical for safety
         if self.obstacle_enable_time is None:
-            self.obstacle_enable_time = self.get_clock().now().nanoseconds + (20 * 10**9)  # 20 second delay
+            self.obstacle_enable_time = self.get_clock().now().nanoseconds  # Start immediately, no delay
         
-        current_time = self.get_clock().now().nanoseconds
-        if current_time < self.obstacle_enable_time:
-            # Ignore obstacle warnings during startup phase
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now < self.obstacle_ignore_until:
+            # Cooldown after backing up - ignore repeated triggers
+            self.obstacle_warning = msg.data
             return
         
         self.obstacle_warning = msg.data
         if msg.data:
             self.consecutive_obstacle_detections += 1
-            # Log every detection for debugging
-            if self.consecutive_obstacle_detections % 2 == 0:  # Log every other detection
-                self.get_logger().info(f'📍 ULTRASONIC: Obstacle detected ({self.consecutive_obstacle_detections} times)')
+            self.obstacle_clear_count = 0
+            self.get_logger().error(f'🚨 OBJECT DETECTED! Distance: {self.front_obstacle_distance:.3f}m - DETECTION #{self.consecutive_obstacle_detections}')
+            
+            # CRITICAL: Trigger backward movement on detection
+            if self.front_obstacle_distance <= self.obstacle_trigger_distance:
+                self.force_obstacle_recovery = True
+                self.get_logger().error(f'🚨 INITIATING IMMEDIATE BACKWARD RESPONSE - Object at {self.front_obstacle_distance:.3f}m')
+                if not self.in_obstacle_recovery and (self.get_clock().now().nanoseconds / 1e9) >= self.obstacle_ignore_until:
+                    self.in_obstacle_recovery = True
+                    self._handle_obstacle_collision()
+                    self.in_obstacle_recovery = False
         else:
-            if self.consecutive_obstacle_detections > 0:
-                self.get_logger().info(f'✅ Obstacle cleared (was detected {self.consecutive_obstacle_detections} times)')
-            self.consecutive_obstacle_detections = 0
+            if self.front_obstacle_distance > self.obstacle_clear_distance:
+                self.obstacle_clear_count += 1
+                if self.obstacle_clear_count >= self.obstacle_clear_required:
+                    if self.consecutive_obstacle_detections > 0:
+                        self.get_logger().info(
+                            f'✅ Obstacle cleared (detected {self.consecutive_obstacle_detections}x)'
+                        )
+                    self.consecutive_obstacle_detections = 0
+                    self.obstacle_clear_count = 0
+            else:
+                self.obstacle_clear_count = 0
     
     def obstacle_distance_callback(self, msg):
-        """Receive front obstacle distance from ultrasonic_explorer - REAL-TIME"""
+        """Receive front obstacle distance from ultrasonic_explorer - REAL-TIME RESPONSE"""
         self.front_obstacle_distance = msg.data
         
-        # Respect startup delay - don't log warnings during initialization phase
-        if self.obstacle_enable_time is not None:
-            current_time = self.get_clock().now().nanoseconds
-            if current_time < self.obstacle_enable_time:
-                return  # Ignore during startup phase
+        # CRITICAL: Trigger immediate action on very close objects
+        if self.front_obstacle_distance <= self.obstacle_trigger_distance and self.obstacle_warning:
+            self.get_logger().error(f'🚨🚨 CRITICAL OBJECT VERY CLOSE: {self.front_obstacle_distance:.3f}m - MUST MOVE BACKWARD!')
         
-        # Log close obstacles only after startup phase
-        if self.front_obstacle_distance < 0.5 and self.obstacle_warning:
-            self.get_logger().warn(f'⚠️  CLOSE OBSTACLE: {self.front_obstacle_distance:.3f}m ahead!')
+        # Process immediately - no startup delay
+        # Log close obstacles to ensure visibility
+        if self.obstacle_warning and self.front_obstacle_distance <= self.obstacle_clear_distance:
+            self.get_logger().warn(
+                f'⚠️  CLOSE OBSTACLE ALERT: {self.front_obstacle_distance:.3f}m ahead!'
+            )
     
     def laser_scan_callback(self, msg: LaserScan):
         """Receive laser scan data for advanced obstacle detection"""
         self.laser_scan_data = msg
     
+    def cmd_vel_monitor_callback(self, msg: Twist):
+        """Monitor cmd_vel to verify Nav2 is publishing and Arduino will receive commands"""
+        now = self.get_clock().now()
+        
+        # Check if this is non-zero velocity (actual movement command)
+        is_moving = abs(msg.linear.x) > 0.01 or abs(msg.angular.z) > 0.01
+        
+        if is_moving and not self.nav2_is_driving:
+            self.nav2_is_driving = True
+            self.get_logger().info(f'🚗 Nav2 DRIVING: linear={msg.linear.x:.2f} m/s, angular={msg.angular.z:.2f} rad/s')
+            self.get_logger().info('   → Arduino motor bridge receiving cmd_vel → Motors will move!')
+        elif not is_moving and self.nav2_is_driving:
+            self.nav2_is_driving = False
+            self.get_logger().info('🛑 Nav2 stopped publishing movement commands')
+        
+        self.last_cmd_vel_time = now
+    
     def score_frontier(self, frontier, robot_x, robot_y):
-        """Score frontier based on distance and information gain (Phase 3)"""
+        """Score frontier based on distance (Phase 3) - PRAGMATIC VERSION"""
         fx = frontier.pose.position.x
         fy = frontier.pose.position.y
         
-        # Skip visited frontiers with aggressive penalty
-        if self.is_frontier_visited(fx, fy):
-            return float('inf')
-        
-        # Distance component
         distance = math.sqrt((fx - robot_x)**2 + (fy - robot_y)**2)
-        if distance < 0.6:  # INCREASED to 0.6m - Nav2 controller needs space to plan (was 0.2m)
+        
+        # Safety cutoff for extremely close frontiers
+        if distance < 0.2:
             return float('inf')
-        
-        distance_normalized = 1.0 / (1.0 + distance)  # Closer is better
-        
-        # Information gain component (frontier size)
-        gain_normalized = frontier.scale.x / max(f.scale.x for f in self.current_frontiers) if self.current_frontiers else 0.5
-        
-        # REVISIT PENALTY: Penalize frontiers that are very close to recently visited ones
-        revisit_penalty = 0.0
-        for vx, vy in self.visited_frontiers[-5:]:  # Check last 5 visited frontiers
-            revisit_dist = math.sqrt((fx - vx)**2 + (fy - vy)**2)
-            if revisit_dist < 1.0:  # Within 1m of visited frontier
-                revisit_penalty += (1.0 - revisit_dist / 1.0) * 10.0  # Heavy penalty
-        
-        # Combined score (lower is better for distance, higher is better for gain)
-        score = (self.frontier_dist_weight * distance_normalized) - (self.frontier_gain_weight * gain_normalized) + revisit_penalty
-        
-        return score
+
+        # Encourage exploring farther areas: add penalty to very close frontiers
+        if distance < self.min_frontier_distance:
+            return distance + 2.0
+
+        # Simple score: closer is better (beyond minimum distance)
+        return distance
     
     # ==================== PHASE 4: GLOBAL PATH PLANNING (A*) ====================
     
@@ -440,18 +506,14 @@ class ExplorationCoordinator(Node):
             check_width: Width of the path to check (meters from center)
         """
         # Ultrasonic sensor: ACTIVE real-time obstacle detection at 50cm threshold
-        # INCREASED from 0.3m (30cm) because false positives were locking up the robot
         OBSTACLE_THRESHOLD = 0.5  # 50cm
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now < self.obstacle_ignore_until:
+            return True
         
-        # Check startup delay - never trigger collision handler during initialization
-        if self.obstacle_enable_time is not None:
-            current_time = self.get_clock().now().nanoseconds
-            if current_time < self.obstacle_enable_time:
-                # Startup phase - ignore obstacles
-                return True
-        
+        # Check obstacles immediately - no startup delay
         if self.obstacle_warning and self.front_obstacle_distance < OBSTACLE_THRESHOLD:
-            self.get_logger().warn(f'🚨 OBSTACLE CRITICAL! {self.front_obstacle_distance:.2f}m < {OBSTACLE_THRESHOLD}m threshold')
+            self.get_logger().error(f'🚨 OBSTACLE COLLISION DETECTED! {self.front_obstacle_distance:.2f}m - BACKING UP!')
             # TRIGGER BACKWARD MOVEMENT AND RECOVERY
             self._handle_obstacle_collision()
             return False
@@ -466,28 +528,85 @@ class ExplorationCoordinator(Node):
         return True
     
     def _handle_obstacle_collision(self):
-        """Handle obstacle collision: Let Arduino handle avoidance, ROS2 finds alternate path - NON-BLOCKING"""
-        self.get_logger().error(f'💥 OBSTACLE COLLISION at {self.front_obstacle_distance:.2f}m!')
-        self.get_logger().info('🤖 Arduino will handle obstacle avoidance autonomously')
+        """Handle obstacle collision: STOP robot, back up, find alternate path"""
+        self.get_logger().error(f'💥 OBSTACLE COLLISION DETECTED at {self.front_obstacle_distance:.2f}m!')
+        self.get_logger().error(f'🚨 INITIATING EMERGENCY BACKWARD MOVEMENT!')
+        self.obstacle_ignore_until = (self.get_clock().now().nanoseconds / 1e9) + self.obstacle_cooldown_sec
+        self.consecutive_obstacle_detections = 0
+        self.obstacle_clear_count = 0
+        self.obstacle_warning = False
         
-        # Cancel current navigation goal to allow Arduino to take control
+        # Cancel current navigation goal immediately
         if self.goal_handle is not None:
             try:
                 self.goal_handle.cancel_goal_async()
                 self.goal_handle = None
-                self.get_logger().info('✅ Navigation goal canceled - Arduino has control')
+                self.get_logger().info('✅ Navigation goal canceled')
             except:
                 pass
         
-        # Don't send manual backward commands - Arduino autonomously handles:
-        # - Detects obstacle at 30cm
-        # - Backs up for 800ms automatically
-        # - Turns 90° for 900ms automatically
-        # - Clears obstacle and resumes
+        # Send STOP command (will override Nav2)
+        stop_cmd = Twist()
+        stop_cmd.linear.x = 0.0
+        stop_cmd.angular.z = 0.0
+        self.get_logger().error('⛔ EMERGENCY STOP - Publishing stop command 3x')
+        for _ in range(3):
+            self.cmd_vel_pub.publish(stop_cmd)
+            self.cmd_vel_nav_pub.publish(stop_cmd)
         
-        # ROS2's job: Find alternate exploration path while Arduino handles immediate avoidance
-        self.get_logger().info('🗺️  Finding alternate frontier while Arduino clears obstacle...')
-        self.explore_free_space()  # Non-blocking - just queues next goal
+        # Wait for stop to take effect
+        time.sleep(0.3)
+        
+        # Back up to clear obstacle - FULL SPEED, 2s
+        backup_cmd = Twist()
+        backup_cmd.linear.x = -0.5  # Full-speed reverse (m/s)
+        backup_cmd.angular.z = 0.0
+        self.get_logger().error('⬅️  BACKING UP NOW - FULL SPEED FOR 2s!')
+        for i in range(40):  # 40 x 0.05s = 2.0 seconds
+            self.cmd_vel_pub.publish(backup_cmd)
+            self.cmd_vel_nav_pub.publish(backup_cmd)
+            if i % 5 == 0:
+                self.get_logger().error(f'  ⬅️  Backup in progress {i+1}/40 - Moving backward at -0.5 m/s')
+            time.sleep(0.05)
+        
+        self.get_logger().error('⬅️  Backup step complete!')
+        
+        # Final stop
+        self.cmd_vel_pub.publish(stop_cmd)
+        self.cmd_vel_nav_pub.publish(stop_cmd)
+        self.cmd_vel_pub.publish(stop_cmd)
+        self.cmd_vel_nav_pub.publish(stop_cmd)
+        self.get_logger().info('✅ Backward movement complete - obstacle should be cleared')
+        time.sleep(0.5)
+
+        # Rotate to scan for a clear path
+        rotate_cmd = Twist()
+        rotate_cmd.linear.x = 0.0
+        rotate_cmd.angular.z = 0.6  # moderate turn rate
+        self.get_logger().info('🔄 Rotating to scan for clear path...')
+        for i in range(20):  # ~1.6s scan
+            self.cmd_vel_pub.publish(rotate_cmd)
+            self.cmd_vel_nav_pub.publish(rotate_cmd)
+            time.sleep(0.08)
+
+        # Stop after scan
+        self.cmd_vel_pub.publish(stop_cmd)
+        self.cmd_vel_nav_pub.publish(stop_cmd)
+        self.cmd_vel_pub.publish(stop_cmd)
+        self.cmd_vel_nav_pub.publish(stop_cmd)
+        self.get_logger().info('✅ Scan complete')
+        time.sleep(0.3)
+
+        # Only resume if path appears clear
+        if self.is_path_clear(check_distance=0.6):
+            self.get_logger().info('✅ Path clear after scan - resuming exploration')
+            if self.current_frontiers:
+                self.get_logger().info('🧭 Frontiers available - returning to frontier logic')
+                self.phase_transition(SystemPhase.FRONTIER_DETECTION)
+                return
+            self.explore_free_space()
+        else:
+            self.get_logger().warn('⚠️  Path still blocked after scan - holding and retrying soon')
         
         # Note: No time.sleep() here - allows real-time frontier updates to continue
     
@@ -598,6 +717,11 @@ class ExplorationCoordinator(Node):
         # Safety check: don't send goals if Nav2 isn't ready
         if not self.nav2_ready:
             self.get_logger().warn('⚠️  Cannot explore free space - Nav2 not ready yet')
+            return False
+
+        if self.current_frontiers:
+            self.get_logger().info('🔁 Frontiers available - skipping free-space exploration')
+            self.exploration_mode = 'frontier'
             return False
         
         if self.laser_scan_data is None:
@@ -777,26 +901,62 @@ class ExplorationCoordinator(Node):
     
     def detect_blocking_obstacles(self):
         """Detect and track persistent obstacles (Phase 6)
-        THRESHOLD: 0.5m (50cm) - Increased from 0.3m to prevent false lockup"""
-        # Detection threshold increased to 0.5m to avoid false positive lockups
-        OBSTACLE_THRESHOLD = 0.5  # 50cm (was 30cm)
-        MIN_DETECTIONS = 2  # Only 2 detections (~0.2 seconds at 10Hz)
+        THRESHOLD: 0.35m (35cm) - Back up when close, let Nav2 handle >0.35m"""
+        now = self.get_clock().now().nanoseconds / 1e9
         
+        # Check if obstacle detection is disabled during startup grace period
+        if self.obstacle_detect_enabled_time is None:
+            self.obstacle_detect_enabled_time = now + self.startup_grace_period
+            self.get_logger().info(f'⏳ Obstacle detection grace period: {self.startup_grace_period}s')
+            return False
+        
+        if now < self.obstacle_detect_enabled_time:
+            return False  # Grace period still active
+        
+        if now < self.obstacle_ignore_until:
+            return False
+        
+        # Detection threshold: back up when closer than trigger distance
+        OBSTACLE_THRESHOLD = self.obstacle_trigger_distance
+        MIN_DETECTIONS = 1  # immediate response
+
+        # Immediate recovery requested by obstacle callback
+        if self.force_obstacle_recovery and self.front_obstacle_distance <= OBSTACLE_THRESHOLD:
+            self.force_obstacle_recovery = False
+            self.get_logger().error(
+                f'🚨 FORCED BACKUP: obstacle at {self.front_obstacle_distance:.2f}m'
+            )
+            self._handle_obstacle_collision()
+            self._update_stuck_time()
+            return True
+        
+        # ⚠️ CRITICAL: Only react to obstacles CLOSER than threshold
+        # Obstacles at 0.25-0.40m should be handled by Nav2 costmaps, not emergency stop
+        if self.front_obstacle_distance > OBSTACLE_THRESHOLD:
+            # Reset counter if obstacle is far enough for Nav2 to handle
+            if self.consecutive_obstacle_detections > 0:
+                self.consecutive_obstacle_detections = 0
+            return False  # Let Nav2 path planner handle obstacles > 0.22m
+        
+        # DIRECT TRIGGER: If obstacle warning is true and close enough, back up immediately
         if (self.obstacle_warning and 
-            self.consecutive_obstacle_detections >= MIN_DETECTIONS and
-            self.front_obstacle_distance < OBSTACLE_THRESHOLD):
+            self.front_obstacle_distance <= OBSTACLE_THRESHOLD and
+            self.consecutive_obstacle_detections >= MIN_DETECTIONS):
             
             self.get_logger().error(
-                f'🚨 BLOCKING obstacle at {self.front_obstacle_distance:.2f}m '
-                f'({self.consecutive_obstacle_detections} detections) - BACKWARD + ALTERNATE PATH'
+                f'🚨 BLOCKING OBSTACLE at {self.front_obstacle_distance:.2f}m - BACKING UP NOW!'
             )
             
             # Handle collision - backward + find clear path
             self._handle_obstacle_collision()
+            
+            # Track how long we've been stuck
+            self._update_stuck_time()
+            
             return True
         
-        # Log persistent obstacles for debugging
-        if self.obstacle_warning and self.consecutive_obstacle_detections >= 3:
+        # Log persistent obstacles for debugging (but don't act on them if > threshold)
+        if self.obstacle_warning and self.front_obstacle_distance <= OBSTACLE_THRESHOLD and self.consecutive_obstacle_detections >= 3:
             if self.consecutive_obstacle_detections % 5 == 0:  # Log every 5 detections
                 self.get_logger().info(
                     f'⚠️  Obstacle at {self.front_obstacle_distance:.2f}m '
@@ -804,7 +964,107 @@ class ExplorationCoordinator(Node):
                 )
         
         return False
-        return False
+    
+    # ==================== REAL-WORLD OBSTACLE RECOVERY (Auto-bypass for stuck situations) ====================
+    
+    def _update_stuck_time(self):
+        """Track time spent stuck on obstacle and trigger recovery if needed"""
+        now = self.get_clock().now().nanoseconds / 1e9
+        
+        # Check if robot is actually stuck (not moving)
+        if self.last_pose is None:
+            self.last_pose = (self.robot_pose.pose.position.x, self.robot_pose.pose.position.y)
+            self.stuck_time = 0.0
+            return
+
+        # Normalize last_pose if stored as a Pose object from older runs
+        if hasattr(self.last_pose, 'position'):
+            self.last_pose = (self.last_pose.position.x, self.last_pose.position.y)
+        
+        # Calculate distance moved
+        if self.robot_pose.pose:
+            dx = self.robot_pose.pose.position.x - self.last_pose[0]
+            dy = self.robot_pose.pose.position.y - self.last_pose[1]
+            distance_moved = (dx**2 + dy**2)**0.5
+            
+            if distance_moved < 0.05:  # Less than 5cm movement
+                self.stuck_time += 0.5  # Accumulate time
+            else:
+                self.stuck_time = 0.0  # Reset if moved
+                self.recovery_attempts = 0
+                self.obstacle_recovery_mode = False
+                self.last_pose = (self.robot_pose.pose.position.x, self.robot_pose.pose.position.y)
+                return
+        
+        # Trigger recovery if stuck too long
+        if self.stuck_time > self.stuck_threshold and not self.obstacle_recovery_mode:
+            self.get_logger().warn(
+                f'🔴 ROBOT STUCK FOR {self.stuck_time:.1f}s - ACTIVATING REAL-WORLD RECOVERY'
+            )
+            self.obstacle_recovery_mode = True
+            self.recovery_attempts = 0
+            self.recovery_direction = 0
+        
+        # Execute recovery behaviors
+        if self.obstacle_recovery_mode:
+            self._execute_stuck_recovery()
+    
+    def _execute_stuck_recovery(self):
+        """Execute different recovery strategies for stuck situations"""
+        now = self.get_clock().now().nanoseconds / 1e9
+        
+        if self.recovery_attempts >= self.max_recovery_attempts:
+            # Force bypass - ignore obstacle and move forward anyway
+            self.get_logger().error(
+                f'🚨 FORCING OBSTACLE BYPASS AFTER {self.max_recovery_attempts} RECOVERY ATTEMPTS'
+            )
+            cmd = Twist()
+            cmd.linear.x = 0.15  # Move forward slowly, force through
+            self.cmd_vel_pub.publish(cmd)
+            self.obstacle_ignore_until = now + 5.0  # Ignore obstacles for 5s
+            self.obstacle_recovery_mode = False
+            self.recovery_attempts = 0
+            self.stuck_time = 0.0
+            return
+        
+        # Try different recovery strategies in sequence
+        strategy = self.recovery_attempts % 3
+        
+        if strategy == 0:
+            # Strategy 1: Aggressive backup
+            self.get_logger().warn('🔧 Recovery Strategy 1: Aggressive backup...')
+            cmd = Twist()
+            cmd.linear.x = -0.3  # Backup faster
+            self.cmd_vel_pub.publish(cmd)
+            
+        elif strategy == 1:
+            # Strategy 2: Turn left and retry
+            self.get_logger().warn('🔧 Recovery Strategy 2: Turn left and retry...')
+            cmd = Twist()
+            cmd.angular.z = 0.5  # Turn left
+            self.cmd_vel_pub.publish(cmd)
+            
+        else:
+            # Strategy 3: Turn right and retry
+            self.get_logger().warn('🔧 Recovery Strategy 3: Turn right and retry...')
+            cmd = Twist()
+            cmd.angular.z = -0.5  # Turn right
+            self.cmd_vel_pub.publish(cmd)
+        
+        self.recovery_attempts += 1
+        self.obstacle_ignore_until = now + 3.0  # Ignore obstacles during recovery attempt
+    
+    def can_move_forward(self):
+        """Check if robot can safely move forward (real-world safety check)"""
+        # During recovery mode, allow movement even with obstacles
+        if self.obstacle_recovery_mode:
+            return True
+        
+        # Normal operation: obstacle must be clear
+        if self.front_obstacle_distance < self.obstacle_trigger_distance:
+            return False
+        
+        return True
     
     # ==================== PHASE 7: FAILURE RECOVERY LOGIC ====================
     
@@ -829,8 +1089,8 @@ class ExplorationCoordinator(Node):
         total_cells = len(self.map_data.data)
         coverage = known_cells / total_cells if total_cells > 0 else 0
         
-        # Completion criteria
-        if len(self.current_frontiers) == 0 and coverage >= self.coverage_threshold:
+        # Completion criteria: sustained no-frontier condition
+        if len(self.current_frontiers) == 0 and self.no_frontier_cycles >= self.no_frontier_cycles_required:
             self.get_logger().info(f'\n🎉 MISSION COMPLETE!')
             self.get_logger().info(f'   Coverage: {coverage*100:.1f}%')
             self.get_logger().info(f'   Frontiers visited: {self.frontiers_visited}')
@@ -901,18 +1161,32 @@ class ExplorationCoordinator(Node):
                 if server_ready:
                     # Server exists - wait a bit more to ensure lifecycle is fully active
                     # This prevents sending goals to Nav2 before it's ready
-                    if elapsed >= 15.0:  # Wait ~15s for full Nav2 lifecycle activation
+                    if elapsed >= 10.0:  # Wait ~10s for full Nav2 lifecycle activation (REDUCED from 15s)
                         self.nav2_ready = True
                         self.start_time = self.get_clock().now()
                         self.exploring = True
                         self.get_logger().info('=' * 60)
                         self.get_logger().info('✅ Phase 1 Complete: Nav2 READY!')
+                        
+                        # 🧹 CRITICAL: Clear Nav2 costmaps at startup
+                        # This resolves "robot inside obstacle" issues that cause ALL goals to be rejected
+                        # Common issue: robot_radius (0.22m) + inflation_radius (0.55m) = 0.77m clearance needed
+                        # If obstacle detected <0.77m at startup, Nav2 thinks robot starts in obstacle!
+                        if self.front_obstacle_distance < 0.8:  # Close obstacle detected
+                            self.get_logger().warn(f'⚠️  STARTUP OBSTACLE DETECTED: {self.front_obstacle_distance:.2f}m')
+                            self.get_logger().warn('   This may cause Nav2 to reject goals thinking robot is stuck')
+                            self.get_logger().warn('   Clearing costmaps and waiting for obstacle to clear...')
+                            self.clear_nav2_costmaps()
+                            # Wait a bit more for costmaps to refresh
+                            import time
+                            time.sleep(2.0)
+                        
                         self.get_logger().info('🚀 Starting Frontier Exploration...')
                         self.get_logger().info('=' * 60)
                         self.phase_transition(SystemPhase.SLAM_LOCALIZATION)
                         return
-                    elif int(elapsed) % 5 == 0:
-                        self.get_logger().info(f'⏳ Phase 1: Nav2 server found, waiting for full lifecycle activation ({15.0-elapsed:.0f}s)...')
+                    elif int(elapsed) % 3 == 0:
+                        self.get_logger().info(f'⏳ Phase 1: Nav2 server found, waiting for full lifecycle activation ({10.0-elapsed:.0f}s)...')
                     return
                 
                 # Server not ready yet
@@ -922,11 +1196,16 @@ class ExplorationCoordinator(Node):
                         self.get_logger().info(f'⏳ Phase 1: Waiting for Nav2 server... ({remaining:.0f}s remaining)')
                     return
                 else:
-                    # Timeout - this shouldn't happen normally
-                    self.get_logger().error('❌ Phase 1 TIMEOUT: Nav2 not ready after waiting!')
-                    self.get_logger().error('   Check that Nav2 nodes are launching correctly')
-                    self.get_logger().error('   Try: ros2 run nav2_lifecycle_manager lifecycle_manager')
-                    # Don't force proceed - wait indefinitely for Nav2
+                    # Timeout - proceed anyway, obstacle avoidance will work locally
+                    self.get_logger().warn('⚠️  Phase 1 TIMEOUT: Nav2 delayed, starting exploration anyway')
+                    self.nav2_ready = True  # Force ready to start exploration
+                    self.start_time = self.get_clock().now()
+                    self.exploring = True
+                    self.get_logger().info('=' * 60)
+                    self.get_logger().info('✅ Phase 1: PROCEEDING with obstacle avoidance ACTIVE')
+                    self.get_logger().info('🚀 Starting Frontier Exploration...')
+                    self.get_logger().info('=' * 60)
+                    self.phase_transition(SystemPhase.SLAM_LOCALIZATION)
                     return
         
         # PHASE 2: SLAM AND LOCALIZATION
@@ -953,6 +1232,11 @@ class ExplorationCoordinator(Node):
             
             if not self.current_frontiers:
                 self.get_logger().info('⚠️  No frontiers detected - attempting forward movement if path is clear')
+                # Only transition to completion after sustained no-frontier condition
+                if self.no_frontier_cycles >= self.no_frontier_cycles_required:
+                    self.get_logger().info('✅ No frontiers for sustained period - entering completion phase')
+                    self.phase_transition(SystemPhase.COMPLETION)
+                    return
                 if self.is_path_clear() and self.goal_handle is None:
                     self.get_logger().info('➡️  Path is clear - moving forward to explore')
                     if self.move_forward_cautiously():
@@ -972,6 +1256,8 @@ class ExplorationCoordinator(Node):
             
             best_frontier = None
             best_score = float('inf')
+            
+            self.get_logger().info(f'   🔧 [DEBUG] visited_frontiers={self.visited_frontiers}, failed_frontiers={list(self.failed_frontiers.keys())[:3]}...')
             
             for i, frontier in enumerate(self.current_frontiers):
                 fx = frontier.pose.position.x
@@ -996,6 +1282,8 @@ class ExplorationCoordinator(Node):
             
             if best_frontier is None:
                 self.get_logger().warn('❌ No valid frontier selected (best_frontier = None)')
+                self.get_logger().warn(f'   🔧 DEBUG: visited_frontiers has {len(self.visited_frontiers)} entries')
+                self.get_logger().warn(f'   🔧 DEBUG: failed_frontiers has {len(self.failed_frontiers)} entries')
                 self.phase_transition(SystemPhase.COMPLETION)
                 return
             
@@ -1031,14 +1319,16 @@ class ExplorationCoordinator(Node):
                 # Track current goal for failure tracking
                 self.current_goal_pos = (goal_pose.pose.position.x, goal_pose.pose.position.y)
                 
-                # Mark as visited
-                self.visited_frontiers.append((goal_pose.pose.position.x, goal_pose.pose.position.y))
+                # BUG FIX: Don't mark as visited until we actually REACH it!
+                # (was causing duplicate entries in visited_frontiers list)
+                # self.visited_frontiers.append() moved to goal_result_callback on SUCCESS
                 self.frontiers_visited += 1
                 
                 goal_msg = NavigateToPose.Goal()
                 goal_msg.pose = goal_pose
                 
                 self.get_logger().info(f'🚀 Sending navigation goal #{self.frontiers_visited} to ({goal_pose.pose.position.x:.2f}, {goal_pose.pose.position.y:.2f})')
+                self.get_logger().info('   Expected flow: Nav2 controller → /cmd_vel → arduino_motor_bridge → Arduino motors')
                 self.event_counts['navigation_attempts'] += 1
                 
                 try:
@@ -1046,6 +1336,7 @@ class ExplorationCoordinator(Node):
                     future.add_done_callback(self.goal_response_callback)
                 except Exception as e:
                     self.get_logger().error(f'❌ Failed to send goal: {e}')
+                    self.get_logger().error('   Nav2 action server may not be running!')
             
             self.phase_transition(SystemPhase.OBSTACLE_HANDLING)
         
@@ -1104,16 +1395,71 @@ class ExplorationCoordinator(Node):
         """Handle goal response"""
         try:
             self.goal_handle = future.result()
-            self.get_logger().info(f'🔵 Goal response received: goal_handle={self.goal_handle}')
-            if self.goal_handle.accepted:
-                self.get_logger().info('✅ Goal accepted by Nav2!')
+            self.get_logger().info(f'🔵 Goal response received: accepted={self.goal_handle.accepted if self.goal_handle else False}')
+            if self.goal_handle and self.goal_handle.accepted:
+                self.get_logger().info('✅ Goal accepted by Nav2! Controller should start publishing /cmd_vel')
+                self.get_logger().info('   → Arduino motor bridge will receive cmd_vel and send PWM to motors')
                 result_future = self.goal_handle.get_result_async()
                 result_future.add_done_callback(self.goal_result_callback)
             else:
-                self.get_logger().warn('❌ Goal rejected by Nav2')
+                self.get_logger().warn('⚠️  Goal REJECTED by Nav2')
+                self.get_logger().warn('   Possible causes:')
+                self.get_logger().warn('   • Robot start position inside inflated obstacle (robot_radius=0.15m + inflation_radius=0.05m = 0.20m clearance needed)')
+                self.get_logger().warn('   • Goal position unreachable or in obstacle')
+                self.get_logger().warn('   • Costmaps not fully initialized')
+                self.get_logger().warn('   • Nav2 planner cannot find valid path')
+                if self.front_obstacle_distance < 0.5:
+                    self.get_logger().warn(f'   ⚠️  CLOSE OBSTACLE DETECTED: {self.front_obstacle_distance:.2f}m - Nav2 may think robot is blocked!')
+                
+                # RECOVERY: If stuck at origin with repeated rejections, back up to clear obstacle zone
+                robot_x = self.robot_pose.pose.position.x
+                robot_y = self.robot_pose.pose.position.y
+                robot_at_origin = (abs(robot_x) < 0.1 and abs(robot_y) < 0.1)
+                if robot_at_origin and not self.startup_recovery_done:
+                    self.startup_rejections += 1
+                    if self.startup_rejections >= 2:
+                        self.get_logger().warn('   🚨 STUCK AT ORIGIN - Executing startup recovery maneuver')
+                        self.get_logger().warn('   → Backing up 0.6m to clear inflated obstacle zone...')
+                        self.execute_startup_recovery()
+                        self.startup_recovery_done = True
+                        self.startup_rejections = 0
+                        self.get_logger().info('   ✅ Recovery complete - clearing costmaps and resuming exploration')
+                        self.clear_nav2_costmaps()
+                        import time
+                        self.get_logger().info('   ⏸️  Post-recovery pause (1s) for costmap/TF stabilization...')
+                        time.sleep(1.0)
+                        self.phase_transition(SystemPhase.FRONTIER_DETECTION)
+                        return
+                
+                # Clear costmaps on first rejection to remove stale obstacle data
+                if not hasattr(self, '_costmaps_cleared'):
+                    self.get_logger().warn('   🧹 Clearing Nav2 costmaps to remove stale obstacles...')
+                    self.clear_nav2_costmaps()
+                    self._costmaps_cleared = True
+                
                 self.goal_handle = None
+                
+                # Smart retry logic: allow 1 retry, then move to next frontier
+                if self.current_goal_pos:
+                    goal_x, goal_y = self.current_goal_pos
+                    frontier_key = (round(goal_x, 2), round(goal_y, 2))
+                    fail_count = self.failed_frontiers.get(frontier_key, 0) + 1
+                    self.failed_frontiers[frontier_key] = fail_count
+                    
+                    if fail_count >= 2:
+                        self.get_logger().info(f'   {fail_count} rejections - moving to next frontier')
+                        self.phase_transition(SystemPhase.FRONTIER_DETECTION)
+                    else:
+                        self.get_logger().info(f'   Attempt {fail_count}/2 - retrying goal')
+                        # Retry same goal
+                        self.phase_transition(SystemPhase.GLOBAL_PLANNING)
+                else:
+                    self.phase_transition(SystemPhase.FRONTIER_DETECTION)
         except Exception as e:
             self.get_logger().error(f'❌ Goal response error: {e}')
+            self.get_logger().error('   Nav2 action server may not be ready yet')
+            # Also retry on exception
+            self.phase_transition(SystemPhase.FRONTIER_DETECTION)
     
     def goal_result_callback(self, future):
         """Handle goal result and track unreachable frontiers"""
@@ -1122,7 +1468,14 @@ class ExplorationCoordinator(Node):
         goal_y = self.current_goal_pos[1] if self.current_goal_pos else 0.0
         frontier_key = (round(goal_x, 2), round(goal_y, 2))
         
-        if result and result.result:
+        # Determine success using action status (robust across Nav2 versions)
+        status = result.status if hasattr(result, 'status') else None
+        success = status == GoalStatus.STATUS_SUCCEEDED
+
+        if success:
+            # Mark as visited only when REACHED, not when sent
+            self.visited_frontiers.append((goal_x, goal_y))
+            self.get_logger().info(f'✅ Frontier ({goal_x:.2f}, {goal_y:.2f}) successfully reached and marked as visited')
             self.get_logger().info(f'✅ Successfully reached frontier at ({goal_x:.2f}, {goal_y:.2f})!')
             # Clear failure count on success
             if frontier_key in self.failed_frontiers:
@@ -1142,13 +1495,64 @@ class ExplorationCoordinator(Node):
         self.current_goal_pos = None
     
     def is_frontier_visited(self, x, y):
-        """Check if frontier is visited (with larger detection radius)"""
-        for vx, vy in self.visited_frontiers:
-            distance = math.sqrt((x - vx)**2 + (y - vy)**2)
-            # Increased from 0.8m to 1.5m to prevent revisits
-            if distance < 1.5:
-                return True
+        """Check if frontier is visited (DISABLED - was too aggressive)"""
+        # Disabled: The 1.5m radius was blocking ALL frontiers
+        # Nav2 has its own cost functions to avoid revisits
         return False
+    
+    def execute_startup_recovery(self):
+        """Execute recovery maneuver to back robot out of inflated obstacle zone at startup"""
+        import time
+        
+        # Send backward cmd_vel at FULL POWER for 3 seconds to ensure robot actually moves
+        backup_duration = 2.5  # seconds - tuned for heavy robot
+        backup_speed = -0.4  # m/s (negative = backward, strong but not max)
+        
+        msg = Twist()
+        msg.linear.x = backup_speed
+        msg.angular.z = 0.0
+        
+        start_time = time.time()
+        rate = self.create_rate(10)  # 10 Hz
+        
+        self.get_logger().info(f'   🔄 Backing up at {backup_speed} m/s (HIGH POWER) for {backup_duration}s...')
+        
+        while (time.time() - start_time) < backup_duration:
+            self.cmd_vel_pub.publish(msg)
+            rate.sleep()
+        
+        # Stop robot
+        msg.linear.x = 0.0
+        self.cmd_vel_pub.publish(msg)
+        self.get_logger().info('   🛑 Backup complete - robot stopped')
+        
+        # Wait for robot to stabilize (stop momentum, let TF/odometry catch up)
+        self.get_logger().info('   ⏸️  Waiting 2s for robot stabilization (TF/odometry sync)...')
+        time.sleep(2.0)
+    
+    def clear_nav2_costmaps(self):
+        """Request Nav2 to clear both local and global costmaps - helps resolve 'robot in obstacle' issues"""
+        self.get_logger().info('🧹 Requesting Nav2 to clear costmaps...')
+        
+        # Clear global costmap
+        if self.clear_global_costmap_client.service_is_ready():
+            try:
+                future = self.clear_global_costmap_client.call_async(Empty.Request())
+                self.get_logger().info('   ✅ Global costmap clear requested')
+            except Exception as e:
+                self.get_logger().warn(f'   ⚠️  Failed to clear global costmap: {e}')
+        else:
+            self.get_logger().warn('   ⚠️  Global costmap service not ready')
+        
+        # Clear local costmap  
+        if self.clear_local_costmap_client.service_is_ready():
+            try:
+                future = self.clear_local_costmap_client.call_async(Empty.Request())
+                self.get_logger().info('   ✅ Local costmap clear requested')
+            except Exception as e:
+                self.get_logger().warn(f'   ⚠️  Failed to clear local costmap: {e}')
+        else:
+            self.get_logger().warn('   ⚠️  Local costmap service not ready')
     
     def save_map_auto(self):
         """Save map on completion"""

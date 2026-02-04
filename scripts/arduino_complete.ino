@@ -10,10 +10,7 @@
 #define BACKWARD_SPEED  200
 #define TURN_SPEED      220
 
-#define OBSTACLE_CM         30.0
-#define OBSTACLE_CLEAR_CM   35.0
-#define AVOID_BACKUP_MS     800
-#define AVOID_TURN_MS       900
+#define SAFETY_STOP_CM      25.0
 
 Adafruit_MPU6050 mpu;
 
@@ -53,15 +50,8 @@ int motorB_speed = 0;
 // Safety: motors disabled until START command
 bool motors_enabled = false;
 
-// Local autonomy (obstacle avoidance on Arduino). ALWAYS ENABLED for safety!
-// ROS2 commands still work - Arduino checks obstacles BEFORE applying motor speeds
-bool local_autonomy_enabled = true;
-
-// Obstacle avoidance state
-enum AvoidState { AVOID_NONE, AVOID_BACKUP, AVOID_TURN };
-AvoidState avoid_state = AVOID_NONE;
-unsigned long avoid_start_ms = 0;
-int turn_direction = 1; // 1 = left, -1 = right
+// Safety stop state (emergency only)
+bool safety_stop_active = false;
 
 // Serial buffer
 String inputBuffer = "";
@@ -144,9 +134,17 @@ void loop() {
   // Ultrasonic
   float distance = readUltrasonic();
 
-  // Obstacle avoidance override (prevents corner revisits)
-  if (local_autonomy_enabled) {
-    handleObstacle(distance);
+  // Safety stop: emergency only (no steering or avoidance)
+  if (distance > 0 && distance < SAFETY_STOP_CM) {
+    if (!safety_stop_active) {
+      safety_stop_active = true;
+      stopMotors();
+      Serial.print("SAFETY_STOP:1,");
+      Serial.println(distance, 2);
+    }
+  } else if (safety_stop_active) {
+    safety_stop_active = false;
+    Serial.println("SAFETY_STOP:0");
   }
 
   // CSV output for Raspberry Pi
@@ -162,60 +160,6 @@ void loop() {
 
   delay(20); // ~50Hz
 }
-
-void handleObstacle(float distance_cm) {
-  if (!motors_enabled) {
-    avoid_state = AVOID_NONE;
-    return;
-  }
-
-  unsigned long now = millis();
-
-  if (avoid_state == AVOID_NONE) {
-    if (distance_cm > 0 && distance_cm < OBSTACLE_CM) {
-      avoid_state = AVOID_BACKUP;
-      avoid_start_ms = now;
-      turn_direction = (now / 1000) % 2 == 0 ? 1 : -1; // alternate turns
-      Serial.print("🚨 OBSTACLE DETECTED at ");
-      Serial.print(distance_cm);
-      Serial.println("cm - STARTING BACKUP");
-    }
-  }
-
-  if (avoid_state == AVOID_BACKUP) {
-    moveBackward(BACKWARD_SPEED);
-    if (now - avoid_start_ms >= AVOID_BACKUP_MS) {
-      avoid_state = AVOID_TURN;
-      avoid_start_ms = now;
-      Serial.print("⏱️  TURNING ");
-      Serial.println(turn_direction > 0 ? "LEFT" : "RIGHT");
-    }
-    return;
-  }
-
-  if (avoid_state == AVOID_TURN) {
-    if (turn_direction > 0) {
-      turnLeft(TURN_SPEED);
-    } else {
-      turnRight(TURN_SPEED);
-    }
-
-    if (now - avoid_start_ms >= AVOID_TURN_MS) {
-      if (distance_cm > OBSTACLE_CLEAR_CM) {
-        avoid_state = AVOID_NONE;
-        Serial.print("✅ OBSTACLE CLEARED (distance=");
-        Serial.print(distance_cm);
-        Serial.println("cm)");
-      } else {
-        avoid_state = AVOID_BACKUP;
-        avoid_start_ms = now;
-        Serial.println("⚠️  Still blocked - BACKUP again");
-      }
-    }
-    return;
-  }
-}
-
 
 float readUltrasonic() {
   digitalWrite(TRIG_PIN, LOW);
@@ -266,12 +210,11 @@ void setMotors(int speedA, int speedB) {
     return;
   }
   
-  // If obstacle avoidance is active, obstacle avoidance has priority
-  // But we still acknowledge the ROS2 command so Nav2 stays aware
-  if (local_autonomy_enabled && avoid_state != AVOID_NONE) {
-    Serial.print("OVERRIDE: Obstacle avoidance active (state=");
-    Serial.print(avoid_state); Serial.println(")");
-    return;  // Don't apply ROS2 speeds, let handleObstacle() control motors
+  // Allow BACKWARD movement even during safety stop (to escape obstacle)
+  // Only block FORWARD movement when obstacle detected
+  if (safety_stop_active && (speedA > 0 || speedB > 0)) {
+    Serial.println("IGNORED: Safety stop active (ultrasonic) - forward blocked");
+    return;
   }
   
   setMotorA(speedA);
@@ -307,12 +250,11 @@ void processCommand(String cmd) {
 
   if (cmd == "START") {
     motors_enabled = true;
-    Serial.println("✅ ACK:START - Motors ENABLED - Obstacle avoidance ACTIVE");
+    Serial.println("✅ ACK:START - Motors ENABLED - Safety stop ACTIVE");
     return;
   }
   if (cmd == "STOP") {
     motors_enabled = false;
-    avoid_state = AVOID_NONE;
     stopMotors();
     Serial.println("ACK:STOP");
     return;
@@ -333,16 +275,6 @@ void processCommand(String cmd) {
     scan_servo.write(servo_angle);
     Serial.print("ACK:SERVO:");
     Serial.println(servo_angle);
-    return;
-  }
-  if (cmd == "AUTO:ON") {
-    local_autonomy_enabled = true;
-    Serial.println("ACK:AUTO:ON");
-    return;
-  }
-  if (cmd == "AUTO:OFF") {
-    local_autonomy_enabled = false;
-    Serial.println("ACK:AUTO:OFF");
     return;
   }
   if (!motors_enabled) {
