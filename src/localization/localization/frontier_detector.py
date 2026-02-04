@@ -17,10 +17,10 @@ class FrontierDetector(Node):
         super().__init__('frontier_detector')
         
         # Parameters
-        self.declare_parameter('min_frontier_size', 3)  # Reduced from 5 to catch smaller frontiers
-        self.declare_parameter('min_distance_to_frontier', 0.3)
-        self.declare_parameter('frontier_threshold', 15)  # Unknown cell threshold (lower = more sensitive)
-        self.declare_parameter('free_space_threshold', 20)  # Increased from default for clearer boundaries
+        self.declare_parameter('min_frontier_size', 5)  # Tighten: ignore tiny/noisy frontiers
+        self.declare_parameter('min_distance_to_frontier', 0.6)  # Tighten: avoid very close frontiers
+        self.declare_parameter('frontier_threshold', 20)  # Less sensitive to noise
+        self.declare_parameter('free_space_threshold', 20)  # Keep clear boundaries
         
         self.min_frontier_size = self.get_parameter('min_frontier_size').value
         self.min_distance = self.get_parameter('min_distance_to_frontier').value
@@ -29,7 +29,7 @@ class FrontierDetector(Node):
         
         # Performance: throttle processing to avoid slowing down RViz
         self.last_frontier_time = 0.0
-        self.frontier_throttle_rate = 2.0  # Process at most every 0.5 seconds
+        self.frontier_throttle_rate = 4.0  # Process at most every 0.25 seconds
         
         # Publishers
         self.frontiers_pub = self.create_publisher(MarkerArray, 'frontiers', 10)
@@ -84,6 +84,10 @@ class FrontierDetector(Node):
                 # Calculate centroid
                 cluster_array = np.array(cluster)
                 centroid_cell = np.mean(cluster_array, axis=0).astype(int)
+                
+                # Clip to map bounds to prevent out-of-bounds planning
+                centroid_cell[0] = np.clip(centroid_cell[0], 0, height - 1)
+                centroid_cell[1] = np.clip(centroid_cell[1], 0, width - 1)
                 
                 # Convert to world coordinates
                 world_x = origin.x + (centroid_cell[1] * resolution)

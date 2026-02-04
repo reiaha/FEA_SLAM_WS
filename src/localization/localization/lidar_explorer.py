@@ -228,7 +228,7 @@ class LidarExplorer(Node):
             self.exploring = False  # Stop publishing cmd_vel
             self.stop_robot()
             self.get_logger().info('✅ Nav2 /navigate_to_pose is READY! Handing off cmd_vel control to frontier exploration.')
-            self.get_logger().info('   ultrasonic_explorer will continue monitoring obstacles in background.')
+            self.get_logger().info('   lidar_explorer will continue monitoring obstacles in background.')
             # Note: Keep running for continuous obstacle detection, just stop publishing cmd_vel
         else:
             self.get_logger().debug('⏳ Waiting for Nav2 /navigate_to_pose action server...')

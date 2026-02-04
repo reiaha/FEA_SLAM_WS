@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-Bootstrap script to manually move robot and build initial map
-This breaks the chicken-egg problem: SLAM needs motion, Nav2 needs map
-"""
+
 
 import rclpy
 from rclpy.node import Node

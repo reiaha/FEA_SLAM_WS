@@ -10,14 +10,14 @@ def generate_launch_description():
 
     return LaunchDescription([
 
-        # 1️⃣ Include your existing sensor fusion (EKF) launch
+        # Include your existing sensor fusion (EKF) launch
         IncludeLaunchDescription(
             PythonLaunchDescriptionSource(
                 os.path.join(pkg_share, 'launch', 'sensor_fusion_launch.py')
             )
         ),
 
-        # 2️⃣ Publish a static transform from base_link → laser_frame
+        # Publish a static transform from base_link → laser_frame
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
@@ -25,7 +25,7 @@ def generate_launch_description():
             arguments=['0', '0', '0.1', '0', '0', '0', 'base_link', 'laser_frame']
         ),
 
-        # 3️⃣ SLAM Toolbox node (mapping)
+        # SLAM Toolbox node (mapping)
         Node(
             package='slam_toolbox',
             executable='sync_slam_toolbox_node',
@@ -37,13 +37,13 @@ def generate_launch_description():
             }],
             remappings=[
                 ('/scan', '/scan'),
-                ('/odom', '/odom'),  # your EKF publishes /odom
+                ('/odom', '/odom'), 
                 ('/tf', '/tf'),
                 ('/tf_static', '/tf_static')
             ]
         ),
 
-        # 4️⃣ RViz visualization for mapping
+        # RViz visualization for mapping
         Node(
             package='rviz2',
             executable='rviz2',

@@ -180,7 +180,7 @@ class IMULidarEKF(Node):
         F[1, 2] = 0.5 * daydtheta * dt**2
         F[3, 2] = daxdtheta * dt
         F[4, 2] = daydtheta * dt
-        # theta derivative wrt theta is 1 (already identity)
+        # theta derivative wrt theta is 1 
         # velocities derivatives wrt velocities remain 1
 
         # Predict covariance
