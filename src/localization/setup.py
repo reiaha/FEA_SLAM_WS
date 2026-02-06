@@ -25,15 +25,15 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            'sensor_fusion = localization.sensor_fusion:main',
+            'sensor_fusion_simple = localization.sensor_fusion_simple:main',
             'arduino_motor_bridge = localization.arduino_motor_bridge:main',
+            'arduino_motor_bridge_simple = localization.arduino_motor_bridge_simple:main',
             'frontier_detector = localization.frontier_detector:main',
-            'exploration_coordinator = localization.exploration_coordinator:main',
             'exploration_coordinator_v2 = localization.exploration_coordinator_v2:main',
-            'motor_controller = localization.motor_controller:main',
+            'exploration_coordinator_simple = localization.exploration_coordinator_simple:main',
             'lidar_explorer = localization.lidar_explorer:main',
             'ultrasonic_servo_sweeper = localization.ultrasonic_servo_sweeper:main',
-            'phase5_metrics = localization.phase5_metrics:main',
+            'scan_timestamp_fix = localization.scan_timestamp_fix:main',
         ],
     },
 )

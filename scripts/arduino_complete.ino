@@ -10,7 +10,9 @@
 #define BACKWARD_SPEED  200
 #define TURN_SPEED      220
 
-#define SAFETY_STOP_CM      25.0
+#define SAFETY_STOP_CM      10.0  // Emergency stop at 10cm (ultrasonic only at close range)
+#define SAFETY_HIT_COUNT    3     // Require 3 consecutive hits to trigger
+#define SAFETY_CLEAR_COUNT  3     // Require 3 consecutive clears to reset
 
 Adafruit_MPU6050 mpu;
 
@@ -52,6 +54,8 @@ bool motors_enabled = false;
 
 // Safety stop state (emergency only)
 bool safety_stop_active = false;
+int safety_hit_streak = 0;
+int safety_clear_streak = 0;
 
 // Serial buffer
 String inputBuffer = "";
@@ -134,17 +138,22 @@ void loop() {
   // Ultrasonic
   float distance = readUltrasonic();
 
-  // Safety stop: emergency only (no steering or avoidance)
+  // Safety stop: emergency signal only (do not stop motors here)
   if (distance > 0 && distance < SAFETY_STOP_CM) {
-    if (!safety_stop_active) {
+    safety_hit_streak++;
+    safety_clear_streak = 0;
+    if (!safety_stop_active && safety_hit_streak >= SAFETY_HIT_COUNT) {
       safety_stop_active = true;
-      stopMotors();
       Serial.print("SAFETY_STOP:1,");
       Serial.println(distance, 2);
     }
-  } else if (safety_stop_active) {
-    safety_stop_active = false;
-    Serial.println("SAFETY_STOP:0");
+  } else {
+    safety_clear_streak++;
+    safety_hit_streak = 0;
+    if (safety_stop_active && safety_clear_streak >= SAFETY_CLEAR_COUNT) {
+      safety_stop_active = false;
+      Serial.println("SAFETY_STOP:0");
+    }
   }
 
   // CSV output for Raspberry Pi
@@ -207,13 +216,6 @@ void setMotorB(int speed) {
 void setMotors(int speedA, int speedB) {
   if (!motors_enabled) {
     Serial.println("IGNORED: Motors disabled (send START)");
-    return;
-  }
-  
-  // Allow BACKWARD movement even during safety stop (to escape obstacle)
-  // Only block FORWARD movement when obstacle detected
-  if (safety_stop_active && (speedA > 0 || speedB > 0)) {
-    Serial.println("IGNORED: Safety stop active (ultrasonic) - forward blocked");
     return;
   }
   
