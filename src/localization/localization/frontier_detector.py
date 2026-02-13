@@ -7,6 +7,7 @@ Analyzes occupancy grid map and publishes frontier candidate locations
 import rclpy
 from rclpy.node import Node
 import numpy as np
+import heapq
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PointStamped, Point
 from visualization_msgs.msg import Marker, MarkerArray
@@ -64,7 +65,11 @@ class FrontierDetector(Node):
         origin = msg.info.origin.position
         
         # Convert to 2D array
-        map_array = np.array(msg.data).reshape((height, width))
+        try:
+            map_array = np.array(msg.data).reshape((height, width))
+        except ValueError as e:
+            self.get_logger().error(f'Failed to reshape map data: {e}')
+            return
         
         # Find frontier cells (boundaries between explored and unexplored)
         frontier_cells = self.find_frontiers(map_array)
@@ -180,21 +185,28 @@ class FrontierDetector(Node):
         for cell in frontier_cells:
             if cell not in visited:
                 # A*-based region growing for more intelligent clustering
-                cluster = self._astar_cluster_region(cell, frontier_cells, map_array, visited)
-                
-                if cluster:
-                    clusters.append(cluster)
+                try:
+                    cluster = self._astar_cluster_region(cell, frontier_cells, map_array, visited)
+                    if cluster:
+                        clusters.append(cluster)
+                except Exception as e:
+                    self.get_logger().warn(f'Error clustering cell {cell}: {e}')
+                    # Fallback: add cell as its own cluster
+                    if cell not in visited:
+                        visited.add(cell)
+                        clusters.append([cell])
         
         return clusters
     
     def _astar_cluster_region(self, start_cell, all_frontier_cells, map_array, visited):
         """Use A* to cluster frontier regions by path cost"""
-        import heapq
-        
         cluster = []
         # Priority queue: (f_score, g_score, cell)
         open_set = [(0, 0, start_cell)]
         g_scores = {start_cell: 0}
+        
+        # Get map dimensions for bounds checking
+        height, width = map_array.shape
         
         while open_set:
             f_score, g_score, current = heapq.heappop(open_set)
@@ -213,37 +225,50 @@ class FrontierDetector(Node):
                 ny, nx = y + dy, x + dx
                 neighbor = (ny, nx)
                 
-                # Check bounds and if it's a frontier cell
-                if (0 <= ny < map_array.shape[0] and 
-                    0 <= nx < map_array.shape[1] and
-                    neighbor in all_frontier_cells and
-                    neighbor not in visited):
+                # Check bounds BEFORE accessing map_array
+                if ny < 0 or ny >= height or nx < 0 or nx >= width:
+                    continue  # Skip out-of-bounds neighbors
+                
+                # Check if it's a frontier cell
+                if neighbor not in all_frontier_cells or neighbor in visited:
+                    continue
+                
+                # Calculate movement cost (diagonal costs more)
+                move_cost = 1.414 if abs(dy) + abs(dx) == 2 else 1.0
+                
+                # Add terrain cost based on occupancy - with bounds checking
+                try:
+                    cell_value = map_array[ny, nx]
+                    cell_cost = abs(cell_value) / 100.0 if cell_value >= 0 else 0.5
+                except IndexError:
+                    cell_cost = 0.5  # Default cost for edge cases
+                
+                tentative_g = g_score + move_cost + cell_cost
+                
+                if neighbor not in g_scores or tentative_g < g_scores[neighbor]:
+                    g_scores[neighbor] = tentative_g
                     
-                    # Calculate movement cost (diagonal costs more)
-                    move_cost = 1.414 if abs(dy) + abs(dx) == 2 else 1.0
+                    # Heuristic: Manhattan distance to start (keep cluster compact)
+                    h_score = abs(ny - start_cell[0]) + abs(nx - start_cell[1])
+                    f_score = tentative_g + h_score
                     
-                    # Add terrain cost based on occupancy
-                    cell_cost = abs(map_array[ny, nx]) / 100.0 if map_array[ny, nx] >= 0 else 0.5
-                    
-                    tentative_g = g_score + move_cost + cell_cost
-                    
-                    if neighbor not in g_scores or tentative_g < g_scores[neighbor]:
-                        g_scores[neighbor] = tentative_g
-                        
-                        # Heuristic: Manhattan distance to start (keep cluster compact)
-                        h_score = abs(ny - start_cell[0]) + abs(nx - start_cell[1])
-                        f_score = tentative_g + h_score
-                        
-                        heapq.heappush(open_set, (f_score, tentative_g, neighbor))
+                    heapq.heappush(open_set, (f_score, tentative_g, neighbor))
         
         return cluster
 
 def main(args=None):
     rclpy.init(args=args)
     node = FrontierDetector()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        node.get_logger().error(f'Frontier detector error: {e}')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
+

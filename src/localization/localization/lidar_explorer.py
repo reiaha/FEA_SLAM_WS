@@ -25,12 +25,14 @@ class LidarExplorer(Node):
         self.declare_parameter('forward_speed', 0.15)     
         self.declare_parameter('turn_speed', 0.4)         
         self.declare_parameter('exploration_timeout', 300.0)  
+        self.declare_parameter('scan_topic', '/scan_fixed')
         
         self.obstacle_dist = self.get_parameter('obstacle_distance').value
         self.safe_dist = self.get_parameter('safe_distance').value
         self.forward_speed = self.get_parameter('forward_speed').value
         self.turn_speed = self.get_parameter('turn_speed').value
         self.timeout = self.get_parameter('exploration_timeout').value
+        self.scan_topic = self.get_parameter('scan_topic').value
         
         # Subscribers
         # Match LiDAR publisher QoS (Best Effort, sensor profile)
@@ -41,7 +43,7 @@ class LidarExplorer(Node):
             depth=5
         )
         self.scan_sub = self.create_subscription(
-            LaserScan, '/scan', self.scan_callback, scan_qos)
+            LaserScan, self.scan_topic, self.scan_callback, scan_qos)
         self.map_sub = self.create_subscription(
             OccupancyGrid, '/map', self.map_callback, 10)
         
@@ -74,6 +76,7 @@ class LidarExplorer(Node):
         self.nav2_check_timer = self.create_timer(2.0, self.check_nav2_ready)
         
         self.get_logger().info('🤖 LiDAR Explorer started - 180° obstacle detection active')
+        self.get_logger().info(f'   Scan topic: {self.scan_topic}')
         self.get_logger().info(f'   Obstacle threshold: {self.obstacle_dist}m, Safe distance: {self.safe_dist}m')
     
     def scan_callback(self, msg: LaserScan):

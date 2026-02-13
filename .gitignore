@@ -2,3 +2,12 @@ build/
 install/
 log/
 .vscode/
+
+# Large binaries and caches
+*.deb
+node-v20.10.0-linux-armv7l/
+node-v20.10.0-linux-armv7l.tar.xz
+**/__pycache__/
+*.pyc
+frames_*.gv
+frames_*.pdf
