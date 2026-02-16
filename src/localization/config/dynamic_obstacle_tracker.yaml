@@ -1,0 +1,16 @@
+dynamic_obstacle_tracker:
+  ros__parameters:
+    scan_topic: /scan
+    output_topic: /dynamic_obstacles
+    frame_id: base_footprint
+    max_range: 4.0
+    min_range: 0.05
+    cluster_dist: 0.20
+    min_cluster_size: 3
+    max_cluster_size: 200
+    assoc_distance: 0.60
+    prediction_horizon: 0.6
+    track_timeout: 1.0
+    process_noise: 0.5
+    meas_noise: 0.2
+    publish_rate: 10.0

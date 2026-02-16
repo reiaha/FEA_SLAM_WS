@@ -8,7 +8,7 @@ This prevents TF message filter drops due to stale scan timestamps.
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import LaserScan
 
 
@@ -17,7 +17,7 @@ class ScanTimestampFix(Node):
         super().__init__('scan_timestamp_fix')
 
         self.declare_parameter('input_topic', '/scan_raw')
-        self.declare_parameter('output_topic', '/scan_fixed')
+        self.declare_parameter('output_topic', '/scan')
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         
@@ -27,12 +27,17 @@ class ScanTimestampFix(Node):
         self.last_input_time = self.get_clock().now()
         self.last_output_time = self.get_clock().now()
 
-        # Match sensor_data QoS to avoid incompatible reliability with the LiDAR driver.
-        self.pub = self.create_publisher(LaserScan, self.output_topic, qos_profile_sensor_data)
+        # Subscribe with sensor_data QoS to match the LiDAR driver (often best-effort).
+        # Publish with reliable QoS so Nav2 costmaps (reliable subscribers) receive scans.
+        reliable_qos = QoSProfile(depth=10)
+        reliable_qos.reliability = ReliabilityPolicy.RELIABLE
+        reliable_qos.durability = DurabilityPolicy.VOLATILE
+
+        self.pub = self.create_publisher(LaserScan, self.output_topic, reliable_qos)
         self.sub = self.create_subscription(LaserScan, self.input_topic, self._scan_cb, qos_profile_sensor_data)
 
         self.get_logger().info(
-            f"🔧 Scan timestamp fix: {self.input_topic} -> {self.output_topic} (QoS: sensor_data)"
+            f"🔧 Scan timestamp fix: {self.input_topic} -> {self.output_topic} (pub: reliable, sub: sensor_data)"
         )
 
     def _scan_cb(self, msg: LaserScan):

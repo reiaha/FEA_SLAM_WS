@@ -32,6 +32,7 @@ setup(
             'map_odom_fallback = localization.map_odom_fallback:main',
             'ultrasonic_servo_sweeper = localization.ultrasonic_servo_sweeper:main',
             'scan_timestamp_fix = localization.scan_timestamp_fix:main',
+            'dynamic_obstacle_tracker = localization.dynamic_obstacle_tracker:main',
         ],
     },
 )

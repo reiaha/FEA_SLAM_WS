@@ -9,6 +9,7 @@ from std_msgs.msg import Int32, Float32
 from sensor_msgs.msg import Range, LaserScan
 from rclpy.qos import qos_profile_sensor_data
 from tf2_ros import TransformBroadcaster
+from lifecycle_msgs.srv import GetState
 import serial
 import time
 import threading
@@ -37,18 +38,24 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('stuck_backup_time', 0.8)
         self.declare_parameter('safety_stop_backup_time', 2.0)
         self.declare_parameter('safety_stop_backup_pwm', 120)
-        self.declare_parameter('enable_safety_override', False)
+        self.declare_parameter('enable_safety_override', True)
         self.declare_parameter('ultrasonic_frame', 'base_footprint')
         self.declare_parameter('ultrasonic_min_range', 0.02)
         self.declare_parameter('ultrasonic_max_range', 0.50)
         self.declare_parameter('ultrasonic_fov', 0.52)
         self.declare_parameter('rear_stop_distance', 0.30)
+        self.declare_parameter('rear_backup_min_distance', 0.18)
         self.declare_parameter('rear_stop_hold_time', 0.4)
-        self.declare_parameter('front_stop_distance', 0.10)
+        self.declare_parameter('front_stop_distance', 0.22)
         self.declare_parameter('front_stop_hold_time', 0.2)
-        self.declare_parameter('scan_stale_timeout', 0.6)
+        self.declare_parameter('scan_stale_timeout', 1.2)
         self.declare_parameter('flip_guard_time', 0.15)
-        self.declare_parameter('scan_topic', '/scan_fixed')
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('force_backward_on_zero_cmd', False)
+        self.declare_parameter('zero_cmd_forward_pwm', 110)
+        self.declare_parameter('allow_backward_when_rear_blocked', False)
+        self.declare_parameter('require_nav2_active', True)
+        self.declare_parameter('nav2_state_check_interval', 1.0)
         
         serial_port = self.get_parameter('serial_port').value
         baud_rate = self.get_parameter('baud_rate').value
@@ -58,6 +65,21 @@ class ArduinoMotorBridge(Node):
         self.max_speed_backward = int(self.get_parameter('max_speed_backward').value)
         self.min_pwm = int(self.get_parameter('min_pwm').value)
         self.publish_odom = self.get_parameter('publish_odom').value
+
+        # IMU orientation state
+        self.imu_yaw = None
+        self.imu_quat = None
+        self.imu_last_stamp = None
+
+        # Subscribe to IMU
+        from sensor_msgs.msg import Imu
+        self.create_subscription(
+            Imu,
+            '/imu/data_raw',
+            self.imu_cb,
+            10
+        )
+
         self.odom_rate = float(self.get_parameter('odom_rate').value)
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
@@ -74,15 +96,41 @@ class ArduinoMotorBridge(Node):
         self.ultrasonic_max_range = float(self.get_parameter('ultrasonic_max_range').value)
         self.ultrasonic_fov = float(self.get_parameter('ultrasonic_fov').value)
         self.rear_stop_distance = float(self.get_parameter('rear_stop_distance').value)
+        self.rear_backup_min_distance = float(self.get_parameter('rear_backup_min_distance').value)
         self.rear_stop_hold_time = float(self.get_parameter('rear_stop_hold_time').value)
         self.front_stop_distance = float(self.get_parameter('front_stop_distance').value)
         self.front_stop_hold_time = float(self.get_parameter('front_stop_hold_time').value)
         self.scan_stale_timeout = float(self.get_parameter('scan_stale_timeout').value)
         self.flip_guard_time = float(self.get_parameter('flip_guard_time').value)
         self.scan_topic = self.get_parameter('scan_topic').value
+        self.force_backward_on_zero_cmd = bool(self.get_parameter('force_backward_on_zero_cmd').value)
+        self.zero_cmd_forward_pwm = int(self.get_parameter('zero_cmd_forward_pwm').value)
+        self.allow_backward_when_rear_blocked = bool(self.get_parameter('allow_backward_when_rear_blocked').value)
+        self.require_nav2_active = bool(self.get_parameter('require_nav2_active').value)
+        self.nav2_state_check_interval = float(self.get_parameter('nav2_state_check_interval').value)
         self.cmd_vel_override_duration = 0.2
         self.cmd_vel_override_until = 0.0
-        
+
+        self.nav2_ready = not self.require_nav2_active
+        self.nav2_state_log_interval = 2.0
+        self.last_nav2_state_log_time = 0.0
+        self.last_nav2_ready = self.nav2_ready
+        self.nav2_state_response_timeout = 1.0
+        self.nav2_clients = {
+            'controller_server': self.create_client(GetState, '/controller_server/get_state'),
+            'planner_server': self.create_client(GetState, '/planner_server/get_state'),
+            'bt_navigator': self.create_client(GetState, '/bt_navigator/get_state')
+        }
+        self.nav2_state_futures = {}
+        self.nav2_state_cache = {}
+        self.nav2_state_update_time = {}
+        if self.require_nav2_active:
+            check_interval = max(0.5, self.nav2_state_check_interval)
+            self.create_timer(check_interval, self._check_nav2_state)
+            self.get_logger().info(f"🧭 Nav2 state checker enabled (interval: {check_interval}s)")
+        else:
+            self.get_logger().info("🧭 Nav2 state checking disabled")
+
         # Try to open serial port
         self.ser = None
         ports_to_try = [serial_port, '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0', '/dev/ttyUSB1']
@@ -97,26 +145,26 @@ class ArduinoMotorBridge(Node):
             except Exception as e:
                 self.get_logger().debug(f'Failed to connect to {port}: {e}')
                 pass
-        
+
         self.serial_disabled = False
         if self.ser is None:
             self.serial_disabled = True
             self.get_logger().error('❌ Failed to connect to Arduino - running without serial (odom only)')
-        
+
         # Enable motors
         if not self.serial_disabled:
             try:
                 self.ser.write(b'START\n')
                 time.sleep(0.1)
                 self.get_logger().info('✅ Motors ENABLED')
-                
+
                 # Disable Arduino's local obstacle avoidance (ROS2 handles it)
                 self.ser.write(b'AUTO:OFF\n')
                 time.sleep(0.1)
                 self.get_logger().info('✅ Arduino local avoidance DISABLED')
             except Exception as e:
                 self.get_logger().error(f'Failed to initialize Arduino: {e}')
-        
+
         self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_cb, 10)
         self.create_subscription(Twist, '/cmd_vel_nav', self.cmd_vel_nav_cb, 10)
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
@@ -130,6 +178,11 @@ class ArduinoMotorBridge(Node):
         self.odom_pub = None
         self.tf_broadcaster = None
         self.odom_fallback_active = False  # Track if using fallback odometry
+        # Always initialize shutdown and serial locks, regardless of odom publishing
+        self._shutdown_lock = threading.Lock()
+        self._shutdown_done = False
+        self._serial_lock = threading.Lock()  # Thread safety for serial access
+
         if self.publish_odom:
             self.odom_pub = self.create_publisher(Odometry, '/odom', 106)
             self.tf_broadcaster = TransformBroadcaster(self)
@@ -141,15 +194,11 @@ class ArduinoMotorBridge(Node):
             self.last_time = self.get_clock().now()
             self.create_timer(1.0 / max(1.0, self.odom_rate), self._publish_odom)
             self.get_logger().info('✅ Odometry publisher initialized')
-        
+
         # Start serial reader thread to parse Arduino data
         self.serial_reading = True
         self.serial_thread = threading.Thread(target=self._serial_reader, daemon=True)
         self.serial_thread.start()
-
-        self._shutdown_lock = threading.Lock()
-        self._shutdown_done = False
-        self._serial_lock = threading.Lock()  # Thread safety for serial access
 
         # Stuck detection state (uses Arduino motor feedback)
         self.last_cmd_pwm_left = 0
@@ -171,6 +220,8 @@ class ArduinoMotorBridge(Node):
         self.rear_block_log_interval = 1.0
         self.last_front_block_log_time = 0.0
         self.last_scan_time = 0.0
+        self.last_nav2_block_log_time = 0.0
+        self.nav2_block_log_interval = 2.0
         self.last_cmd_sign = 0
         self.last_dir_change_time = 0.0
         self.last_flip_guard_log_time = 0.0
@@ -183,18 +234,43 @@ class ArduinoMotorBridge(Node):
 
         # Safety stop override loop (ultrasonic emergency)
         self.create_timer(0.05, self._safety_override_loop)
-        
+
         self.get_logger().info('🚀 Arduino Motor Bridge initialized')
 
         # Ensure motors stop on shutdown
         atexit.register(self._shutdown_motors)
+
+    def imu_cb(self, msg):
+        # Extract yaw from quaternion
+        import math
+        q = msg.orientation
+        # Normalize quaternion to avoid drift from invalid IMU data
+        norm = math.sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w)
+        if norm <= 1e-6:
+            return
+        q.x /= norm
+        q.y /= norm
+        q.z /= norm
+        q.w /= norm
+        # yaw (z-axis rotation)
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.imu_yaw = math.atan2(siny_cosp, cosy_cosp)
+        self.imu_quat = q
+        self.imu_last_stamp = msg.header.stamp
     
     def cmd_vel_cb(self, msg: Twist):
         self._handle_cmd_vel(msg, source='cmd_vel')
 
     def _handle_cmd_vel(self, msg: Twist, source: str):
+        if self.require_nav2_active and not self.nav2_ready:
+            now = time.time()
+            if now - self.last_nav2_block_log_time >= self.nav2_block_log_interval:
+                self.last_nav2_block_log_time = now
+                self.get_logger().warn(f"🛑 Nav2 not active; suppressing {source}")
+            return
         # Safety override: ignore normal commands while backing up
-        if self.safety_override_active:
+        if self.enable_safety_override and self.safety_override_active:
             return
 
         if self.stuck_recovery_active:
@@ -231,21 +307,53 @@ class ArduinoMotorBridge(Node):
                 self.last_dir_change_time = now
                 self.last_cmd_sign = sign
 
+        if linear == 0.0 and angular == 0.0 and self._front_blocked() and not self._rear_blocked():
+            linear = -(abs(self.safety_stop_backup_pwm) * 0.5 / max(1.0, self.max_speed_backward))
+            angular = 0.0
+        elif self.force_backward_on_zero_cmd and linear == 0.0 and angular == 0.0:
+            linear = -(abs(self.safety_stop_backup_pwm) * 0.5 / max(1.0, self.max_speed_backward))
+            angular = 0.0
+
+        auto_backup = False
         if self._front_blocked() and (linear > 0.0 or abs(angular) > 0.0):
+            if self._rear_blocked():
+                # Front and rear blocked: allow in-place turning instead of backing up.
+                linear = 0.0
+                if now - self.last_front_block_log_time >= self.rear_block_log_interval:
+                    self.last_front_block_log_time = now
+                    self.get_logger().warn(
+                        f"🌀 Front+rear blocked (front {self.last_front_distance:.2f}m, "
+                        f"rear {self.last_rear_distance:.2f}m); allowing turn only"
+                    )
+            else:
+                # Auto-reverse immediately when front is blocked
+                backup_v = -(abs(self.safety_stop_backup_pwm) * 0.5 / max(1.0, self.max_speed_backward))
+                linear = backup_v
+                angular = 0.0
+                auto_backup = True
+                if now - self.last_front_block_log_time >= self.rear_block_log_interval:
+                    self.last_front_block_log_time = now
+                    self.get_logger().warn(
+                        f"⬇️ Front blocked at {self.last_front_distance:.2f}m; backing up immediately"
+                    )
+
+        if not self.allow_backward_when_rear_blocked and linear < 0.0 and self._rear_blocked():
             linear = 0.0
             angular = 0.0
-            if now - self.last_front_block_log_time >= self.rear_block_log_interval:
-                self.last_front_block_log_time = now
-                self.get_logger().warn(
-                    f"🛑 Front blocked at {self.last_front_distance:.2f}m; suppressing cmd_vel"
-                )
-
-        if linear < 0.0 and self._rear_blocked():
-            linear = 0.0
             if now - self.last_rear_block_log_time >= self.rear_block_log_interval:
                 self.last_rear_block_log_time = now
                 self.get_logger().warn(
                     f"🛑 Rear blocked at {self.last_rear_distance:.2f}m; suppressing backward cmd_vel"
+                )
+
+        if linear < 0.0 and self.last_rear_distance <= self.rear_backup_min_distance:
+            linear = 0.0
+            angular = 0.0
+            if now - self.last_rear_block_log_time >= self.rear_block_log_interval:
+                self.last_rear_block_log_time = now
+                self.get_logger().warn(
+                    f"🛑 Rear distance {self.last_rear_distance:.2f}m <= backup min "
+                    f"{self.rear_backup_min_distance:.2f}m; suppressing backward cmd_vel"
                 )
 
         # Store for odom integration
@@ -317,6 +425,88 @@ class ArduinoMotorBridge(Node):
 
     def _front_blocked(self) -> bool:
         return time.time() < self.front_blocked_until
+
+    def _check_nav2_state(self):
+        if not self.require_nav2_active:
+            self.nav2_ready = True
+            return
+
+        now = time.time()
+        state_map = {
+            0: 'UNKNOWN',
+            1: 'UNCONFIGURED',
+            2: 'INACTIVE',
+            3: 'ACTIVE',
+            4: 'FINALIZED'
+        }
+
+        # Fire async requests without blocking the executor.
+        for name, client in self.nav2_clients.items():
+            if not client.service_is_ready():
+                continue
+            if self.nav2_state_futures.get(name) is None:
+                try:
+                    future = client.call_async(GetState.Request())
+                    self.nav2_state_futures[name] = future
+                    future.add_done_callback(lambda f, n=name: self._handle_nav2_state_result(n, f))
+                except Exception as e:
+                    self.get_logger().error(f"🧭 Error sending {name} state request: {e}")
+
+        all_active = True
+        active_count = 0
+        status_lines = []
+
+        for name in self.nav2_clients.keys():
+            if not self.nav2_clients[name].service_is_ready():
+                all_active = False
+                status_lines.append(f"{name}: service_not_ready")
+                continue
+
+            if name not in self.nav2_state_cache:
+                all_active = False
+                status_lines.append(f"{name}: pending")
+                continue
+
+            last_update = self.nav2_state_update_time.get(name, 0.0)
+            if now - last_update > self.nav2_state_response_timeout:
+                all_active = False
+                status_lines.append(f"{name}: timeout")
+                continue
+
+            state_id = self.nav2_state_cache.get(name)
+            if state_id == 3:
+                active_count += 1
+            else:
+                all_active = False
+                status_lines.append(f"{name}: {state_map.get(state_id, str(state_id))}")
+
+        self.nav2_ready = all_active
+
+        if self.nav2_ready != self.last_nav2_ready:
+            self.last_nav2_ready = self.nav2_ready
+            state = 'ACTIVE' if self.nav2_ready else 'INACTIVE'
+            self.get_logger().info(f"🧭 Nav2 state changed: {state} ({active_count}/3 nodes active)")
+
+        if not self.nav2_ready:
+            if now - self.last_nav2_state_log_time >= self.nav2_state_log_interval:
+                self.last_nav2_state_log_time = now
+                if status_lines:
+                    status = '; '.join(status_lines)
+                    self.get_logger().warn(f"🧭 Nav2 not ready: {status}")
+                else:
+                    self.get_logger().warn(f"🧭 Nav2 check in progress... ({active_count}/3 active)")
+
+    def _handle_nav2_state_result(self, name: str, future):
+        try:
+            response = future.result()
+            self.nav2_state_cache[name] = response.current_state.id
+            self.nav2_state_update_time[name] = time.time()
+        except Exception as e:
+            self.get_logger().error(f"🧭 Error getting {name} state: {e}")
+            self.nav2_state_cache[name] = None
+            self.nav2_state_update_time[name] = time.time()
+        finally:
+            self.nav2_state_futures[name] = None
     
     def servo_cb(self, msg: Int32):
         """Send servo angle (0-180 degrees) to Arduino"""
@@ -345,7 +535,11 @@ class ArduinoMotorBridge(Node):
             self.get_logger().error(f'Serial write error (servo): {e}')
 
     def _publish_odom(self):
+
+        # DEBUG: Confirm timer is firing
+        self.get_logger().debug('🟢 _publish_odom timer called')
         if not self.publish_odom:
+            self.get_logger().debug('🔴 publish_odom is False, skipping')
             return
 
         now = self.get_clock().now()
@@ -355,16 +549,23 @@ class ArduinoMotorBridge(Node):
             return
 
         v = self.last_cmd_linear
-        w = self.last_cmd_angular
-
-        # Integrate pose
-        self.x += v * math.cos(self.yaw) * dt
-        self.y += v * math.sin(self.yaw) * dt
-        self.yaw += w * dt
+        # Use IMU yaw if available, else integrate
+        if self.imu_yaw is not None:
+            # Integrate x, y using IMU yaw
+            dx = v * math.cos(self.imu_yaw) * dt
+            dy = v * math.sin(self.imu_yaw) * dt
+            self.x += dx
+            self.y += dy
+            self.yaw = self.imu_yaw
+        else:
+            w = self.last_cmd_angular
+            self.x += v * math.cos(self.yaw) * dt
+            self.y += v * math.sin(self.yaw) * dt
+            self.yaw += w * dt
+            self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
 
         # Use slightly backdated timestamp to avoid "future" TF errors
-        # Publish at current time minus 10ms to ensure laser scans arrive "after"
-        stamp = now - rclpy.duration.Duration(seconds=0.01)
+        stamp = now - rclpy.duration.Duration(seconds=0.002)
 
         t = TransformStamped()
         t.header.stamp = stamp.to_msg()
@@ -373,8 +574,15 @@ class ArduinoMotorBridge(Node):
         t.transform.translation.x = self.x
         t.transform.translation.y = self.y
         t.transform.translation.z = 0.0
-        t.transform.rotation.z = math.sin(self.yaw / 2.0)
-        t.transform.rotation.w = math.cos(self.yaw / 2.0)
+        # Use IMU quaternion if available, else synthesize from yaw
+        if self.imu_quat is not None:
+            t.transform.rotation = self.imu_quat
+        else:
+            t.transform.rotation.z = math.sin(self.yaw / 2.0)
+            t.transform.rotation.w = math.cos(self.yaw / 2.0)
+
+        # DEBUG: Show TF being published
+        self.get_logger().debug(f'Publishing TF: {t.header.frame_id} -> {t.child_frame_id} at ({t.transform.translation.x:.3f}, {t.transform.translation.y:.3f}, {self.yaw:.3f})')
         self.tf_broadcaster.sendTransform(t)
 
         odom = Odometry()
@@ -384,10 +592,16 @@ class ArduinoMotorBridge(Node):
         odom.pose.pose.position.x = self.x
         odom.pose.pose.position.y = self.y
         odom.pose.pose.position.z = 0.0
-        odom.pose.pose.orientation.z = math.sin(self.yaw / 2.0)
-        odom.pose.pose.orientation.w = math.cos(self.yaw / 2.0)
+        if self.imu_quat is not None:
+            odom.pose.pose.orientation = self.imu_quat
+        else:
+            odom.pose.pose.orientation.z = math.sin(self.yaw / 2.0)
+            odom.pose.pose.orientation.w = math.cos(self.yaw / 2.0)
         odom.twist.twist.linear.x = v
-        odom.twist.twist.angular.z = w
+        odom.twist.twist.angular.z = self.last_cmd_angular
+
+        # DEBUG: Show odometry being published
+        self.get_logger().debug(f'Publishing Odometry: ({odom.pose.pose.position.x:.3f}, {odom.pose.pose.position.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={self.last_cmd_angular:.3f}')
         self.odom_pub.publish(odom)
 
         # Track if we're using fallback (no serial feedback received)
@@ -395,13 +609,12 @@ class ArduinoMotorBridge(Node):
             self.odom_fallback_active = True
             self.get_logger().warn('⚠️ Using FALLBACK odometry (no serial feedback from Arduino)')
         elif not self.serial_disabled and self.odom_fallback_active:
-            # Serial recovered
             self.odom_fallback_active = False
             self.get_logger().info('✅ Serial communication restored')
 
         # DIAGNOSTIC: Log TF publishing status periodically
-        if abs(v) > 0.001 or abs(w) > 0.001:
-            self.get_logger().info(f'📍 TF published: odom->base_footprint at ({self.x:.3f}, {self.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={w:.3f}')
+        if abs(v) > 0.001 or abs(self.last_cmd_angular) > 0.001:
+            self.get_logger().info(f'📍 TF published: odom->base_footprint at ({self.x:.3f}, {self.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={self.last_cmd_angular:.3f}')
 
         self.last_time = now
     
@@ -453,14 +666,37 @@ class ArduinoMotorBridge(Node):
             if now >= self.stuck_recovery_end_time:
                 self.stuck_recovery_active = False
                 self.stuck_start_time = None
-                self._send_motor_pwm(0, 0, action_override='⏸️  STOPPED')
+                if self.last_rear_distance <= self.rear_backup_min_distance:
+                    self._send_motor_pwm(
+                        0,
+                        0,
+                        action_override='🛑 STOPPED (REAR LIMIT)',
+                        log_level='warn'
+                    )
+                else:
+                    self._send_motor_pwm(
+                        -abs(self.stuck_backup_pwm),
+                        -abs(self.stuck_backup_pwm),
+                        action_override='⬇️  BACKWARD (STUCK EXIT)',
+                        log_level='warn'
+                    )
             else:
-                self._send_motor_pwm(
-                    -abs(self.stuck_backup_pwm),
-                    -abs(self.stuck_backup_pwm),
-                    action_override='⬇️  BACKWARD (STUCK RECOVERY)',
-                    log_level='warn'
-                )
+                if self.last_rear_distance <= self.rear_backup_min_distance:
+                    self.stuck_recovery_active = False
+                    self.stuck_start_time = None
+                    self._send_motor_pwm(
+                        0,
+                        0,
+                        action_override='🛑 STOPPED (REAR LIMIT)',
+                        log_level='warn'
+                    )
+                else:
+                    self._send_motor_pwm(
+                        -abs(self.stuck_backup_pwm),
+                        -abs(self.stuck_backup_pwm),
+                        action_override='⬇️  BACKWARD (STUCK RECOVERY)',
+                        log_level='warn'
+                    )
             return
 
         if self.last_motor_speed_left is None or self.last_motor_speed_right is None:
@@ -489,22 +725,55 @@ class ArduinoMotorBridge(Node):
         if self.ser is None:
             return
 
+        if self.require_nav2_active and not self.nav2_ready:
+            self.safety_override_active = False
+            self.safety_override_until = 0.0
+            self._send_motor_pwm(
+                0,
+                0,
+                action_override='🛑 STOPPED (NAV2 INACTIVE)',
+                log_level='warn'
+            )
+            return
+
         if not self.enable_safety_override:
             return
 
         now = time.time()
         if now < self.safety_override_until:
-            self._send_motor_pwm(
-                -abs(self.safety_stop_backup_pwm),
-                -abs(self.safety_stop_backup_pwm),
-                action_override='⬇️  BACKWARD (SAFETY OVERRIDE)',
-                log_level='warn'
-            )
+            if self.last_rear_distance <= self.rear_backup_min_distance:
+                self.safety_override_active = False
+                self.safety_override_until = 0.0
+                self._send_motor_pwm(
+                    0,
+                    0,
+                    action_override='🛑 STOPPED (REAR LIMIT)',
+                    log_level='warn'
+                )
+            else:
+                self._send_motor_pwm(
+                    -abs(self.safety_stop_backup_pwm),
+                    -abs(self.safety_stop_backup_pwm),
+                    action_override='⬇️  BACKWARD (SAFETY OVERRIDE)',
+                    log_level='warn'
+                )
             return
 
         if self.safety_override_active:
             self.safety_override_active = False
-            self._send_motor_pwm(0, 0, action_override='⏸️  STOPPED')
+            if self.last_rear_distance <= self.rear_backup_min_distance:
+                self._send_motor_pwm(
+                    0,
+                    0,
+                    action_override='🛑 STOPPED (REAR LIMIT)',
+                    log_level='warn'
+                )
+            else:
+                self._send_motor_pwm(
+                    -abs(self.safety_stop_backup_pwm),
+                    -abs(self.safety_stop_backup_pwm),
+                    action_override='⬇️  BACKWARD (SAFETY EXIT)'
+                )
     
     def _serial_reader(self):
         """Background thread to read and parse Arduino CSV data"""

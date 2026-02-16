@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 
 import rclpy
+import os
+import os
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import SaveMap
 from nav2_msgs.msg import Costmap
 from geometry_msgs.msg import PoseStamped, Twist
-from visualization_msgs.msg import MarkerArray
+from visualization_msgs.msg import MarkerArray, Marker
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry, OccupancyGrid
 from lifecycle_msgs.srv import GetState
@@ -37,6 +40,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('backup_speed', -0.3)           # m/s (gentler backward)
         self.declare_parameter('backup_time', 2.0)             # seconds (2 seconds duration)
         self.declare_parameter('use_lidar_obstacle', True)
+        self.declare_parameter('strict_obstacle_handling', True)
         self.declare_parameter('use_ultrasonic_backup', True)
         self.declare_parameter('lidar_obstacle_distance', 0.45)   # meters (earlier stop)
         self.declare_parameter('ultrasonic_backup_distance', 0.10)  # meters
@@ -54,6 +58,8 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('blacklist_duration', 30.0)     # seconds (avoid failed goals)
         self.declare_parameter('blacklist_radius', 0.4)        # meters (treat nearby goals as same)
         self.declare_parameter('avoid_revisit', True)          # skip goals near previously reached ones
+        self.declare_parameter('strict_no_revisit', True)      # never revisit any attempted goal
+        self.declare_parameter('force_frontier_goal', True)    # always target detected frontier point
         self.declare_parameter('visited_goal_radius', 0.6)     # meters (radius to treat as visited)
         self.declare_parameter('recent_goal_radius', 0.8)      # meters (avoid recently attempted goals)
         self.declare_parameter('recent_goal_hold_time', 90.0)  # seconds (cooldown for attempted goals)
@@ -62,7 +68,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('use_servo_scan', False)        # disable servo sweep for testing
         self.declare_parameter('startup_clear_hold_time', 1.0) # seconds path must be clear before explore
         self.declare_parameter('base_frame', 'base_footprint') # TF base frame
-        self.declare_parameter('scan_topic', '/scan_fixed')    # scan topic used for obstacles
+        self.declare_parameter('scan_topic', '/scan')    # scan topic used for obstacles
         self.declare_parameter('scan_raw_topic', '/scan_raw')  # raw scan topic (timestamp fix source)
         self.declare_parameter('costmap_topic', '/global_costmap/costmap')
         self.declare_parameter('local_costmap_topic', '/local_costmap/costmap')
@@ -77,6 +83,23 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('require_nav2_active', True)
         self.declare_parameter('enable_simple_exploration', True)  # Enable simple exploration when Nav2 fails
         self.declare_parameter('stop_when_no_frontiers', True)
+        self.declare_parameter('coverage_complete_percent', 90.0)
+        self.declare_parameter('auto_save_on_complete', True)
+        self.declare_parameter('map_topic', '/map')
+        self.declare_parameter('map_save_dir', '/home/pi/FEA_SLAM_WS/saved_maps')
+        self.declare_parameter('map_save_name', 'auto_explore_map')
+        self.declare_parameter('mapped_area_file', 'auto_explore_area.csv')
+        self.declare_parameter('replan_on_frontier_update', True)
+        self.declare_parameter('replan_interval', 1.0)
+        self.declare_parameter('replan_goal_change_distance', 0.5)
+        self.declare_parameter('replan_min_improvement', 0.3)
+        self.declare_parameter('always_replan_on_frontier_update', True)
+        self.declare_parameter('avoid_return_radius', 1.0)
+        self.declare_parameter('avoid_last_goal_radius', 0.8)
+        self.declare_parameter('frontier_pick_farthest', True)
+        self.declare_parameter('frontier_selection_method', 'astar')
+        self.declare_parameter('astar_max_candidates', 30)
+        self.declare_parameter('astar_max_expansions', 12000)
         
         self.nav2_timeout = self.get_parameter('nav2_timeout').value
         self.obstacle_distance = self.get_parameter('obstacle_distance').value
@@ -84,6 +107,7 @@ class ExplorationCoordinator(Node):
         self.backup_time = self.get_parameter('backup_time').value
         self.backup_iterations = int(self.backup_time / 0.05)  # 40 at 20Hz
         self.use_lidar_obstacle = self.get_parameter('use_lidar_obstacle').value
+        self.strict_obstacle_handling = bool(self.get_parameter('strict_obstacle_handling').value)
         self.use_ultrasonic_backup = self.get_parameter('use_ultrasonic_backup').value
         self.lidar_obstacle_distance = self.get_parameter('lidar_obstacle_distance').value
         self.ultrasonic_backup_distance = self.get_parameter('ultrasonic_backup_distance').value
@@ -101,6 +125,8 @@ class ExplorationCoordinator(Node):
         self.blacklist_duration = self.get_parameter('blacklist_duration').value
         self.blacklist_radius = self.get_parameter('blacklist_radius').value
         self.avoid_revisit = self.get_parameter('avoid_revisit').value
+        self.strict_no_revisit = bool(self.get_parameter('strict_no_revisit').value)
+        self.force_frontier_goal = bool(self.get_parameter('force_frontier_goal').value)
         self.visited_goal_radius = self.get_parameter('visited_goal_radius').value
         self.recent_goal_radius = float(self.get_parameter('recent_goal_radius').value)
         self.recent_goal_hold_time = float(self.get_parameter('recent_goal_hold_time').value)
@@ -123,8 +149,27 @@ class ExplorationCoordinator(Node):
         self.costmap_wait_timeout = float(self.get_parameter('costmap_wait_timeout').value)
         self.require_nav2_active = self.get_parameter('require_nav2_active').value  # Properly use the parameter
         self.stop_when_no_frontiers = self.get_parameter('stop_when_no_frontiers').value
+        self.coverage_complete_percent = float(self.get_parameter('coverage_complete_percent').value)
         self.enable_simple_exploration = self.get_parameter('enable_simple_exploration').value
+        self.auto_save_on_complete = self.get_parameter('auto_save_on_complete').value
+        self.map_topic = self.get_parameter('map_topic').value
+        self.map_save_dir = self.get_parameter('map_save_dir').value
+        self.map_save_name = self.get_parameter('map_save_name').value
+        self.mapped_area_file = self.get_parameter('mapped_area_file').value
+        self.replan_on_frontier_update = self.get_parameter('replan_on_frontier_update').value
+        self.replan_interval = float(self.get_parameter('replan_interval').value)
+        self.replan_goal_change_distance = float(self.get_parameter('replan_goal_change_distance').value)
+        self.replan_min_improvement = float(self.get_parameter('replan_min_improvement').value)
+        self.always_replan_on_frontier_update = bool(self.get_parameter('always_replan_on_frontier_update').value)
+        self.avoid_return_radius = float(self.get_parameter('avoid_return_radius').value)
+        self.avoid_last_goal_radius = float(self.get_parameter('avoid_last_goal_radius').value)
+        self.frontier_pick_farthest = bool(self.get_parameter('frontier_pick_farthest').value)
+        self.frontier_selection_method = self.get_parameter('frontier_selection_method').value
+        self.astar_max_candidates = int(self.get_parameter('astar_max_candidates').value)
+        self.astar_max_expansions = int(self.get_parameter('astar_max_expansions').value)
         self.costmap_waited_out = False
+        if self.strict_no_revisit:
+            self.avoid_revisit = True
         
         # State
         self.current_phase = Phase.INIT
@@ -165,6 +210,11 @@ class ExplorationCoordinator(Node):
         self.simple_exploration_duration = 10.0  # 10 seconds of simple exploration
         self.simple_exploration_turn_time = 2.0  # Turn for 2 seconds
         self.simple_exploration_move_time = 3.0  # Move for 3 seconds
+        self.map_save_requested = False
+        self.complete_marker_sent = False
+        self.mapped_area_series = []
+        self.last_mapped_area_m2 = 0.0
+        self.last_percent_known = 0.0
         
         # EXPLORATION TRACKING - ensure bot actually explores area
         self.goals_reached = 0              # Track how many goals actually reached
@@ -189,6 +239,8 @@ class ExplorationCoordinator(Node):
         self.blacklisted_goals = {}  # (x, y) -> expiry_time
         self.visited_goals = []      # list of (x, y) reached successfully
         self.recent_goals = []       # list of (x, y, expiry_time) attempted recently
+        self.strict_avoid_goals = [] # list of (x, y) attempted/reached (no expiry)
+        self.attempted_frontiers = []  # list of (x, y) frontier targets (no expiry)
         
         # Backward scan state (non-blocking)
         self.scan_in_progress = False
@@ -224,6 +276,8 @@ class ExplorationCoordinator(Node):
         self.last_origin_warn_time = 0.0
         self.startup_time = time.time()
         self.last_frontier_skip_reason = None
+        self.last_frontier_relax_log_time = 0.0
+        self.frontier_relax_log_interval = 5.0
         self.last_tf_check_log_time = 0.0
         self.tf_check_log_interval = 5.0
         self.costmap = None
@@ -239,6 +293,10 @@ class ExplorationCoordinator(Node):
         self.odom_stale_timeout = 1.0  # seconds
         self.last_odom_stale_log_time = 0.0
         self.odom_stale_log_interval = 5.0
+        self.last_frontier_update_time = 0.0
+        self.last_replan_time = 0.0
+        self.pending_replan_goal = None
+        self.last_goal_cancel_time = 0.0
         
         # Nav2 action client
         self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
@@ -247,6 +305,11 @@ class ExplorationCoordinator(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.cmd_vel_nav_pub = self.create_publisher(Twist, '/cmd_vel_nav', 10)
         self.servo_cmd_pub = self.create_publisher(Float32, '/servo_command', 10)  # For servo sweep angles
+        self.mapped_area_pub = self.create_publisher(Float32, '/mapped_area_m2', 10)
+        status_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.status_marker_pub = self.create_publisher(Marker, '/exploration_status', status_qos)
+
+        self.map_saver_client = self.create_client(SaveMap, '/map_saver/save_map')
         
         # Subscribers
         self.create_subscription(MarkerArray, '/frontiers', self.frontiers_cb, 10)
@@ -254,11 +317,15 @@ class ExplorationCoordinator(Node):
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
         # Also listen to raw scan to mark lidar freshness in case /scan is delayed
         self.create_subscription(LaserScan, self.scan_raw_topic, self.scan_raw_cb, qos_profile_sensor_data)
-        self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
+        self.create_subscription(Odometry, '/odometry/filtered', self.odom_cb, 10)
         costmap_qos = QoSProfile(depth=1)
         costmap_qos.durability = DurabilityPolicy.VOLATILE
         costmap_qos.reliability = ReliabilityPolicy.RELIABLE
         costmap_raw_qos = qos_profile_sensor_data
+        map_qos = QoSProfile(depth=1)
+        map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        map_qos.reliability = ReliabilityPolicy.RELIABLE
+        self.create_subscription(OccupancyGrid, self.map_topic, self.map_cb, map_qos)
         self.create_subscription(OccupancyGrid, self.costmap_topic, self.costmap_cb, costmap_qos)
         self.create_subscription(OccupancyGrid, self.local_costmap_topic, self.local_costmap_cb, costmap_qos)
         self.create_subscription(Costmap, self.costmap_raw_topic, self.costmap_raw_cb, costmap_raw_qos)
@@ -284,6 +351,8 @@ class ExplorationCoordinator(Node):
             y = marker.pose.position.y
             self.current_frontiers.append((x, y))
 
+        self.last_frontier_update_time = time.time()
+
         # If frontiers exist, LiDAR/map is flowing; use as fallback for lidar freshness
         if self.current_frontiers:
             self.ever_had_frontiers = True
@@ -292,7 +361,7 @@ class ExplorationCoordinator(Node):
     
     def obstacle_distance_cb(self, msg: Float32):
         """Handle Arduino safety stop signals"""
-        if self.nav2_handles_obstacles:
+        if self.nav2_handles_obstacles and not self.strict_obstacle_handling:
             return
         if not self.use_ultrasonic_backup:
             return
@@ -427,6 +496,28 @@ class ExplorationCoordinator(Node):
         if self.local_costmap is None:
             self.get_logger().info("✅ Received local costmap (OccupancyGrid)")
         self.local_costmap = msg
+
+    def map_cb(self, msg: OccupancyGrid):
+        data = msg.data
+        if not data:
+            return
+        known_cells = 0
+        total_cells = len(data)
+        for val in data:
+            if val != -1:
+                known_cells += 1
+        resolution = msg.info.resolution
+        area_m2 = known_cells * (resolution * resolution)
+        now = time.time()
+        elapsed = now - self.startup_time
+        percent_known = (known_cells / total_cells) * 100.0 if total_cells > 0 else 0.0
+        self.last_mapped_area_m2 = area_m2
+        self.last_percent_known = percent_known
+        self.mapped_area_series.append((elapsed, area_m2, percent_known, known_cells, total_cells))
+
+        msg_area = Float32()
+        msg_area.data = area_m2
+        self.mapped_area_pub.publish(msg_area)
 
     def costmap_raw_cb(self, msg: Costmap):
         if not self.costmap_raw_received:
@@ -633,6 +724,89 @@ class ExplorationCoordinator(Node):
             f"map->odom={can_map_odom}, odom->{self.base_frame}={can_odom_base}, costmap={costmap_ready}, "
             f"clear={clear_for_hold}"
         )
+
+    def _get_costmap_info(self):
+        if self.costmap is None:
+            return None
+
+        if hasattr(self.costmap, 'info'):
+            info = self.costmap.info
+            origin_x = info.origin.position.x
+            origin_y = info.origin.position.y
+            resolution = info.resolution
+            width = info.width
+            height = info.height
+            data = self.costmap.data
+        elif hasattr(self.costmap, 'metadata'):
+            meta = self.costmap.metadata
+            origin_x = meta.origin.position.x
+            origin_y = meta.origin.position.y
+            resolution = meta.resolution
+            width = meta.size_x
+            height = meta.size_y
+            data = self.costmap.data
+        else:
+            return None
+
+        return origin_x, origin_y, resolution, width, height, data
+
+    def _world_to_costmap(self, x, y, costmap_info):
+        origin_x, origin_y, resolution, width, height, _ = costmap_info
+        mx = int((x - origin_x) / resolution)
+        my = int((y - origin_y) / resolution)
+        if mx < 0 or my < 0 or mx >= width or my >= height:
+            return None
+        return (mx, my)
+
+    def _is_costmap_free(self, mx, my, costmap_info):
+        _, _, _, width, _, data = costmap_info
+        index = my * width + mx
+        value = data[index]
+        if value < 0:
+            return False
+        return value < self.costmap_free_threshold
+
+    def _astar_path_length(self, start_xy, goal_xy):
+        costmap_info = self._get_costmap_info()
+        if costmap_info is None:
+            return None
+
+        start = self._world_to_costmap(start_xy[0], start_xy[1], costmap_info)
+        goal = self._world_to_costmap(goal_xy[0], goal_xy[1], costmap_info)
+        if start is None or goal is None:
+            return None
+
+        if not self._is_costmap_free(start[0], start[1], costmap_info):
+            return None
+        if not self._is_costmap_free(goal[0], goal[1], costmap_info):
+            return None
+
+        import heapq
+        sx, sy = start
+        gx, gy = goal
+        open_set = [(0.0, 0.0, sx, sy)]
+        g_scores = {(sx, sy): 0.0}
+        expansions = 0
+
+        while open_set and expansions < self.astar_max_expansions:
+            _, g, x, y = heapq.heappop(open_set)
+            expansions += 1
+            if (x, y) == (gx, gy):
+                _, _, resolution, _, _, _ = costmap_info
+                return g * resolution
+
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                nx, ny = x + dx, y + dy
+                if not self._is_costmap_free(nx, ny, costmap_info):
+                    continue
+                ng = g + 1.0
+                if (nx, ny) not in g_scores or ng < g_scores[(nx, ny)]:
+                    g_scores[(nx, ny)] = ng
+                    h = abs(gx - nx) + abs(gy - ny)
+                    f = ng + h
+                    heapq.heappush(open_set, (f, ng, nx, ny))
+
+        return None
     
     def pick_best_frontier(self):
         if not self.current_frontiers:
@@ -672,51 +846,142 @@ class ExplorationCoordinator(Node):
 
         def select_frontier(min_dist, goal_offset, use_costmap_filter):
             best = None
-            best_dist = float('inf')
+            best_dist = -float('inf') if self.frontier_pick_farthest else float('inf')
+            candidates = []
 
-            for fx, fy in self.current_frontiers:
-                dist = math.sqrt((fx - robot_x)**2 + (fy - robot_y)**2)
-                if dist < min_dist or dist >= best_dist:
-                    continue
-
-                if goal_offset > 0.0:
-                    if dist <= (goal_offset + 0.05):
+            def build_candidates(costmap_filter: bool):
+                built = []
+                for fx, fy in self.current_frontiers:
+                    dist = math.sqrt((fx - robot_x)**2 + (fy - robot_y)**2)
+                    if dist < min_dist:
                         continue
-                    ux = (fx - robot_x) / dist
-                    uy = (fy - robot_y) / dist
-                    goal_x = fx - (ux * goal_offset)
-                    goal_y = fy - (uy * goal_offset)
+
+                    if self.force_frontier_goal:
+                        goal_x = fx
+                        goal_y = fy
+                    elif goal_offset > 0.0:
+                        if dist <= (goal_offset + 0.05):
+                            continue
+                        ux = (fx - robot_x) / dist
+                        uy = (fy - robot_y) / dist
+                        goal_x = fx - (ux * goal_offset)
+                        goal_y = fy - (uy * goal_offset)
+                    else:
+                        goal_x = fx
+                        goal_y = fy
+
+                    if self.strict_no_revisit and self.strict_avoid_goals:
+                        strict_radius = max(
+                            self.visited_goal_radius,
+                            self.recent_goal_radius,
+                            self.avoid_return_radius,
+                            self.avoid_last_goal_radius,
+                        )
+                        if any(math.hypot(goal_x - sx, goal_y - sy) <= strict_radius
+                               for sx, sy in self.strict_avoid_goals):
+                            continue
+                    if self.strict_no_revisit and self.attempted_frontiers:
+                        strict_radius = max(
+                            self.visited_goal_radius,
+                            self.recent_goal_radius,
+                            self.avoid_return_radius,
+                            self.avoid_last_goal_radius,
+                        )
+                        if any(math.hypot(fx - sx, fy - sy) <= strict_radius
+                               for sx, sy in self.attempted_frontiers):
+                            continue
+
+                    if not self._goal_in_free_space(goal_x, goal_y, costmap_filter):
+                        continue
+
+                    if self.blacklisted_goals:
+                        skip = any(math.hypot(goal_x - bx, goal_y - by) <= self.blacklist_radius
+                                  for (bx, by), _ in self.blacklisted_goals.items())
+                        if skip:
+                            continue
+
+                    if self.avoid_revisit and self.visited_goals:
+                        skip = any(math.hypot(goal_x - vx, goal_y - vy) <= self.visited_goal_radius
+                                  for vx, vy in self.visited_goals)
+                        if skip:
+                            continue
+
+                    if self.avoid_revisit and self.last_successful_goal_pos is not None:
+                        if math.hypot(goal_x - self.last_successful_goal_pos[0], goal_y - self.last_successful_goal_pos[1]) <= self.avoid_return_radius:
+                            continue
+
+                    if self.avoid_revisit and self.last_goal_target is not None:
+                        if math.hypot(goal_x - self.last_goal_target[0], goal_y - self.last_goal_target[1]) <= self.avoid_last_goal_radius:
+                            continue
+
+                    if self.recent_goals:
+                        skip = any(math.hypot(goal_x - rx, goal_y - ry) <= self.recent_goal_radius
+                                  for rx, ry, _ in self.recent_goals)
+                        if skip:
+                            continue
+
+                    built.append({
+                        'frontier': (fx, fy),
+                        'goal': (goal_x, goal_y),
+                        'dist': dist,
+                        'costmap_filtered': costmap_filter
+                    })
+                return built
+
+            candidates = build_candidates(use_costmap_filter)
+            if not candidates and use_costmap_filter:
+                candidates = build_candidates(False)
+                if candidates:
+                    now = time.time()
+                    if (now - self.last_frontier_relax_log_time) >= self.frontier_relax_log_interval:
+                        self.last_frontier_relax_log_time = now
+                        self.get_logger().warn("No candidates after costmap filter; retrying without costmap filter.")
+
+            if not candidates:
+                return None
+
+            if self.frontier_selection_method == 'astar':
+                candidates.sort(key=lambda c: c['dist'])
+                candidates = candidates[:max(1, self.astar_max_candidates)]
+                best_cost = None
+                astar_found = False
+                for candidate in candidates:
+                    path_cost = self._astar_path_length((robot_x, robot_y), candidate['goal'])
+                    if path_cost is None:
+                        continue
+                    astar_found = True
+                    if best_cost is None:
+                        best_cost = path_cost
+                        best = candidate
+                        best['dist'] = path_cost
+                        continue
+                    if self.frontier_pick_farthest:
+                        if path_cost > best_cost:
+                            best_cost = path_cost
+                            best = candidate
+                            best['dist'] = path_cost
+                    else:
+                        if path_cost < best_cost:
+                            best_cost = path_cost
+                            best = candidate
+                            best['dist'] = path_cost
+                if astar_found:
+                    return best
+                now = time.time()
+                if (now - self.last_frontier_relax_log_time) >= self.frontier_relax_log_interval:
+                    self.last_frontier_relax_log_time = now
+                    self.get_logger().warn("A* failed for all candidates; falling back to distance selection.")
+
+            for candidate in candidates:
+                dist = candidate['dist']
+                if self.frontier_pick_farthest:
+                    if dist <= best_dist:
+                        continue
                 else:
-                    goal_x = fx
-                    goal_y = fy
-
-                if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter):
-                    continue
-
-                if self.blacklisted_goals:
-                    skip = any(math.hypot(goal_x - bx, goal_y - by) <= self.blacklist_radius
-                              for (bx, by), _ in self.blacklisted_goals.items())
-                    if skip:
+                    if dist >= best_dist:
                         continue
-
-                if self.avoid_revisit and self.visited_goals:
-                    skip = any(math.hypot(goal_x - vx, goal_y - vy) <= self.visited_goal_radius
-                              for vx, vy in self.visited_goals)
-                    if skip:
-                        continue
-
-                if self.recent_goals:
-                    skip = any(math.hypot(goal_x - rx, goal_y - ry) <= self.recent_goal_radius
-                              for rx, ry, _ in self.recent_goals)
-                    if skip:
-                        continue
-
                 best_dist = dist
-                best = {
-                    'frontier': (fx, fy),
-                    'goal': (goal_x, goal_y),
-                    'dist': dist
-                }
+                best = candidate
 
             return best
 
@@ -743,11 +1008,40 @@ class ExplorationCoordinator(Node):
 
         self.last_frontier_skip_reason = "no_valid_frontiers"
         return None
+
+    def _refresh_pending_goal_from_frontiers(self, reason: str):
+        if not self.replan_on_frontier_update:
+            return
+        if self.last_frontier_update_time <= self.last_replan_time:
+            return
+        now = time.time()
+        if not self.always_replan_on_frontier_update and (now - self.last_replan_time) < self.replan_interval:
+            return
+        self.update_pose()
+        if not self.pose_valid:
+            return
+
+        goal_info = self.pick_best_frontier()
+        if goal_info is None:
+            return
+
+        best_goal_x, best_goal_y = goal_info['goal']
+        if self.last_goal_target is not None:
+            current_goal_x, current_goal_y = self.last_goal_target
+            goal_delta = math.hypot(best_goal_x - current_goal_x, best_goal_y - current_goal_y)
+            if goal_delta < max(0.05, self.replan_goal_change_distance):
+                return
+
+        self.pending_replan_goal = (best_goal_x, best_goal_y)
+        self.last_replan_time = now
+        self.get_logger().info(f"🔁 Replan pending ({reason}): new goal ({best_goal_x:.2f}, {best_goal_y:.2f})")
     
-    def send_goal_to_nav2(self, goal_x, goal_y):
+    def send_goal_to_nav2(self, goal_x, goal_y, use_costmap_filter: bool | None = None, frontier_xy=None):
         """Send goal to Nav2 navigate_to_pose with proper TF timeout handling"""
         now = time.time()
         timeout = Duration(seconds=0.1)  # 100ms timeout for TF operations
+        if use_costmap_filter is None:
+            use_costmap_filter = self.use_costmap_goal_filter
         
         # Check TF directly instead of requiring odom
         try:
@@ -760,8 +1054,9 @@ class ExplorationCoordinator(Node):
             return False
 
         # Double-check goal is in free space (costmap may have updated)
-        if not self._goal_in_free_space(goal_x, goal_y, self.use_costmap_goal_filter):
+        if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter):
             self.get_logger().warn(f"⚠️ Goal ({goal_x:.2f}, {goal_y:.2f}) no longer in free space - skipping")
+            self._blacklist_goal((goal_x, goal_y))
             return False
 
         nav2_server_ready = self.nav_client.wait_for_server(timeout_sec=0.1)
@@ -807,6 +1102,11 @@ class ExplorationCoordinator(Node):
         goal_msg.pose.pose.orientation.w = 1.0
 
         self.last_goal_target = (goal_x, goal_y)
+        if self.strict_no_revisit:
+            self.strict_avoid_goals.append((goal_x, goal_y))
+            if frontier_xy is not None:
+                self.strict_avoid_goals.append(frontier_xy)
+                self.attempted_frontiers.append(frontier_xy)
         # Track recently attempted goals to avoid revisits
         self.recent_goals.append((goal_x, goal_y, time.time() + self.recent_goal_hold_time))
 
@@ -956,10 +1256,10 @@ class ExplorationCoordinator(Node):
         
         # SAFETY: Check for rear obstacles before moving backward
         if self.rear_obstacle_detected:
-            stop_msg = Twist()
-            self.cmd_vel_pub.publish(stop_msg)
             self.scan_in_progress = False
-            self.get_logger().error("🛑 REAR OBSTACLE DETECTED! Stopping backward motion.")
+            self.get_logger().error(
+                "🛑 Rear obstacle detected; aborting backward scan to allow forward/turn commands."
+            )
             return False  # Abort scan due to rear obstacle
         
         # Check if we've finished all angles
@@ -995,12 +1295,10 @@ class ExplorationCoordinator(Node):
     
     def main_loop(self):
         """Main exploration state machine"""
-        if not self.nav2_handles_obstacles:
+        if self.strict_obstacle_handling or not self.nav2_handles_obstacles:
             # Ultrasonic emergency backup (2s) at very close range
             if time.time() < self.ultrasonic_emergency_until:
                 if self.rear_obstacle_detected:
-                    stop_msg = Twist()
-                    self.cmd_vel_pub.publish(stop_msg)
                     return
                 backup_msg = Twist()
                 backup_msg.linear.x = self.backup_speed
@@ -1013,15 +1311,13 @@ class ExplorationCoordinator(Node):
                     return
                 if self.rear_obstacle_detected:
                     self.lidar_backup_until = 0.0
-                    stop_msg = Twist()
-                    self.cmd_vel_pub.publish(stop_msg)
                     return
                 backup_msg = Twist()
                 backup_msg.linear.x = self.backup_speed
                 self.cmd_vel_pub.publish(backup_msg)
                 return
         # Global safety stop handling: custom obstacle handling only when enabled
-        if (not self.nav2_handles_obstacles and self.obstacle_detected and
+        if ((self.strict_obstacle_handling or not self.nav2_handles_obstacles) and self.obstacle_detected and
                 self.current_phase not in (Phase.OBSTACLE, Phase.RESCAN)):
             self.get_logger().error(
                 f"💥 SAFETY_STOP detected ({self.obstacle_distance_m:.3f}m) - forcing OBSTACLE phase"
@@ -1119,7 +1415,7 @@ class ExplorationCoordinator(Node):
                 tf_ready = can_map_odom and can_odom_base
                 
                 clear_for_hold = (time.time() - self.last_obstacle_time) >= self.startup_clear_hold_time
-                obstacle_blocking = self.obstacle_detected and not self.nav2_handles_obstacles
+                obstacle_blocking = self.obstacle_detected and (self.strict_obstacle_handling or not self.nav2_handles_obstacles)
                 
                 # Handle obstacle blocking with timeout - proceed after max_obstacle_block_time
                 if obstacle_blocking:
@@ -1161,10 +1457,10 @@ class ExplorationCoordinator(Node):
         # ==== PHASE 2: EXPLORE ====
         elif self.current_phase == Phase.EXPLORE:
             # If a front obstacle is detected, wait for it to clear before choosing new frontiers
-            if self.obstacle_detected and not self.nav2_handles_obstacles:
+            if self.obstacle_detected and (self.strict_obstacle_handling or not self.nav2_handles_obstacles):
                 return
             # Check if obstacles detected - TRIGGER IMMEDIATE AVOIDANCE (only in EXPLORE phase)
-            if not self.nav2_handles_obstacles and self.obstacle_detected:
+            if (self.strict_obstacle_handling or not self.nav2_handles_obstacles) and self.obstacle_detected:
                 self.get_logger().error(f"💥💥💥 OBSTACLE at {self.obstacle_distance_m:.3f}m - OBSTACLE PHASE!")
                 self.current_phase = Phase.OBSTACLE
                 self.phase_start_time = time.time()
@@ -1175,9 +1471,32 @@ class ExplorationCoordinator(Node):
             if now - self.last_explore_check < self.explore_check_interval:
                 return  # Skip this cycle
             self.last_explore_check = now
+
+            # If a replan goal is pending and no goal is active, send it now
+            if self.pending_replan_goal and not (self.goal_handle or self.goal_in_progress):
+                if (now - self.last_goal_cancel_time) >= 0.2:
+                    goal_x, goal_y = self.pending_replan_goal
+                    self.pending_replan_goal = None
+                    self.last_goal_time = now
+                    self.send_goal_to_nav2(goal_x, goal_y)
+                return
             
             # Check if we have an active goal or one in progress - wait for it
             if self.goal_handle is not None or self.goal_in_progress:
+                if self.replan_on_frontier_update and self.last_frontier_update_time > self.last_replan_time:
+                    self._refresh_pending_goal_from_frontiers("frontier update")
+                    if self.pending_replan_goal is not None:
+                        if self.goal_handle is not None:
+                            try:
+                                cancel_future = self.goal_handle.cancel_goal_async()
+                                cancel_future.add_done_callback(
+                                    lambda f: self.get_logger().info("🛑 Nav2 goal cancel requested (replan)")
+                                )
+                            except Exception as e:
+                                self.get_logger().warn(f"⚠️ Replan cancel failed: {e}")
+                        self.goal_handle = None
+                        self.goal_in_progress = False
+                        self.last_goal_cancel_time = now
                 return
             
             # Check cooldown - don't spam goals
@@ -1190,8 +1509,13 @@ class ExplorationCoordinator(Node):
             goal_info = self.pick_best_frontier()
             if goal_info is None:
                 if self.stop_when_no_frontiers and self.last_frontier_skip_reason == "no_frontiers":
-                    stop_msg = Twist()
-                    self.cmd_vel_pub.publish(stop_msg)
+                    if self.rear_obstacle_detected:
+                        stop_msg = Twist()
+                        self.cmd_vel_pub.publish(stop_msg)
+                    else:
+                        backup_msg = Twist()
+                        backup_msg.linear.x = self.backup_speed
+                        self.cmd_vel_pub.publish(backup_msg)
                 if self.last_frontier_skip_reason in ("pose_invalid", "pose_stale"):
                     return
 
@@ -1201,6 +1525,12 @@ class ExplorationCoordinator(Node):
                     # Only declare complete if we've actually explored (reached some goals)
                     # AND frontiers have been stable for a while
                     if self.goals_reached >= self.min_goals_for_complete:
+                        if self.last_percent_known < self.coverage_complete_percent:
+                            self.get_logger().warn(
+                                f"⚠️ Coverage {self.last_percent_known:.1f}% < {self.coverage_complete_percent:.1f}% - continuing exploration"
+                            )
+                            self.no_frontier_cycles = 0
+                            return
                         # Check if frontiers have been stable (unchanged for some time)
                         now = time.time()
                         if self.last_frontier_check_time > 0:
@@ -1212,6 +1542,7 @@ class ExplorationCoordinator(Node):
                                 self.get_logger().info(f"   Final frontier count: {total_frontiers}")
                                 self.get_logger().info(f"   All accessible areas have been explored!")
                                 self.current_phase = Phase.DONE
+                                self._on_exploration_complete()
                                 return
                         
                         # Update frontier check time
@@ -1258,10 +1589,11 @@ class ExplorationCoordinator(Node):
             )
             self.ever_sent_goal = True
             self.last_goal_time = now  # Record goal send time
-            self.send_goal_to_nav2(goal_x, goal_y)
+            self.send_goal_to_nav2(goal_x, goal_y, goal_info.get('costmap_filtered'), frontier_xy=(frontier_x, frontier_y))
         
         # ==== PHASE 3: OBSTACLE HANDLING ====
         elif self.current_phase == Phase.OBSTACLE:
+            self._refresh_pending_goal_from_frontiers("obstacle")
             self.get_logger().error("📍 OBSTACLE PHASE: Cancel goal and prepare for RESCAN")
             self.emergency_backup()
             # Switch to RESCAN phase (will execute on next loop)
@@ -1271,6 +1603,7 @@ class ExplorationCoordinator(Node):
         
         # ==== PHASE 4: RESCAN ====
         elif self.current_phase == Phase.RESCAN:
+            self._refresh_pending_goal_from_frontiers("rescan")
             elapsed = time.time() - self.phase_start_time
             
             # Start scan on first entry
@@ -1281,6 +1614,11 @@ class ExplorationCoordinator(Node):
             
             # Execute scan steps continuously (NON-BLOCKING)
             scan_active = self.execute_scan_step()
+
+            if self.rear_obstacle_detected:
+                # Rear wall should not block exploration; let Nav2 take over.
+                self.current_phase = Phase.EXPLORE
+                return
             
             # If scan is done, check if path is clear
             if not scan_active:
@@ -1345,6 +1683,80 @@ class ExplorationCoordinator(Node):
             if now - self.last_done_log_time >= self.done_log_interval:
                 self.last_done_log_time = now
                 self.get_logger().info("🏁 Mission complete!")
+            if not self.complete_marker_sent:
+                self._on_exploration_complete()
+
+    def _on_exploration_complete(self):
+        if not self.complete_marker_sent:
+            self._publish_complete_marker()
+            self.complete_marker_sent = True
+        if self.auto_save_on_complete and not self.map_save_requested:
+            self.map_save_requested = True
+            self._request_map_save()
+        self._save_mapped_area_series()
+
+    def _save_mapped_area_series(self):
+        if not self.mapped_area_series:
+            self.get_logger().warn('⚠️ No mapped area data to save')
+            return
+        os.makedirs(self.map_save_dir, exist_ok=True)
+        out_path = os.path.join(self.map_save_dir, self.mapped_area_file)
+        try:
+            with open(out_path, 'w', encoding='ascii') as f:
+                f.write('elapsed_s,area_m2,percent_known,known_cells,total_cells\n')
+                for row in self.mapped_area_series:
+                    f.write(f"{row[0]:.2f},{row[1]:.3f},{row[2]:.2f},{row[3]},{row[4]}\n")
+            self.get_logger().info(f"📈 Mapped area data saved to {out_path}")
+        except Exception as e:
+            self.get_logger().error(f"❌ Failed to save mapped area data: {e}")
+
+    def _publish_complete_marker(self):
+        marker = Marker()
+        marker.header.frame_id = 'map'
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = 'exploration_status'
+        marker.id = 0
+        marker.type = Marker.TEXT_VIEW_FACING
+        marker.action = Marker.ADD
+        marker.pose.position.x = float(self.robot_pose[0])
+        marker.pose.position.y = float(self.robot_pose[1])
+        marker.pose.position.z = 0.5
+        marker.pose.orientation.w = 1.0
+        marker.scale.z = 0.4
+        marker.color.r = 0.0
+        marker.color.g = 1.0
+        marker.color.b = 0.0
+        marker.color.a = 1.0
+        marker.text = 'EXPLORATION COMPLETE'
+        self.status_marker_pub.publish(marker)
+
+    def _request_map_save(self):
+        if not self.map_saver_client.service_is_ready():
+            if not self.map_saver_client.wait_for_service(timeout_sec=2.0):
+                self.get_logger().warn('⚠️ Map saver service not available; skipping auto-save')
+                return
+        os.makedirs(self.map_save_dir, exist_ok=True)
+        map_url = os.path.join(self.map_save_dir, self.map_save_name)
+        req = SaveMap.Request()
+        req.map_topic = '/map'
+        req.map_url = map_url
+        req.image_format = 'pgm'
+        req.free_thresh = 0.25
+        req.occupied_thresh = 0.65
+        req.overwrite = True
+        self.get_logger().info(f"💾 Saving map to {map_url}.*")
+        future = self.map_saver_client.call_async(req)
+        future.add_done_callback(self._map_save_done)
+
+    def _map_save_done(self, future):
+        try:
+            result = future.result()
+            if result is not None and result.result:
+                self.get_logger().info('✅ Map saved successfully')
+            else:
+                self.get_logger().warn('⚠️ Map save failed')
+        except Exception as e:
+            self.get_logger().error(f'❌ Map save error: {e}')
 
 def main(args=None):
     rclpy.init(args=args)
