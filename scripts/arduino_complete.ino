@@ -49,8 +49,8 @@ const int MOTOR_STBY = 3;
 int motorA_speed = 0;
 int motorB_speed = 0;
 
-// Safety: motors disabled until START command
-bool motors_enabled = false;
+// Motors enabled by default (Python sends START for confirmation)
+bool motors_enabled = true;
 
 // Safety stop state (emergency only)
 bool safety_stop_active = false;
@@ -109,18 +109,20 @@ void setup() {
 }
 
 void loop() {
-  // Handle incoming commands
-  while (Serial.available() > 0) {
-    char c = Serial.read();
-    if (c == COMMAND_DELIMITER) {
-      processCommand(inputBuffer);
-      inputBuffer = "";
-    } else {
-      inputBuffer += c;
+  // PRIORITY 1: Handle incoming commands (check multiple times)
+  for (int i = 0; i < 3; i++) {
+    while (Serial.available() > 0) {
+      char c = Serial.read();
+      if (c == COMMAND_DELIMITER) {
+        processCommand(inputBuffer);
+        inputBuffer = "";
+      } else if (c != '\r') {  // Ignore carriage return
+        inputBuffer += c;
+      }
     }
   }
 
-  // IMU data
+  // PRIORITY 2: Read sensors
   float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
   if (imu_initialized) {
     sensors_event_t a, g, temp;
@@ -138,7 +140,7 @@ void loop() {
   // Ultrasonic
   float distance = readUltrasonic();
 
-  // Safety stop: emergency signal only (do not stop motors here)
+  // PRIORITY 3: Safety stop: emergency signal only (do not stop motors here)
   if (distance > 0 && distance < SAFETY_STOP_CM) {
     safety_hit_streak++;
     safety_clear_streak = 0;
@@ -146,6 +148,7 @@ void loop() {
       safety_stop_active = true;
       Serial.print("SAFETY_STOP:1,");
       Serial.println(distance, 2);
+      Serial.flush();  // Ensure safety stop is sent immediately
     }
   } else {
     safety_clear_streak++;
@@ -153,10 +156,11 @@ void loop() {
     if (safety_stop_active && safety_clear_streak >= SAFETY_CLEAR_COUNT) {
       safety_stop_active = false;
       Serial.println("SAFETY_STOP:0");
+      Serial.flush();
     }
   }
 
-  // CSV output for Raspberry Pi
+  // PRIORITY 4: CSV output for Raspberry Pi
   Serial.print(ax, 4); Serial.print(",");
   Serial.print(ay, 4); Serial.print(",");
   Serial.print(az, 4); Serial.print(",");
@@ -166,6 +170,7 @@ void loop() {
   Serial.print(distance, 2); Serial.print(",");
   Serial.print(motorA_speed); Serial.print(",");
   Serial.println(motorB_speed);
+  Serial.flush();  // Ensure data is sent
 
   delay(20); // ~50Hz
 }
@@ -249,16 +254,22 @@ void turnRight(int speed) {
 
 void processCommand(String cmd) {
   cmd.trim();
+  
+  // Remove any carriage returns
+  cmd.replace("\r", "");
+  cmd.replace("\n", "");
 
   if (cmd == "START") {
     motors_enabled = true;
     Serial.println("✅ ACK:START - Motors ENABLED - Safety stop ACTIVE");
+    Serial.flush();
     return;
   }
   if (cmd == "STOP") {
     motors_enabled = false;
     stopMotors();
     Serial.println("ACK:STOP");
+    Serial.flush();
     return;
   }
   if (cmd.startsWith("SERVO:")) {
@@ -277,10 +288,14 @@ void processCommand(String cmd) {
     scan_servo.write(servo_angle);
     Serial.print("ACK:SERVO:");
     Serial.println(servo_angle);
+    Serial.flush();
     return;
   }
-  if (!motors_enabled) {
+  
+  // Check if motors are enabled for motor commands
+  if (!motors_enabled && cmd.startsWith("MOTOR:")) {
     Serial.println("IGNORED: Motors disabled (send START)");
+    Serial.flush();
     return;
   }
 
@@ -294,18 +309,23 @@ void processCommand(String cmd) {
       Serial.print("ACK:MOTOR:");
       Serial.print(speedA); Serial.print(",");
       Serial.println(speedB);
+      Serial.flush();
     }
   } else if (cmd.startsWith("FWD:")) {
     moveForward(FORWARD_SPEED);
     Serial.print("ACK:FWD:"); Serial.println(FORWARD_SPEED);
+    Serial.flush();
   } else if (cmd.startsWith("BWD:")) {
     moveBackward(BACKWARD_SPEED);
     Serial.print("ACK:BWD:"); Serial.println(BACKWARD_SPEED);
+    Serial.flush();
   } else if (cmd.startsWith("LEFT:")) {
     turnLeft(TURN_SPEED);
     Serial.print("ACK:LEFT:"); Serial.println(TURN_SPEED);
+    Serial.flush();
   } else if (cmd.startsWith("RIGHT:")) {
     turnRight(TURN_SPEED);
     Serial.print("ACK:RIGHT:"); Serial.println(TURN_SPEED);
+    Serial.flush();
   }
 }

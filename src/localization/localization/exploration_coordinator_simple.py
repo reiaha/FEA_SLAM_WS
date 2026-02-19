@@ -46,6 +46,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('ultrasonic_backup_distance', 0.10)  # meters
         self.declare_parameter('lidar_stale_timeout', 0.5)       # seconds
         self.declare_parameter('lidar_backup_on_obstacle', True)
+        self.declare_parameter('swap_lidar_front_back', False)
         self.declare_parameter('rear_obstacle_threshold', 0.25)   # meters (rear safety)
         self.declare_parameter('rear_obstacle_hold_time', 0.8)    # seconds (latch rear obstacle)
         self.declare_parameter('rear_emergency_distance', 0.25)   # meters (hard stop if closer)
@@ -83,6 +84,10 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('require_nav2_active', True)
         self.declare_parameter('enable_simple_exploration', True)  # Enable simple exploration when Nav2 fails
         self.declare_parameter('stop_when_no_frontiers', True)
+        self.declare_parameter('no_frontier_recovery_cycles', 5)
+        self.declare_parameter('no_frontier_complete_cycles', 10)
+        self.declare_parameter('corner_recovery_time', 1.5)
+        self.declare_parameter('corner_recovery_turn_speed', 0.4)
         self.declare_parameter('coverage_complete_percent', 90.0)
         self.declare_parameter('auto_save_on_complete', True)
         self.declare_parameter('map_topic', '/map')
@@ -113,6 +118,7 @@ class ExplorationCoordinator(Node):
         self.ultrasonic_backup_distance = self.get_parameter('ultrasonic_backup_distance').value
         self.lidar_stale_timeout = self.get_parameter('lidar_stale_timeout').value
         self.lidar_backup_on_obstacle = self.get_parameter('lidar_backup_on_obstacle').value
+        self.swap_lidar_front_back = bool(self.get_parameter('swap_lidar_front_back').value)
         self.rear_obstacle_threshold = self.get_parameter('rear_obstacle_threshold').value
         self.rear_obstacle_hold_time = self.get_parameter('rear_obstacle_hold_time').value
         self.rear_emergency_distance = self.get_parameter('rear_emergency_distance').value
@@ -149,6 +155,10 @@ class ExplorationCoordinator(Node):
         self.costmap_wait_timeout = float(self.get_parameter('costmap_wait_timeout').value)
         self.require_nav2_active = self.get_parameter('require_nav2_active').value  # Properly use the parameter
         self.stop_when_no_frontiers = self.get_parameter('stop_when_no_frontiers').value
+        self.no_frontier_recovery_cycles = int(self.get_parameter('no_frontier_recovery_cycles').value)
+        self.no_frontier_complete_cycles = int(self.get_parameter('no_frontier_complete_cycles').value)
+        self.corner_recovery_time = float(self.get_parameter('corner_recovery_time').value)
+        self.corner_recovery_turn_speed = float(self.get_parameter('corner_recovery_turn_speed').value)
         self.coverage_complete_percent = float(self.get_parameter('coverage_complete_percent').value)
         self.enable_simple_exploration = self.get_parameter('enable_simple_exploration').value
         self.auto_save_on_complete = self.get_parameter('auto_save_on_complete').value
@@ -199,6 +209,8 @@ class ExplorationCoordinator(Node):
         self.goal_handle = None
         self.goal_in_progress = False  # Flag: prevents sending goals while waiting for callback
         self.no_frontier_cycles = 0
+        self.corner_recovery_until = 0.0
+        self.corner_recovery_mode = None
         self.last_goal_time = 0.0  # Track when we last sent a goal
         self.goal_cooldown = 0.5   # Reduced from 3s for faster exploration
         self.ever_had_frontiers = False
@@ -444,6 +456,10 @@ class ExplorationCoordinator(Node):
                     min_front_distance = distance
                 if distance < self.lidar_obstacle_distance:
                     front_obstacle = True
+
+        if self.swap_lidar_front_back:
+            min_front_distance, min_rear_distance = min_rear_distance, min_front_distance
+            front_obstacle, rear_obstacle = rear_obstacle, front_obstacle
         
         # Latch rear obstacle detection to stop backing reliably
         if min_rear_distance < float('inf'):
@@ -1254,13 +1270,25 @@ class ExplorationCoordinator(Node):
         if not self.scan_in_progress:
             return False  # Scan not active
         
-        # SAFETY: Check for rear obstacles before moving backward
-        if self.rear_obstacle_detected:
+        # SAFETY: If rear is too close, stop backing up; otherwise rotate to clear the front.
+        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
             self.scan_in_progress = False
             self.get_logger().error(
-                "🛑 Rear obstacle detected; aborting backward scan to allow forward/turn commands."
+                "🛑 Rear obstacle too close; stopping backward scan and holding position."
             )
-            return False  # Abort scan due to rear obstacle
+            stop_msg = Twist()
+            self.cmd_vel_pub.publish(stop_msg)
+            return False
+        elif self.rear_obstacle_detected:
+            # Turn in place to search for a clear direction without backing into the rear obstacle.
+            rotate_msg = Twist()
+            rotate_msg.angular.z = 0.4
+            self.cmd_vel_pub.publish(rotate_msg)
+            self.scan_step += 1
+            if self.scan_step >= self.scan_steps_per_angle:
+                self.scan_step = 0
+                self.scan_angle_index += 1
+            return True
         
         # Check if we've finished all angles
         if self.scan_angle_index >= len(self.scan_angles):
@@ -1298,7 +1326,7 @@ class ExplorationCoordinator(Node):
         if self.strict_obstacle_handling or not self.nav2_handles_obstacles:
             # Ultrasonic emergency backup (2s) at very close range
             if time.time() < self.ultrasonic_emergency_until:
-                if self.rear_obstacle_detected:
+                if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
                     return
                 backup_msg = Twist()
                 backup_msg.linear.x = self.backup_speed
@@ -1309,7 +1337,7 @@ class ExplorationCoordinator(Node):
                 if not self.front_obstacle_detected:
                     self.lidar_backup_until = 0.0
                     return
-                if self.rear_obstacle_detected:
+                if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
                     self.lidar_backup_until = 0.0
                     return
                 backup_msg = Twist()
@@ -1472,6 +1500,23 @@ class ExplorationCoordinator(Node):
                 return  # Skip this cycle
             self.last_explore_check = now
 
+            # If a corner recovery is active, keep it running for the duration
+            if self.corner_recovery_until > 0.0:
+                if now >= self.corner_recovery_until:
+                    self.corner_recovery_until = 0.0
+                    self.corner_recovery_mode = None
+                else:
+                    recovery_msg = Twist()
+                    if self.corner_recovery_mode == "backup":
+                        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
+                            recovery_msg.angular.z = self.corner_recovery_turn_speed
+                        else:
+                            recovery_msg.linear.x = self.backup_speed
+                    else:
+                        recovery_msg.angular.z = self.corner_recovery_turn_speed
+                    self.cmd_vel_pub.publish(recovery_msg)
+                    return
+
             # If a replan goal is pending and no goal is active, send it now
             if self.pending_replan_goal and not (self.goal_handle or self.goal_in_progress):
                 if (now - self.last_goal_cancel_time) >= 0.2:
@@ -1520,7 +1565,32 @@ class ExplorationCoordinator(Node):
                     return
 
                 self.no_frontier_cycles += 1
-                if self.no_frontier_cycles > 10:
+                if (
+                    self.no_frontier_cycles >= self.no_frontier_recovery_cycles and
+                    self.no_frontier_cycles < self.no_frontier_complete_cycles and
+                    (self.no_frontier_cycles % self.no_frontier_recovery_cycles) == 0
+                ):
+                    if self.corner_recovery_until <= 0.0:
+                        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
+                            self.corner_recovery_mode = "rotate"
+                        else:
+                            self.corner_recovery_mode = "backup"
+                        self.corner_recovery_until = now + self.corner_recovery_time
+                        self.get_logger().warn(
+                            f"🧭 No frontiers for {self.no_frontier_cycles} cycles - corner recovery: {self.corner_recovery_mode}"
+                        )
+                    recovery_msg = Twist()
+                    if self.corner_recovery_mode == "backup":
+                        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
+                            recovery_msg.angular.z = self.corner_recovery_turn_speed
+                        else:
+                            recovery_msg.linear.x = self.backup_speed
+                    else:
+                        recovery_msg.angular.z = self.corner_recovery_turn_speed
+                    self.cmd_vel_pub.publish(recovery_msg)
+                    return
+
+                if self.no_frontier_cycles >= self.no_frontier_complete_cycles:
                     total_frontiers = len(self.current_frontiers)
                     # Only declare complete if we've actually explored (reached some goals)
                     # AND frontiers have been stable for a while
@@ -1569,7 +1639,9 @@ class ExplorationCoordinator(Node):
                 else:
                     self.update_pose()
                     robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
-                    self.get_logger().warn(f"⚠️ No valid frontiers! (cycle {self.no_frontier_cycles}/10) Robot at ({robot_x:.2f}, {robot_y:.2f})")
+                    self.get_logger().warn(
+                        f"⚠️ No valid frontiers! (cycle {self.no_frontier_cycles}/{self.no_frontier_complete_cycles}) Robot at ({robot_x:.2f}, {robot_y:.2f})"
+                    )
                 return
             
             # Reset frontier tracking when we find a goal
@@ -1615,11 +1687,6 @@ class ExplorationCoordinator(Node):
             # Execute scan steps continuously (NON-BLOCKING)
             scan_active = self.execute_scan_step()
 
-            if self.rear_obstacle_detected:
-                # Rear wall should not block exploration; let Nav2 take over.
-                self.current_phase = Phase.EXPLORE
-                return
-            
             # If scan is done, check if path is clear
             if not scan_active:
                 # Allow 1 second after scan before checking clearance
