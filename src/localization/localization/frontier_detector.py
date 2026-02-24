@@ -18,19 +18,26 @@ class FrontierDetector(Node):
         super().__init__('frontier_detector')
         
         # Parameters
-        self.declare_parameter('min_frontier_size', 5)  # Tighten: ignore tiny/noisy frontiers
-        self.declare_parameter('min_distance_to_frontier', 0.6)  # Tighten: avoid very close frontiers
-        self.declare_parameter('frontier_threshold', 20)  # Less sensitive to noise
-        self.declare_parameter('free_space_threshold', 20)  # Keep clear boundaries
+        self.declare_parameter('min_frontier_size', 2)
+        self.declare_parameter('min_distance_to_frontier', 0.1)
+        self.declare_parameter('frontier_threshold', 20)
+        self.declare_parameter('free_space_threshold', 35)
+        self.declare_parameter('min_unknown_neighbors', 1)
+        self.declare_parameter('diagnostics', True)
+        self.declare_parameter('diagnostics_log_interval', 2.0)
         
         self.min_frontier_size = self.get_parameter('min_frontier_size').value
         self.min_distance = self.get_parameter('min_distance_to_frontier').value
         self.frontier_threshold = self.get_parameter('frontier_threshold').value
         self.free_space_threshold = self.get_parameter('free_space_threshold').value
+        self.min_unknown_neighbors = int(self.get_parameter('min_unknown_neighbors').value)
+        self.diagnostics = bool(self.get_parameter('diagnostics').value)
+        self.diagnostics_log_interval = float(self.get_parameter('diagnostics_log_interval').value)
         
         # Performance: throttle processing to avoid slowing down RViz
         self.last_frontier_time = 0.0
         self.frontier_throttle_rate = 4.0  # Process at most every 0.25 seconds
+        self.last_diag_log_time = 0.0
         
         # Publishers
         self.frontiers_pub = self.create_publisher(MarkerArray, 'frontiers', 10)
@@ -70,12 +77,24 @@ class FrontierDetector(Node):
         except ValueError as e:
             self.get_logger().error(f'Failed to reshape map data: {e}')
             return
+
+        if self.diagnostics and (current_time - self.last_diag_log_time) >= self.diagnostics_log_interval:
+            self.last_diag_log_time = current_time
+            known_cells = int(np.count_nonzero(map_array >= 0))
+            unknown_cells = int(np.count_nonzero(map_array == -1))
+            free_cells = int(np.count_nonzero((map_array >= 0) & (map_array < self.free_space_threshold)))
+            self.get_logger().info(
+                f"🧭 Frontier map stats: known={known_cells}, unknown={unknown_cells}, free={free_cells}, "
+                f"resolution={resolution:.3f}, size={width}x{height}"
+            )
         
         # Find frontier cells (boundaries between explored and unexplored)
         frontier_cells = self.find_frontiers(map_array)
         
         if len(frontier_cells) == 0:
-            self.get_logger().info('No frontiers found - map fully explored!')
+            marker_array = MarkerArray()
+            self.frontiers_pub.publish(marker_array)
+            self.get_logger().info('No frontiers found in current map update')
             return
         
         # Cluster frontier cells
@@ -105,7 +124,10 @@ class FrontierDetector(Node):
                     'cell': centroid_cell
                 })
         
-        self.get_logger().info(f'Found {len(frontier_clusters)} frontier clusters, {len(valid_frontiers)} are valid (size >= {self.min_frontier_size})')
+        self.get_logger().info(
+            f'Found {len(frontier_cells)} frontier cells, {len(frontier_clusters)} clusters, '
+            f'{len(valid_frontiers)} valid (size >= {self.min_frontier_size})'
+        )
         
         # Publish frontiers as markers for RViz
         marker_array = MarkerArray()
@@ -155,21 +177,25 @@ class FrontierDetector(Node):
             for x in range(1, width - 1):
                 cell = map_array[y, x]
                 
-                # Only consider FREE cells (low cost) - use parameter for threshold
-                if cell >= 0 and cell < self.free_space_threshold:  # Free space only
-                    # Check 4-connectivity neighbors for speed
+                # Consider only known free cells as frontier candidates
+                if cell >= 0 and cell < self.free_space_threshold:
+                    # Check 8-neighborhood for unknown boundary contact
                     neighbors = [
                         map_array[y-1, x],
                         map_array[y+1, x],
                         map_array[y, x-1],
-                        map_array[y, x+1]
+                        map_array[y, x+1],
+                        map_array[y-1, x-1],
+                        map_array[y-1, x+1],
+                        map_array[y+1, x-1],
+                        map_array[y+1, x+1],
                     ]
                     
-                    # Count unknown neighbors
-                    unknown_count = sum(1 for n in neighbors if n == -1 or n >= self.frontier_threshold)
+                    # Frontier = free cell adjacent to unknown space
+                    unknown_count = sum(1 for n in neighbors if n == -1)
                     
                     # If has unknown neighbors, it's a frontier boundary
-                    if unknown_count > 0:
+                    if unknown_count >= max(1, self.min_unknown_neighbors):
                         frontier_cells.append((y, x))
         
         return frontier_cells
@@ -178,6 +204,8 @@ class FrontierDetector(Node):
         """Cluster frontier cells using A* pathfinding-based connectivity"""
         if not frontier_cells:
             return []
+
+        frontier_set = set(frontier_cells)
         
         visited = set()
         clusters = []
@@ -186,7 +214,7 @@ class FrontierDetector(Node):
             if cell not in visited:
                 # A*-based region growing for more intelligent clustering
                 try:
-                    cluster = self._astar_cluster_region(cell, frontier_cells, map_array, visited)
+                    cluster = self._astar_cluster_region(cell, frontier_set, map_array, visited)
                     if cluster:
                         clusters.append(cluster)
                 except Exception as e:

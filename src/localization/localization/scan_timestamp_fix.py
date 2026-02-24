@@ -18,8 +18,20 @@ class ScanTimestampFix(Node):
 
         self.declare_parameter('input_topic', '/scan_raw')
         self.declare_parameter('output_topic', '/scan')
+        self.declare_parameter('expected_scan_size', -1)
+        self.declare_parameter('auto_lock_scan_size', True)
+        self.declare_parameter('size_mismatch_log_interval', 10.0)
+        self.declare_parameter('timestamp_offset_sec', 0.03)
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
+        self.expected_scan_size = int(self.get_parameter('expected_scan_size').value)
+        self.auto_lock_scan_size = bool(self.get_parameter('auto_lock_scan_size').value)
+        self.size_mismatch_log_interval = float(self.get_parameter('size_mismatch_log_interval').value)
+        self.timestamp_offset_sec = float(self.get_parameter('timestamp_offset_sec').value)
+        self.scan_size_ref = self.expected_scan_size if self.expected_scan_size > 0 else None
+        self.last_size_log_time = 0.0
+        self.size_mismatch_count = 0
+        self.last_output_stamp_ns = 0
         
         # Message counters for diagnostics
         self.input_count = 0
@@ -29,7 +41,7 @@ class ScanTimestampFix(Node):
 
         # Subscribe with sensor_data QoS to match the LiDAR driver (often best-effort).
         # Publish with reliable QoS so Nav2 costmaps (reliable subscribers) receive scans.
-        reliable_qos = QoSProfile(depth=10)
+        reliable_qos = QoSProfile(depth=1)
         reliable_qos.reliability = ReliabilityPolicy.RELIABLE
         reliable_qos.durability = DurabilityPolicy.VOLATILE
 
@@ -47,8 +59,15 @@ class ScanTimestampFix(Node):
         
         try:
             fixed = LaserScan()
-            # Use current clock time instead of original timestamp
-            fixed.header.stamp = self.get_clock().now().to_msg()
+            # Use current clock time with a small positive offset and enforce monotonicity.
+            # This avoids occasional "earlier than transform cache" drops under scheduling jitter.
+            now_ns = self.get_clock().now().nanoseconds
+            stamp_ns = now_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
+            if stamp_ns <= self.last_output_stamp_ns:
+                stamp_ns = self.last_output_stamp_ns + 1
+            self.last_output_stamp_ns = stamp_ns
+            fixed.header.stamp.sec = stamp_ns // 1_000_000_000
+            fixed.header.stamp.nanosec = stamp_ns % 1_000_000_000
             fixed.header.frame_id = msg.header.frame_id
 
             fixed.angle_min = msg.angle_min
@@ -58,8 +77,42 @@ class ScanTimestampFix(Node):
             fixed.scan_time = msg.scan_time
             fixed.range_min = msg.range_min
             fixed.range_max = msg.range_max
-            fixed.ranges = list(msg.ranges)
-            fixed.intensities = list(msg.intensities)
+
+            ranges = list(msg.ranges)
+            intensities = list(msg.intensities)
+
+            if self.scan_size_ref is None and self.auto_lock_scan_size and len(ranges) > 0:
+                self.scan_size_ref = len(ranges)
+                self.get_logger().info(f"🔒 Auto-locked scan size to {self.scan_size_ref}")
+
+            if self.scan_size_ref is not None and len(ranges) != self.scan_size_ref:
+                self.size_mismatch_count += 1
+                if len(ranges) > self.scan_size_ref:
+                    ranges = ranges[:self.scan_size_ref]
+                    if intensities:
+                        intensities = intensities[:self.scan_size_ref]
+                else:
+                    pad_count = self.scan_size_ref - len(ranges)
+                    ranges.extend([float('inf')] * pad_count)
+                    if intensities:
+                        intensities.extend([0.0] * pad_count)
+
+                now_sec = self.get_clock().now().nanoseconds / 1e9
+                if (now_sec - self.last_size_log_time) >= max(1.0, self.size_mismatch_log_interval):
+                    self.last_size_log_time = now_sec
+                    self.get_logger().info(
+                        f"🔧 Normalized scan size {len(msg.ranges)} -> {self.scan_size_ref} "
+                        f"(mismatches={self.size_mismatch_count})"
+                    )
+
+            # Keep angle metadata consistent with output range length.
+            # slam_toolbox derives expected beam count from angle_min/max/increment,
+            # so range resizing must update angle_max to match.
+            if len(ranges) > 0:
+                fixed.angle_max = fixed.angle_min + (len(ranges) - 1) * fixed.angle_increment
+
+            fixed.ranges = ranges
+            fixed.intensities = intensities
 
             self.pub.publish(fixed)
             self.output_count += 1
@@ -84,12 +137,11 @@ class ScanTimestampFix(Node):
         
         if input_delta > 1.0:
             if self.input_count == 0:
-                self.get_logger().warn("⚠️ No input scans received yet on input_topic")
+                self.get_logger().info("\u2139\ufe0f No input scans received yet on input_topic")
             else:
-                self.get_logger().warn(f"⚠️ No input scans for {input_delta:.1f}s (received {self.input_count})")
-        
+                self.get_logger().info(f"\u2139\ufe0f No input scans for {input_delta:.1f}s (received {self.input_count})")
         if output_delta > 1.0 and self.output_count > 0 and self.input_count > self.output_count:
-            self.get_logger().warn(f"⚠️ Output stalled: in={self.input_count}, out={self.output_count}")
+            self.get_logger().info(f"\u2139\ufe0f Output stalled: in={self.input_count}, out={self.output_count}")
 
 
 def main(args=None):

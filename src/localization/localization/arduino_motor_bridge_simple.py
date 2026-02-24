@@ -5,7 +5,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Int32, Float32
+from std_msgs.msg import Float32
 from sensor_msgs.msg import Range, LaserScan
 from rclpy.qos import qos_profile_sensor_data
 from tf2_ros import TransformBroadcaster
@@ -14,6 +14,7 @@ import serial
 import time
 import threading
 import atexit
+import glob
 from threading import Lock
 
 class ArduinoMotorBridge(Node):
@@ -26,7 +27,19 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('max_speed', 220)
         self.declare_parameter('max_speed_forward', 167)
         self.declare_parameter('max_speed_backward', 180)
+        self.declare_parameter('max_linear_speed_mps', 0.35)
+        self.declare_parameter('max_angular_speed_radps', 0.8)
+        self.declare_parameter('fixed_pwm_forward', 150)
+        self.declare_parameter('fixed_pwm_backward', 120)
+        self.declare_parameter('fixed_pwm_turn', 120)
+        self.declare_parameter('auto_backup_speed_mps', 0.10)
         self.declare_parameter('min_pwm', 90)
+        self.declare_parameter('min_pwm_forward', 105)
+        self.declare_parameter('min_pwm_backward', 100)
+        self.declare_parameter('min_pwm_turn', 95)
+        self.declare_parameter('velocity_deadband', 0.03)
+        self.declare_parameter('angular_deadband', 0.05)
+        self.declare_parameter('pwm_change_threshold', 8)
         self.declare_parameter('publish_odom', True)
         self.declare_parameter('odom_rate', 50.0)
         self.declare_parameter('odom_frame', 'odom')
@@ -38,6 +51,10 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('stuck_backup_time', 0.8)
         self.declare_parameter('safety_stop_backup_time', 2.0)
         self.declare_parameter('safety_stop_backup_pwm', 120)
+        self.declare_parameter('safety_stop_trigger_distance', 0.08)
+        self.declare_parameter('safety_stop_confirm_count', 2)
+        self.declare_parameter('safety_stop_clear_confirm_count', 2)
+        self.declare_parameter('safety_stop_front_latch_time', 0.8)
         self.declare_parameter('enable_safety_override', True)
         self.declare_parameter('ultrasonic_frame', 'base_footprint')
         self.declare_parameter('ultrasonic_min_range', 0.02)
@@ -46,20 +63,36 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('rear_stop_distance', 0.40)
         self.declare_parameter('rear_backup_min_distance', 0.30)
         self.declare_parameter('rear_stop_hold_time', 0.6)
-        self.declare_parameter('front_stop_distance', 0.35)
-        self.declare_parameter('front_stop_hold_time', 0.5)
+        self.declare_parameter('rear_block_min_hits', 3)
+        self.declare_parameter('front_stop_distance', 0.50)
+        self.declare_parameter('front_stop_hold_time', 0.6)
+        self.declare_parameter('any_obstacle_stop_distance', 0.20)
+        self.declare_parameter('any_obstacle_stop_hold_time', 0.5)
+        self.declare_parameter('front_block_min_hits', 4)
+        self.declare_parameter('any_obstacle_min_hits', 6)
         self.declare_parameter('scan_stale_timeout', 1.2)
         self.declare_parameter('flip_guard_time', 0.15)
         self.declare_parameter('wall_debug_log_interval', 1.0)
         self.declare_parameter('swap_lidar_front_back', False)
         self.declare_parameter('escape_turn_speed', 0.6)
         self.declare_parameter('escape_turn_period', 2.0)
+        self.declare_parameter('escape_turn_toggle_interval', 1.2)
+        self.declare_parameter('turn_angular_scale', 0.75)
+        self.declare_parameter('turn_pwm_limit', 125)
+        self.declare_parameter('front_obstacle_backup_speed_mps', 0.12)
+        self.declare_parameter('front_obstacle_backup_turn_scale', 0.35)
         self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('front_obstacle_half_angle_deg', 45.0)
+        self.declare_parameter('rear_obstacle_half_angle_deg', 30.0)
         self.declare_parameter('force_backward_on_zero_cmd', False)
         self.declare_parameter('zero_cmd_forward_pwm', 110)
         self.declare_parameter('allow_backward_when_rear_blocked', False)
         self.declare_parameter('require_nav2_active', True)
         self.declare_parameter('nav2_state_check_interval', 1.0)
+        self.declare_parameter('serial_reconnect_interval', 1.0)
+        self.declare_parameter('serial_max_error_streak', 5)
+        self.declare_parameter('serial_error_log_interval', 2.0)
+        self.declare_parameter('motor_log_interval', 0.25)
         
         serial_port = self.get_parameter('serial_port').value
         baud_rate = self.get_parameter('baud_rate').value
@@ -67,7 +100,19 @@ class ArduinoMotorBridge(Node):
         self.max_speed = int(self.get_parameter('max_speed').value)
         self.max_speed_forward = int(self.get_parameter('max_speed_forward').value)
         self.max_speed_backward = int(self.get_parameter('max_speed_backward').value)
+        self.max_linear_speed_mps = float(self.get_parameter('max_linear_speed_mps').value)
+        self.max_angular_speed_radps = float(self.get_parameter('max_angular_speed_radps').value)
+        self.fixed_pwm_forward = int(self.get_parameter('fixed_pwm_forward').value)
+        self.fixed_pwm_backward = int(self.get_parameter('fixed_pwm_backward').value)
+        self.fixed_pwm_turn = int(self.get_parameter('fixed_pwm_turn').value)
+        self.auto_backup_speed_mps = float(self.get_parameter('auto_backup_speed_mps').value)
         self.min_pwm = int(self.get_parameter('min_pwm').value)
+        self.min_pwm_forward = int(self.get_parameter('min_pwm_forward').value)
+        self.min_pwm_backward = int(self.get_parameter('min_pwm_backward').value)
+        self.min_pwm_turn = int(self.get_parameter('min_pwm_turn').value)
+        self.velocity_deadband = float(self.get_parameter('velocity_deadband').value)
+        self.angular_deadband = float(self.get_parameter('angular_deadband').value)
+        self.pwm_change_threshold = int(self.get_parameter('pwm_change_threshold').value)
         self.publish_odom = self.get_parameter('publish_odom').value
 
         # IMU orientation state
@@ -94,6 +139,10 @@ class ArduinoMotorBridge(Node):
         self.stuck_backup_time = float(self.get_parameter('stuck_backup_time').value)
         self.safety_stop_backup_time = float(self.get_parameter('safety_stop_backup_time').value)
         self.safety_stop_backup_pwm = int(self.get_parameter('safety_stop_backup_pwm').value)
+        self.safety_stop_trigger_distance = float(self.get_parameter('safety_stop_trigger_distance').value)
+        self.safety_stop_confirm_count = int(self.get_parameter('safety_stop_confirm_count').value)
+        self.safety_stop_clear_confirm_count = int(self.get_parameter('safety_stop_clear_confirm_count').value)
+        self.safety_stop_front_latch_time = float(self.get_parameter('safety_stop_front_latch_time').value)
         self.enable_safety_override = self.get_parameter('enable_safety_override').value
         self.ultrasonic_frame = self.get_parameter('ultrasonic_frame').value
         self.ultrasonic_min_range = float(self.get_parameter('ultrasonic_min_range').value)
@@ -102,22 +151,42 @@ class ArduinoMotorBridge(Node):
         self.rear_stop_distance = float(self.get_parameter('rear_stop_distance').value)
         self.rear_backup_min_distance = float(self.get_parameter('rear_backup_min_distance').value)
         self.rear_stop_hold_time = float(self.get_parameter('rear_stop_hold_time').value)
+        self.rear_block_min_hits = int(self.get_parameter('rear_block_min_hits').value)
         self.front_stop_distance = float(self.get_parameter('front_stop_distance').value)
         self.front_stop_hold_time = float(self.get_parameter('front_stop_hold_time').value)
+        self.any_obstacle_stop_distance = float(self.get_parameter('any_obstacle_stop_distance').value)
+        self.any_obstacle_stop_hold_time = float(self.get_parameter('any_obstacle_stop_hold_time').value)
+        self.front_block_min_hits = int(self.get_parameter('front_block_min_hits').value)
+        self.any_obstacle_min_hits = int(self.get_parameter('any_obstacle_min_hits').value)
         self.scan_stale_timeout = float(self.get_parameter('scan_stale_timeout').value)
         self.flip_guard_time = float(self.get_parameter('flip_guard_time').value)
         self.wall_debug_log_interval = float(self.get_parameter('wall_debug_log_interval').value)
         self.swap_lidar_front_back = bool(self.get_parameter('swap_lidar_front_back').value)
         self.escape_turn_speed = float(self.get_parameter('escape_turn_speed').value)
         self.escape_turn_period = float(self.get_parameter('escape_turn_period').value)
+        self.escape_turn_toggle_interval = float(self.get_parameter('escape_turn_toggle_interval').value)
+        self.turn_angular_scale = float(self.get_parameter('turn_angular_scale').value)
+        self.turn_pwm_limit = int(self.get_parameter('turn_pwm_limit').value)
+        self.front_obstacle_backup_speed_mps = float(self.get_parameter('front_obstacle_backup_speed_mps').value)
+        self.front_obstacle_backup_turn_scale = float(self.get_parameter('front_obstacle_backup_turn_scale').value)
         self.scan_topic = self.get_parameter('scan_topic').value
+        self.front_obstacle_half_angle = math.radians(float(self.get_parameter('front_obstacle_half_angle_deg').value))
+        self.rear_obstacle_half_angle = math.radians(float(self.get_parameter('rear_obstacle_half_angle_deg').value))
         self.force_backward_on_zero_cmd = bool(self.get_parameter('force_backward_on_zero_cmd').value)
         self.zero_cmd_forward_pwm = int(self.get_parameter('zero_cmd_forward_pwm').value)
         self.allow_backward_when_rear_blocked = bool(self.get_parameter('allow_backward_when_rear_blocked').value)
         self.require_nav2_active = bool(self.get_parameter('require_nav2_active').value)
         self.nav2_state_check_interval = float(self.get_parameter('nav2_state_check_interval').value)
+        self.serial_reconnect_interval = float(self.get_parameter('serial_reconnect_interval').value)
+        self.serial_max_error_streak = int(self.get_parameter('serial_max_error_streak').value)
+        self.serial_error_log_interval = float(self.get_parameter('serial_error_log_interval').value)
+        self.motor_log_interval = float(self.get_parameter('motor_log_interval').value)
         self.cmd_vel_override_duration = 0.2
         self.cmd_vel_override_until = 0.0
+
+        self.get_logger().info(
+            f"⚙️ PWM profile loaded: forward={self.fixed_pwm_forward}, backward={self.fixed_pwm_backward}, turn={self.fixed_pwm_turn}"
+        )
 
         self.nav2_ready = not self.require_nav2_active
         self.nav2_state_log_interval = 2.0
@@ -141,7 +210,20 @@ class ArduinoMotorBridge(Node):
 
         # Try to open serial port
         self.ser = None
-        ports_to_try = [serial_port, '/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0', '/dev/ttyUSB1']
+        # IMPORTANT: avoid cross-family fallback (e.g., grabbing LiDAR /dev/ttyUSB* when Arduino expected on /dev/ttyACM*)
+        if serial_port.startswith('/dev/ttyACM'):
+            ports_to_try = [serial_port] + sorted(glob.glob('/dev/ttyACM*'))
+        elif serial_port.startswith('/dev/ttyUSB'):
+            ports_to_try = [serial_port, '/dev/ttyUSB0', '/dev/ttyUSB1']
+        else:
+            # For custom paths (/dev/arduino), keep explicit path first, then any ACM devices
+            ports_to_try = [serial_port] + sorted(glob.glob('/dev/ttyACM*'))
+        self.ports_to_try = list(dict.fromkeys(ports_to_try))
+        self.serial_error_streak = 0
+        self.last_serial_error_log_time = 0.0
+        self.last_serial_reconnect_time = 0.0
+        self.last_motor_log_time = 0.0
+        self.last_motor_log_cmd = None
         for port in ports_to_try:
             try:
                 self.ser = serial.Serial(port, baud_rate, timeout=1)
@@ -175,13 +257,11 @@ class ArduinoMotorBridge(Node):
                 time.sleep(0.1)
                 self.get_logger().info('✅ Arduino local avoidance DISABLED')
             except Exception as e:
-                self.get_logger().error(f'Failed to initialize Arduino: {e}', exc_info=True)
+                self.get_logger().error(f'Failed to initialize Arduino: {e}')
 
         self.create_subscription(Twist, '/cmd_vel', self.cmd_vel_cb, 10)
         self.create_subscription(Twist, '/cmd_vel_nav', self.cmd_vel_nav_cb, 10)
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
-        self.create_subscription(Int32, '/servo_angle', self.servo_cb, 10)
-        self.create_subscription(Float32, '/servo_command', self.servo_cmd_cb, 10)
 
         self.ultrasonic_pub = self.create_publisher(Float32, '/ultrasonic_distance', 10)
         self.ultrasonic_range_pub = self.create_publisher(Range, '/ultrasonic_range', 10)
@@ -228,6 +308,8 @@ class ArduinoMotorBridge(Node):
         self.last_rear_distance = float('inf')
         self.front_blocked_until = 0.0
         self.last_front_distance = float('inf')
+        self.any_obstacle_blocked_until = 0.0
+        self.last_any_obstacle_distance = float('inf')
         self.last_rear_block_log_time = 0.0
         self.rear_block_log_interval = 1.0
         self.last_front_block_log_time = 0.0
@@ -241,6 +323,11 @@ class ArduinoMotorBridge(Node):
         self.last_scan_stale_log_time = 0.0
         self.scan_stale_log_interval = 1.0
         self.last_wall_debug_log_time = 0.0
+        self.escape_turn_dir = 1.0
+        self.last_escape_turn_toggle_time = 0.0
+        self.safety_stop_obstacle_hits = 0
+        self.safety_stop_clear_hits = 0
+        self.last_safety_stop_brake_time = 0.0
 
         if self.enable_stuck_recovery:
             self.create_timer(0.1, self._stuck_recovery_loop)
@@ -252,6 +339,31 @@ class ArduinoMotorBridge(Node):
 
         # Ensure motors stop on shutdown
         atexit.register(self._shutdown_motors)
+
+    def _open_serial_connection(self):
+        """Try to open Arduino serial on allowed ports and initialize controller state."""
+        for port in self.ports_to_try:
+            try:
+                self.ser = serial.Serial(port, self.get_parameter('baud_rate').value, timeout=1)
+                time.sleep(0.5)
+                self.ser.reset_input_buffer()
+                self.ser.reset_output_buffer()
+                self.get_logger().warn(f'🔌 Reconnected Arduino serial on {port}')
+                try:
+                    self.ser.write(b'START\n')
+                    time.sleep(0.05)
+                    self.ser.write(b'AUTO:OFF\n')
+                    self.ser.write(b'MOTOR:0,0\n')
+                except Exception as init_err:
+                    self.get_logger().warn(f'⚠️ Reconnect init command failed: {init_err}')
+                self.serial_disabled = False
+                self.serial_error_streak = 0
+                return True
+            except Exception:
+                continue
+        self.ser = None
+        self.serial_disabled = True
+        return False
 
     def imu_cb(self, msg):
         # Extract yaw from quaternion
@@ -295,40 +407,65 @@ class ArduinoMotorBridge(Node):
         linear = msg.linear.x      # m/s
         angular = msg.angular.z    # rad/s
 
+        # Explicit speed limits for motor safety/smoothness
+        linear = max(-self.max_linear_speed_mps, min(self.max_linear_speed_mps, linear))
+        angular = max(-self.max_angular_speed_radps, min(self.max_angular_speed_radps, angular))
+
+        # Deadband to suppress tiny oscillating commands that cause motor chatter/noise
+        if abs(linear) < self.velocity_deadband:
+            linear = 0.0
+        if abs(angular) < self.angular_deadband:
+            angular = 0.0
+        elif linear == 0.0:
+            angular *= self.turn_angular_scale
+
         now = time.time()
-        if self.last_scan_time > 0.0 and (now - self.last_scan_time) > self.scan_stale_timeout:
+        scan_stale = False
+        scan_age = now - self.last_scan_time if self.last_scan_time > 0.0 else float('inf')
+        if self.last_scan_time > 0.0 and scan_age > self.scan_stale_timeout:
+            scan_stale = True
             linear = 0.0
             angular = 0.0
             if now - self.last_scan_stale_log_time >= self.scan_stale_log_interval:
                 self.last_scan_stale_log_time = now
                 self.get_logger().warn(
-                    f"🛑 Scan stale ({now - self.last_scan_time:.2f}s); suppressing {source}"
+                    f"🛑 Scan stale ({scan_age:.2f}s); suppressing {source}"
                 )
+
+        # When a front obstacle is latched, allow command sign changes so
+        # obstacle escape (backing/turning) is not blocked by flip guard.
+        front_escape_active = (not scan_stale) and self._front_blocked()
 
         if linear != 0.0:
             sign = 1 if linear > 0.0 else -1
             if self.last_cmd_sign != 0 and sign != self.last_cmd_sign:
-                if (now - self.last_dir_change_time) < self.flip_guard_time:
+                if ((now - self.last_dir_change_time) < self.flip_guard_time) and (not front_escape_active):
                     linear = 0.0
-                    angular = 0.0
+                    # Keep commanded turn when present so obstacle escape rotations
+                    # are not suppressed by linear direction flip protection.
+                    if abs(angular) < self.angular_deadband:
+                        angular = 0.0
                     if now - self.last_flip_guard_log_time >= self.flip_guard_log_interval:
                         self.last_flip_guard_log_time = now
                         self.get_logger().warn(
-                            f"🛑 Direction flip guard active; suppressing {source}"
+                            f"🛑 Direction flip guard active; suppressing linear {source}"
                         )
             if sign != self.last_cmd_sign:
                 self.last_dir_change_time = now
                 self.last_cmd_sign = sign
 
-        if linear == 0.0 and angular == 0.0 and self._front_blocked() and not self._rear_blocked():
-            linear = -(abs(self.safety_stop_backup_pwm) * 0.5 / max(1.0, self.max_speed_backward))
-            angular = 0.0
-        elif self.force_backward_on_zero_cmd and linear == 0.0 and angular == 0.0:
-            linear = -(abs(self.safety_stop_backup_pwm) * 0.5 / max(1.0, self.max_speed_backward))
+        if (not scan_stale) and self.force_backward_on_zero_cmd and linear == 0.0 and angular == 0.0:
+            linear = -abs(self.auto_backup_speed_mps)
             angular = 0.0
 
         auto_backup = False
-        if self._front_blocked() and (linear > 0.0 or abs(angular) > 0.0):
+        can_front_backup = (
+            (not scan_stale) and
+            (not self._rear_blocked()) and
+            math.isfinite(self.last_rear_distance) and
+            (self.last_rear_distance > self.rear_backup_min_distance)
+        )
+        if (not scan_stale) and self._front_blocked() and linear > 0.0:
             if self._rear_blocked():
                 # Front and rear blocked: allow in-place turning instead of backing up.
                 linear = 0.0
@@ -338,17 +475,58 @@ class ArduinoMotorBridge(Node):
                         f"🌀 Front+rear blocked (front {self.last_front_distance:.2f}m, "
                         f"rear {self.last_rear_distance:.2f}m); allowing turn only"
                     )
-            else:
-                # Auto-reverse immediately when front is blocked
-                backup_v = -(abs(self.safety_stop_backup_pwm) * 0.5 / max(1.0, self.max_speed_backward))
-                linear = backup_v
-                angular = 0.0
-                auto_backup = True
+            elif abs(angular) > self.angular_deadband and can_front_backup:
+                # Back away from front obstacle while preserving turn direction.
+                linear = -abs(self.front_obstacle_backup_speed_mps)
+                angular *= self.front_obstacle_backup_turn_scale
                 if now - self.last_front_block_log_time >= self.rear_block_log_interval:
                     self.last_front_block_log_time = now
                     self.get_logger().warn(
-                        f"⬇️ Front blocked at {self.last_front_distance:.2f}m; backing up immediately"
+                        f"⬇️ Front blocked at {self.last_front_distance:.2f}m; backing while turning"
                     )
+            else:
+                # Default escape: back away if rear is clear, else rotate in place.
+                angular = self._select_escape_turn(angular)
+                if can_front_backup:
+                    linear = -abs(self.front_obstacle_backup_speed_mps)
+                    angular *= self.front_obstacle_backup_turn_scale
+                    auto_backup = True
+                else:
+                    linear = 0.0
+                if now - self.last_front_block_log_time >= self.rear_block_log_interval:
+                    self.last_front_block_log_time = now
+                    self.get_logger().warn(
+                        f"⬇️ Front blocked at {self.last_front_distance:.2f}m; {'backing off' if can_front_backup else 'rotate-only'}"
+                    )
+
+        # Any-angle near-field safety gate: stop forward if anything is dangerously close,
+        # even when front/rear sector classification is imperfect.
+        if linear > 0.0 and self._any_obstacle_blocked():
+            angular = self._select_escape_turn(angular)
+            if can_front_backup:
+                linear = -abs(self.front_obstacle_backup_speed_mps)
+                angular *= self.front_obstacle_backup_turn_scale
+            else:
+                linear = 0.0
+            if now - self.last_front_block_log_time >= self.rear_block_log_interval:
+                self.last_front_block_log_time = now
+                self.get_logger().warn(
+                    f"🛑 Forward blocked by near obstacle at {self.last_any_obstacle_distance:.2f}m (any-angle gate, {'backup' if can_front_backup else 'rotate'})"
+                )
+
+        # Hard safety gate: if front obstacle is latched, never allow forward command.
+        if linear > 0.0 and self._front_blocked():
+            angular = self._select_escape_turn(angular)
+            if can_front_backup:
+                linear = -abs(self.front_obstacle_backup_speed_mps)
+                angular *= self.front_obstacle_backup_turn_scale
+            else:
+                linear = 0.0
+            if now - self.last_front_block_log_time >= self.rear_block_log_interval:
+                self.last_front_block_log_time = now
+                self.get_logger().warn(
+                    f"🛑 Forward blocked by latched front obstacle at {self.last_front_distance:.2f}m ({'backup' if can_front_backup else 'rotate'})"
+                )
 
         if linear < 0.0 and (now - self.last_wall_debug_log_time) >= self.wall_debug_log_interval:
             self.last_wall_debug_log_time = now
@@ -358,12 +536,24 @@ class ArduinoMotorBridge(Node):
                 f"rear={self.last_rear_distance:.2f}m blocked={self._rear_blocked()}"
             )
 
+        rear_known = math.isfinite(self.last_rear_distance)
+        rear_scan_recent = (self.last_scan_time > 0.0 and (now - self.last_scan_time) <= self.scan_stale_timeout)
+        if linear < 0.0 and (scan_stale or not rear_scan_recent or not rear_known):
+            linear = 0.0
+            if self._front_blocked():
+                angular = self._select_escape_turn(angular)
+            else:
+                angular = 0.0
+            if now - self.last_rear_block_log_time >= self.rear_block_log_interval:
+                self.last_rear_block_log_time = now
+                self.get_logger().warn(
+                    "🛑 Backward suppressed: rear clearance unknown or scan stale"
+                )
+
         if not self.allow_backward_when_rear_blocked and linear < 0.0 and self._rear_blocked():
             linear = 0.0
             if self._front_blocked():
-                period = max(0.5, self.escape_turn_period)
-                phase = int(time.time() / period) % 2
-                angular = self.escape_turn_speed if phase == 0 else -self.escape_turn_speed
+                angular = self._select_escape_turn(angular)
             else:
                 angular = 0.0
             if now - self.last_rear_block_log_time >= self.rear_block_log_interval:
@@ -394,8 +584,15 @@ class ArduinoMotorBridge(Node):
         pwm_left = int(v_left * (scale_left / 0.5))
         pwm_right = int(v_right * (scale_right / 0.5))
         
-        # Enforce minimum PWM when moving (avoid stall)
-        MIN_PWM = self.min_pwm
+        # Enforce minimum PWM by motion mode to avoid stall/buzz while keeping control.
+        if linear > self.velocity_deadband:
+            MIN_PWM = self.min_pwm_forward
+        elif linear < -self.velocity_deadband:
+            MIN_PWM = self.min_pwm_backward
+        elif abs(angular) > self.angular_deadband:
+            MIN_PWM = self.min_pwm_turn
+        else:
+            MIN_PWM = self.min_pwm
         if pwm_left != 0:
             sign = 1 if pwm_left > 0 else -1
             pwm_left = sign * max(MIN_PWM, abs(pwm_left))
@@ -406,6 +603,52 @@ class ArduinoMotorBridge(Node):
         # Clamp to valid PWM range
         pwm_left = max(-255, min(255, pwm_left))
         pwm_right = max(-255, min(255, pwm_right))
+
+        # Fixed-output motor profiles for predictable behavior and logging.
+        fwd_pwm = max(0, min(255, abs(self.fixed_pwm_forward)))
+        back_pwm = max(0, min(255, abs(self.fixed_pwm_backward)))
+        turn_pwm = max(0, min(255, abs(self.fixed_pwm_turn)))
+        if linear > self.velocity_deadband and abs(angular) <= self.angular_deadband:
+            pwm_left = fwd_pwm
+            pwm_right = fwd_pwm
+        elif linear < -self.velocity_deadband and abs(angular) <= self.angular_deadband:
+            pwm_left = -back_pwm
+            pwm_right = -back_pwm
+        elif abs(linear) <= self.velocity_deadband and abs(angular) > self.angular_deadband:
+            if angular > 0.0:
+                pwm_left = -turn_pwm
+                pwm_right = turn_pwm
+            else:
+                pwm_left = turn_pwm
+                pwm_right = -turn_pwm
+        elif linear > self.velocity_deadband and abs(angular) > self.angular_deadband:
+            if angular > 0.0:
+                pwm_left = turn_pwm
+                pwm_right = fwd_pwm
+            else:
+                pwm_left = fwd_pwm
+                pwm_right = turn_pwm
+        elif linear < -self.velocity_deadband and abs(angular) > self.angular_deadband:
+            if angular > 0.0:
+                pwm_left = -turn_pwm
+                pwm_right = -back_pwm
+            else:
+                pwm_left = -back_pwm
+                pwm_right = -turn_pwm
+
+        # Keep in-place left/right turns controlled and symmetric.
+        if linear == 0.0 and abs(angular) > self.angular_deadband:
+            turn_limit = max(self.min_pwm, self.turn_pwm_limit)
+            pwm_left = max(-turn_limit, min(turn_limit, pwm_left))
+            pwm_right = max(-turn_limit, min(turn_limit, pwm_right))
+
+        # Suppress tiny PWM dithering around same command to reduce motor noise
+        if (
+            abs(pwm_left - self.last_cmd_pwm_left) < self.pwm_change_threshold and
+            abs(pwm_right - self.last_cmd_pwm_right) < self.pwm_change_threshold
+        ):
+            pwm_left = self.last_cmd_pwm_left
+            pwm_right = self.last_cmd_pwm_right
 
         self.last_cmd_pwm_left = pwm_left
         self.last_cmd_pwm_right = pwm_right
@@ -420,31 +663,52 @@ class ArduinoMotorBridge(Node):
         self._handle_cmd_vel(msg, source='cmd_vel_nav')
 
     def scan_cb(self, msg: LaserScan):
-        self.last_scan_time = time.time()
+        now = time.time()
+        self.last_scan_time = now
         min_rear = float('inf')
         min_front = float('inf')
+        min_any = float('inf')
+        front_hit_count = 0
+        rear_hit_count = 0
+        any_hit_count = 0
         angle = msg.angle_min
         for distance in msg.ranges:
             if distance < msg.range_min or distance > msg.range_max:
                 angle += msg.angle_increment
                 continue
-            if -math.pi / 2 <= angle <= math.pi / 2:
+            if distance < min_any:
+                min_any = distance
+            if distance <= self.any_obstacle_stop_distance:
+                any_hit_count += 1
+            in_front_zone = (-self.front_obstacle_half_angle <= angle <= self.front_obstacle_half_angle)
+            in_rear_zone = (abs(abs(angle) - math.pi) <= self.rear_obstacle_half_angle)
+
+            if in_front_zone:
                 if distance < min_front:
                     min_front = distance
-            if angle >= math.pi / 2 or angle <= -math.pi / 2:
+                if distance <= self.front_stop_distance:
+                    front_hit_count += 1
+            if in_rear_zone:
                 if distance < min_rear:
                     min_rear = distance
+                if distance <= self.rear_stop_distance:
+                    rear_hit_count += 1
             angle += msg.angle_increment
 
         if min_front < float('inf'):
             self.last_front_distance = min_front
-            if min_front <= self.front_stop_distance:
-                self.front_blocked_until = time.time() + self.front_stop_hold_time
+            if min_front <= self.front_stop_distance and front_hit_count >= max(1, self.front_block_min_hits):
+                self.front_blocked_until = now + self.front_stop_hold_time
 
         if min_rear < float('inf'):
             self.last_rear_distance = min_rear
-            if min_rear <= self.rear_stop_distance:
-                self.rear_blocked_until = time.time() + self.rear_stop_hold_time
+            if min_rear <= self.rear_stop_distance and rear_hit_count >= max(1, self.rear_block_min_hits):
+                self.rear_blocked_until = now + self.rear_stop_hold_time
+
+        if min_any < float('inf'):
+            self.last_any_obstacle_distance = min_any
+            if min_any <= self.any_obstacle_stop_distance and any_hit_count >= max(1, self.any_obstacle_min_hits):
+                self.any_obstacle_blocked_until = now + self.any_obstacle_stop_hold_time
 
         if self.swap_lidar_front_back:
             self.last_front_distance, self.last_rear_distance = self.last_rear_distance, self.last_front_distance
@@ -455,6 +719,19 @@ class ArduinoMotorBridge(Node):
 
     def _front_blocked(self) -> bool:
         return time.time() < self.front_blocked_until
+
+    def _any_obstacle_blocked(self) -> bool:
+        return time.time() < self.any_obstacle_blocked_until
+
+    def _select_escape_turn(self, commanded_angular: float) -> float:
+        if abs(commanded_angular) > self.angular_deadband:
+            return self.escape_turn_speed if commanded_angular > 0.0 else -self.escape_turn_speed
+
+        now = time.time()
+        if (now - self.last_escape_turn_toggle_time) >= self.escape_turn_toggle_interval:
+            self.escape_turn_dir *= -1.0
+            self.last_escape_turn_toggle_time = now
+        return self.escape_turn_speed * self.escape_turn_dir
 
     def _check_nav2_state(self):
         if not self.require_nav2_active:
@@ -537,32 +814,6 @@ class ArduinoMotorBridge(Node):
             self.nav2_state_update_time[name] = time.time()
         finally:
             self.nav2_state_futures[name] = None
-    
-    def servo_cb(self, msg: Int32):
-        """Send servo angle (0-180 degrees) to Arduino"""
-        if self.ser is None:
-            return
-
-        angle = max(0, min(180, msg.data))
-        try:
-            cmd = f"SERVO:{angle}\n"
-            with self._serial_lock:
-                self.ser.write(cmd.encode())
-            self.get_logger().debug(f'Servo: {angle}°')
-        except Exception as e:
-            self.get_logger().error(f'Serial write error (servo): {e}')
-
-    def servo_cmd_cb(self, msg: Float32):
-        if self.ser is None:
-            return
-        angle = int(max(0, min(180, msg.data)))
-        try:
-            cmd = f"SERVO:{angle}\n"
-            with self._serial_lock:
-                self.ser.write(cmd.encode())
-            self.get_logger().info(f'🔄 Servo sweep: {angle}°')
-        except Exception as e:
-            self.get_logger().error(f'Serial write error (servo): {e}')
 
     def _publish_odom(self):
 
@@ -642,9 +893,9 @@ class ArduinoMotorBridge(Node):
             self.odom_fallback_active = False
             self.get_logger().info('✅ Serial communication restored')
 
-        # DIAGNOSTIC: Log TF publishing status periodically
+        # DIAGNOSTIC: keep at debug to avoid flooding logs and starving controller loops
         if abs(v) > 0.001 or abs(self.last_cmd_angular) > 0.001:
-            self.get_logger().info(f'📍 TF published: odom->base_footprint at ({self.x:.3f}, {self.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={self.last_cmd_angular:.3f}')
+            self.get_logger().debug(f'📍 TF published: odom->base_footprint at ({self.x:.3f}, {self.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={self.last_cmd_angular:.3f}')
 
         self.last_time = now
     
@@ -655,6 +906,10 @@ class ArduinoMotorBridge(Node):
             return '⬆️  FORWARD'
         elif left < 0 and right < 0:
             return '⬇️  BACKWARD'
+        elif left < 0 and right > 0:
+            return '↺  TURN LEFT'
+        elif left > 0 and right < 0:
+            return '↻  TURN RIGHT'
         elif left > 0 and right == 0:
             return '⤴️  PIVOT LEFT'
         elif left == 0 and right > 0:
@@ -680,19 +935,31 @@ class ArduinoMotorBridge(Node):
                         self.get_logger().error(f'⚠️ Serial write returned 0 bytes for: {cmd.strip()}')
                     self.ser.flush()
                 except (OSError, serial.SerialException) as se:
-                    self.get_logger().error(f'❌ Serial write exception: {se}', exc_info=True)
+                    self.get_logger().error(f'❌ Serial write exception: {se}')
+                    self.serial_disabled = True
+                    try:
+                        self.ser.close()
+                    except Exception:
+                        pass
+                    self.ser = None
                     return
 
             action = action_override or self._get_action_name(pwm_left, pwm_right)
             msg = f'🚀 {action} | MOTOR:{pwm_left},{pwm_right} | SRC:{source}'
+            now = time.time()
+            cmd_key = (pwm_left, pwm_right, action)
+            should_log_info = (now - self.last_motor_log_time) >= self.motor_log_interval
             if log_level == 'warn':
                 self.get_logger().warn(msg)
             elif log_level == 'error':
                 self.get_logger().error(msg)
             else:
-                self.get_logger().info(msg)
+                if should_log_info:
+                    self.get_logger().info(msg)
+                    self.last_motor_log_time = now
+                    self.last_motor_log_cmd = cmd_key
         except Exception as e:
-            self.get_logger().error(f'Serial write error: {e}', exc_info=True)
+            self.get_logger().error(f'Serial write error: {e}')
 
     def _stuck_recovery_loop(self):
         if self.ser is None:
@@ -815,11 +1082,20 @@ class ArduinoMotorBridge(Node):
     
     def _serial_reader(self):
         """Background thread to read and parse Arduino CSV data"""
-        if self.ser is None:
-            return
-        
         while self.serial_reading:
             try:
+                if self.ser is None or self.serial_disabled:
+                    now = time.time()
+                    if (now - self.last_serial_reconnect_time) >= self.serial_reconnect_interval:
+                        self.last_serial_reconnect_time = now
+                        if self._open_serial_connection():
+                            self.get_logger().warn('🔌 Arduino serial reconnected after startup failure')
+                        elif (now - self.last_serial_error_log_time) >= self.serial_error_log_interval:
+                            self.last_serial_error_log_time = now
+                            self.get_logger().warn('⏳ Arduino serial not available yet; retrying...')
+                    time.sleep(0.1)
+                    continue
+
                 if self.ser.in_waiting > 0:
                     line = self.ser.readline().decode('utf-8', errors='ignore').strip()
                     
@@ -840,23 +1116,59 @@ class ArduinoMotorBridge(Node):
                                     self.ultrasonic_pub.publish(msg)
                                     self._publish_ultrasonic_range(distance_m)
                                     self.safety_stop_pub.publish(msg)  # Explicit safety stop with distance
-                                    self.get_logger().error(f'🚨 SAFETY_STOP! Published /safety_stop: {distance_cm}cm ({distance_m:.4f}m)')
-
-                                    # Activate safety override backup (local motor control)
-                                    if self.enable_safety_override:
-                                        now = time.time()
-                                        self.safety_override_until = max(self.safety_override_until, now + self.safety_stop_backup_time)
-                                        if not self.safety_override_active:
-                                            self.safety_override_active = True
-                                            self.get_logger().warn(
-                                                f'🚨 SAFETY OVERRIDE: backing up for {self.safety_stop_backup_time:.1f}s'
+                                    if distance_m <= self.safety_stop_trigger_distance:
+                                        self.safety_stop_obstacle_hits += 1
+                                        self.safety_stop_clear_hits = 0
+                                        if self.safety_stop_obstacle_hits >= self.safety_stop_confirm_count:
+                                            now = time.time()
+                                            # Treat ultrasonic emergency as FRONT stop latch.
+                                            self.front_blocked_until = max(
+                                                self.front_blocked_until,
+                                                now + self.safety_stop_front_latch_time
                                             )
+                                            self.last_front_distance = min(self.last_front_distance, distance_m)
+                                            self.get_logger().error(
+                                                f'🚨 SAFETY_STOP! Published /safety_stop: {distance_cm}cm ({distance_m:.4f}m)'
+                                            )
+
+                                            # Immediate stop command so we don't wait for next cmd_vel cycle.
+                                            if (now - self.last_safety_stop_brake_time) >= 0.2:
+                                                self.last_safety_stop_brake_time = now
+                                                self.last_cmd_pwm_left = 0
+                                                self.last_cmd_pwm_right = 0
+                                                self.last_cmd_time = now
+                                                self._send_motor_pwm(
+                                                    0,
+                                                    0,
+                                                    action_override='🛑 STOPPED (ULTRASONIC FRONT)',
+                                                    log_level='warn',
+                                                    source='safety_stop'
+                                                )
+
+                                            # Activate safety override backup (local motor control)
+                                            if self.enable_safety_override:
+                                                self.safety_override_until = max(
+                                                    self.safety_override_until,
+                                                    now + self.safety_stop_backup_time
+                                                )
+                                                if not self.safety_override_active:
+                                                    self.safety_override_active = True
+                                                    self.get_logger().warn(
+                                                        f'🚨 SAFETY OVERRIDE: backing up for {self.safety_stop_backup_time:.1f}s'
+                                                    )
+                                    else:
+                                        # Ignore noisy/too-far safety spikes
+                                        self.safety_stop_obstacle_hits = 0
+                                        self.safety_stop_clear_hits += 1
                             else:
                                 # Format: SAFETY_STOP:0 - OBSTACLE CLEARED
                                 msg = Float32()
                                 msg.data = 999.0  # Sentinel value: no obstacle
                                 self.safety_stop_pub.publish(msg)
-                                self.get_logger().warn(f'✅ SAFETY_STOP:0 - Obstacle cleared')
+                                self.safety_stop_clear_hits += 1
+                                self.safety_stop_obstacle_hits = 0
+                                if self.safety_stop_clear_hits >= self.safety_stop_clear_confirm_count:
+                                    self.get_logger().warn(f'✅ SAFETY_STOP:0 - Obstacle cleared')
                         except (ValueError, IndexError) as e:
                             self.get_logger().error(f'Failed to parse SAFETY_STOP: {line} - {e}')
                     # Parse CSV data: ax,ay,az,gx,gy,gz,distance,motorA_speed,motorB_speed
@@ -888,10 +1200,28 @@ class ArduinoMotorBridge(Node):
                                     pass
                     elif line.startswith('ACK'):
                         self.get_logger().debug(f'✓ {line}')
+                self.serial_error_streak = 0
                 
                 time.sleep(0.01)  # Don't busy-wait
             except Exception as e:
-                self.get_logger().error(f'Serial read error: {e}')
+                self.serial_error_streak += 1
+                now = time.time()
+                if (now - self.last_serial_error_log_time) >= self.serial_error_log_interval:
+                    self.last_serial_error_log_time = now
+                    self.get_logger().error(f'Serial read error ({self.serial_error_streak}): {e}')
+
+                if self.serial_error_streak >= self.serial_max_error_streak and (now - self.last_serial_reconnect_time) >= self.serial_reconnect_interval:
+                    self.last_serial_reconnect_time = now
+                    try:
+                        if self.ser is not None:
+                            self.ser.close()
+                    except Exception:
+                        pass
+                    self.ser = None
+                    if not self._open_serial_connection():
+                        if (now - self.last_serial_error_log_time) >= self.serial_error_log_interval:
+                            self.last_serial_error_log_time = now
+                            self.get_logger().error('❌ Serial reconnect failed; will retry')
                 time.sleep(0.1)
 
     def _shutdown_motors(self):
@@ -927,14 +1257,22 @@ class ArduinoMotorBridge(Node):
         range_msg.range = max(self.ultrasonic_min_range, min(self.ultrasonic_max_range, distance_m))
         self.ultrasonic_range_pub.publish(range_msg)
 
+    def destroy_node(self):
+        self._shutdown_motors()
+        return super().destroy_node()
+
 def main(args=None):
     rclpy.init(args=args)
     node = ArduinoMotorBridge()
     try:
         rclpy.spin(node)
     finally:
-        node._shutdown_motors()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

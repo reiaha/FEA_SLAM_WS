@@ -1,0 +1,9 @@
+[console_scripts]
+arduino_motor_bridge_simple = localization.arduino_motor_bridge_simple:main
+dynamic_obstacle_tracker = localization.dynamic_obstacle_tracker:main
+exploration_coordinator_simple = localization.exploration_coordinator_simple:main
+frontier_detector = localization.frontier_detector:main
+lidar_explorer = localization.lidar_explorer:main
+map_odom_fallback = localization.map_odom_fallback:main
+scan_timestamp_fix = localization.scan_timestamp_fix:main
+
