@@ -64,7 +64,7 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('rear_backup_min_distance', 0.30)
         self.declare_parameter('rear_stop_hold_time', 0.6)
         self.declare_parameter('rear_block_min_hits', 3)
-        self.declare_parameter('front_stop_distance', 0.50)
+        self.declare_parameter('front_stop_distance', 0.80)
         self.declare_parameter('front_stop_hold_time', 0.6)
         self.declare_parameter('any_obstacle_stop_distance', 0.20)
         self.declare_parameter('any_obstacle_stop_hold_time', 0.5)
@@ -82,7 +82,7 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('front_obstacle_backup_speed_mps', 0.12)
         self.declare_parameter('front_obstacle_backup_turn_scale', 0.35)
         self.declare_parameter('scan_topic', '/scan')
-        self.declare_parameter('front_obstacle_half_angle_deg', 45.0)
+        self.declare_parameter('front_obstacle_half_angle_deg', 50.0)
         self.declare_parameter('rear_obstacle_half_angle_deg', 30.0)
         self.declare_parameter('force_backward_on_zero_cmd', False)
         self.declare_parameter('zero_cmd_forward_pwm', 110)
@@ -622,12 +622,9 @@ class ArduinoMotorBridge(Node):
                 pwm_left = turn_pwm
                 pwm_right = -turn_pwm
         elif linear > self.velocity_deadband and abs(angular) > self.angular_deadband:
-            if angular > 0.0:
-                pwm_left = turn_pwm
-                pwm_right = fwd_pwm
-            else:
-                pwm_left = fwd_pwm
-                pwm_right = turn_pwm
+            # FORCE: Both motors get same PWM for forward motion, regardless of angular
+            pwm_left = fwd_pwm
+            pwm_right = fwd_pwm
         elif linear < -self.velocity_deadband and abs(angular) > self.angular_deadband:
             if angular > 0.0:
                 pwm_left = -turn_pwm

@@ -1,3 +1,4 @@
+from geometry_msgs.msg import Twist
 #!/usr/bin/env python3
 
 import rclpy
@@ -9,7 +10,7 @@ from nav2_msgs.action import NavigateToPose
 from nav2_msgs.srv import SaveMap
 from nav2_msgs.srv import ClearEntireCostmap
 from nav2_msgs.msg import Costmap
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, PoseWithCovarianceStamped
 from visualization_msgs.msg import MarkerArray, Marker
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry, OccupancyGrid
@@ -32,9 +33,22 @@ class Phase(Enum):
     DONE = 6              # Exploration complete
 
 class ExplorationCoordinator(Node):
+
     def __init__(self):
         super().__init__('exploration_coordinator_v2')
-        
+        self.initial_pose_set = False
+        from geometry_msgs.msg import PoseWithCovarianceStamped
+        self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.initialpose_cb, 10)
+
+    def initialpose_cb(self, msg):
+        self.initial_pose_set = True
+        self.get_logger().info("✅ Initial pose received. Exploration can begin.")
+    def __init__(self):
+        super().__init__('exploration_coordinator_v2')
+        self.initial_pose_set = False
+        self.create_subscription(PoseWithCovarianceStamped, '/initialpose', self.initialpose_cb, 10)
+        self.initialpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        self.max_total_cells = 0  # Track the largest map size seen
         # Parameters
         self.declare_parameter('nav2_timeout', 30.0)
         self.declare_parameter('obstacle_distance', 0.35)      # meters (35cm - earlier stop)
@@ -43,21 +57,21 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('use_lidar_obstacle', True)
         self.declare_parameter('strict_obstacle_handling', True)
         self.declare_parameter('use_ultrasonic_backup', True)
-        self.declare_parameter('lidar_obstacle_distance', 0.45)   # meters (earlier stop)
+        self.declare_parameter('lidar_obstacle_distance', 0.22)   # meters (shorter trigger distance)
         self.declare_parameter('ultrasonic_backup_distance', 0.10)  # meters
         self.declare_parameter('ultrasonic_confirm_count', 2)     # consecutive hits to confirm obstacle
         self.declare_parameter('ultrasonic_clear_confirm_count', 2)  # consecutive clears to reset obstacle
         self.declare_parameter('ultrasonic_min_valid_distance', 0.02)  # reject invalid tiny spikes
         self.declare_parameter('ultrasonic_max_jump', 0.35)       # meters, reject sudden jump spikes
         self.declare_parameter('ultrasonic_jump_window', 0.20)    # seconds for jump check window
-        self.declare_parameter('lidar_stale_timeout', 0.5)       # seconds
+        self.declare_parameter('lidar_stale_timeout', 2.0)       # seconds
         self.declare_parameter('lidar_backup_on_obstacle', True)
         self.declare_parameter('swap_lidar_front_back', False)
         self.declare_parameter('rear_obstacle_threshold', 0.25)   # meters (rear safety)
         self.declare_parameter('rear_obstacle_hold_time', 0.8)    # seconds (latch rear obstacle)
         self.declare_parameter('front_obstacle_half_angle_deg', 30.0)
         self.declare_parameter('rear_obstacle_half_angle_deg', 30.0)
-        self.declare_parameter('front_obstacle_min_hits', 3)
+        self.declare_parameter('front_obstacle_min_hits', 5)
         self.declare_parameter('rear_obstacle_min_hits', 2)
         self.declare_parameter('rear_emergency_distance', 0.25)   # meters (hard stop if closer)
         self.declare_parameter('front_emergency_rotate_distance', 0.30)  # meters (rotate instead of backup when very close in front)
@@ -76,10 +90,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('known_frontier_avoid_radius', 1.2)  # meters (avoid known explored frontier areas)
         self.declare_parameter('recent_goal_radius', 0.8)      # meters (avoid recently attempted goals)
         self.declare_parameter('recent_goal_hold_time', 90.0)  # seconds (cooldown for attempted goals)
-        self.declare_parameter('startup_scan_time', 2.0)       # seconds to gather initial LiDAR/frontiers
-        self.declare_parameter('startup_frontier_timeout', 8.0)
         self.declare_parameter('nav2_handles_obstacles', True) # let Nav2 handle obstacle avoidance
-        self.declare_parameter('startup_clear_hold_time', 1.0) # seconds path must be clear before explore
         self.declare_parameter('base_frame', 'base_footprint') # TF base frame
         self.declare_parameter('scan_topic', '/scan')    # scan topic used for obstacles
         self.declare_parameter('scan_raw_topic', '/scan_raw')  # raw scan topic (timestamp fix source)
@@ -93,7 +104,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('pose_movement_threshold', 0.05)
         self.declare_parameter('require_costmap', True)
         self.declare_parameter('costmap_wait_timeout', 10.0)
-        self.declare_parameter('require_nav2_active', True)
+        self.declare_parameter('require_nav2_active', False)
         self.declare_parameter('enable_simple_exploration', True)  # Enable simple exploration when Nav2 fails
         self.declare_parameter('stop_when_no_frontiers', True)
         self.declare_parameter('no_frontier_recovery_cycles', 5)
@@ -121,6 +132,10 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('costmap_clear_cooldown', 2.0)
         self.declare_parameter('frontier_debug', True)
         self.declare_parameter('frontier_debug_log_interval', 2.0)
+        self.declare_parameter('startup_clear_hold_time', 0.0)
+        self.declare_parameter('startup_frontier_timeout', 20.0)
+        self.declare_parameter('auto_publish_initial_pose', True)
+        self.declare_parameter('auto_publish_initial_pose_timeout', 15.0)
         
         self.nav2_timeout = self.get_parameter('nav2_timeout').value
         self.obstacle_distance = self.get_parameter('obstacle_distance').value
@@ -163,9 +178,6 @@ class ExplorationCoordinator(Node):
         self.known_frontier_avoid_radius = float(self.get_parameter('known_frontier_avoid_radius').value)
         self.recent_goal_radius = float(self.get_parameter('recent_goal_radius').value)
         self.recent_goal_hold_time = float(self.get_parameter('recent_goal_hold_time').value)
-        self.startup_scan_time = self.get_parameter('startup_scan_time').value
-        self.startup_frontier_timeout = float(self.get_parameter('startup_frontier_timeout').value)
-        self.startup_clear_hold_time = self.get_parameter('startup_clear_hold_time').value
         self.nav2_handles_obstacles = self.get_parameter('nav2_handles_obstacles').value
         self.base_frame = self.get_parameter('base_frame').value
         self.scan_topic = self.get_parameter('scan_topic').value
@@ -208,13 +220,19 @@ class ExplorationCoordinator(Node):
         self.costmap_clear_cooldown = float(self.get_parameter('costmap_clear_cooldown').value)
         self.frontier_debug = bool(self.get_parameter('frontier_debug').value)
         self.frontier_debug_log_interval = float(self.get_parameter('frontier_debug_log_interval').value)
+        self.startup_clear_hold_time = float(self.get_parameter('startup_clear_hold_time').value)
+        self.startup_frontier_timeout = float(self.get_parameter('startup_frontier_timeout').value)
+        self.auto_publish_initial_pose = bool(self.get_parameter('auto_publish_initial_pose').value)
+        self.auto_publish_initial_pose_timeout = float(self.get_parameter('auto_publish_initial_pose_timeout').value)
         self.costmap_waited_out = False
         if self.strict_no_revisit:
             self.avoid_revisit = True
         
         # State
+        self.startup_time = time.time()
+        self.init_start_time = self.startup_time
+        self.nav2_activation_time = 5.0
         self.current_phase = Phase.INIT
-        self.init_start_time = time.time()
         self.phase_start_time = None  # Will be set when we detect frontiers
         self.robot_pose = (0.0, 0.0, 0.0)  # x, y, theta
         self.current_frontiers = []
@@ -234,12 +252,13 @@ class ExplorationCoordinator(Node):
         self.rescan_done = False
         self.ultrasonic_emergency_until = 0.0
         self.nav2_ready = False
-        self.nav2_activation_time = 5.0  # Wait for Nav2 lifecycle to activate
         self.startup_scan_end_time = None
         self.first_lidar_time = None
         self.first_frontier_time = None
         self.first_pose_time = None
         self.startup_frontier_timeout_warned = False
+        self.auto_initial_pose_published = False
+        self.last_auto_pose_log_time = 0.0
         self.last_frontier_time = 0.0
         self.last_startup_status_log = 0.0
         self.startup_status_log_interval = 2.0
@@ -326,7 +345,6 @@ class ExplorationCoordinator(Node):
         self.last_tf_stamp = None
         self.origin_warn_interval = 5.0
         self.last_origin_warn_time = 0.0
-        self.startup_time = time.time()
         self.last_frontier_skip_reason = None
         self.last_frontier_relax_log_time = 0.0
         self.frontier_relax_log_interval = 5.0
@@ -612,21 +630,31 @@ class ExplorationCoordinator(Node):
 
     def map_cb(self, msg: OccupancyGrid):
         data = msg.data
-        if not data:
+        if not data or self.last_percent_known is None:
             return
+        # Only count valid known cells (0-100) as explored
         known_cells = 0
         total_cells = len(data)
         for val in data:
-            if val != -1:
+            if 0 <= val <= 100:
                 known_cells += 1
+        # Track the maximum map size ever seen for a stable metric
+        if total_cells > self.max_total_cells:
+            self.max_total_cells = total_cells
         resolution = msg.info.resolution
         area_m2 = known_cells * (resolution * resolution)
         now = time.time()
         elapsed = now - self.startup_time
+        # Standard percentage (may drop if map expands)
         percent_known = (known_cells / total_cells) * 100.0 if total_cells > 0 else 0.0
+        # Stable percentage (uses max map size ever seen)
+        stable_percent_known = (known_cells / self.max_total_cells) * 100.0 if self.max_total_cells > 0 else 0.0
         self.last_mapped_area_m2 = area_m2
         self.last_percent_known = percent_known
-        self.mapped_area_series.append((elapsed, area_m2, percent_known, known_cells, total_cells))
+        self.last_stable_percent_known = stable_percent_known
+        self.mapped_area_series.append((elapsed, area_m2, percent_known, known_cells, total_cells, stable_percent_known))
+        # Log both metrics for debugging
+        self.get_logger().info(f"[DEBUG] Map completion: {percent_known:.2f}% (current map size), {stable_percent_known:.2f}% (stable, max map size)")
 
         msg_area = Float32()
         msg_area.data = area_m2
@@ -1301,9 +1329,17 @@ class ExplorationCoordinator(Node):
         robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
         if frontier_xy is not None:
             fx, fy = frontier_xy
-            self.get_logger().info(f"🚀 Sending Nav2 goal: Robot ({robot_x:.2f}, {robot_y:.2f}) → Frontier ({fx:.2f}, {fy:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f})")
+            heading = math.atan2(fy - robot_y, fx - robot_x)
+            heading_deg = math.degrees(heading)
+            self.get_logger().info(
+                f"🚀 Sending Nav2 goal: Robot ({robot_x:.2f}, {robot_y:.2f}) → Frontier ({fx:.2f}, {fy:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f}) | Heading: {heading_deg:.1f}°"
+            )
         else:
-            self.get_logger().info(f"🚀 Sending Nav2 goal: Robot ({robot_x:.2f}, {robot_y:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f})")
+            heading = math.atan2(goal_y - robot_y, goal_x - robot_x)
+            heading_deg = math.degrees(heading)
+            self.get_logger().info(
+                f"🚀 Sending Nav2 goal: Robot ({robot_x:.2f}, {robot_y:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f}) | Heading: {heading_deg:.1f}°"
+            )
         
         send_goal_future = self.nav_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.goal_response_cb)
@@ -1547,6 +1583,45 @@ class ExplorationCoordinator(Node):
             self.scan_segment_index += 1
         
         return True  # Scan still in progress
+
+    def _maybe_auto_publish_initial_pose(self, init_time_elapsed: float):
+        if self.initial_pose_set or self.auto_initial_pose_published:
+            return
+        if not self.auto_publish_initial_pose:
+            return
+        if init_time_elapsed < self.auto_publish_initial_pose_timeout:
+            return
+
+        self.update_pose()
+        if not self.pose_valid:
+            now = time.time()
+            if (now - self.last_auto_pose_log_time) >= 2.0:
+                self.last_auto_pose_log_time = now
+                self.get_logger().warn("⚠️ Auto initial-pose publish deferred: pose not valid yet")
+            return
+
+        x, y, theta = self.robot_pose
+        pose_msg = PoseWithCovarianceStamped()
+        pose_msg.header.stamp = self.get_clock().now().to_msg()
+        pose_msg.header.frame_id = 'map'
+        pose_msg.pose.pose.position.x = float(x)
+        pose_msg.pose.pose.position.y = float(y)
+        pose_msg.pose.pose.position.z = 0.0
+        pose_msg.pose.pose.orientation.z = math.sin(theta * 0.5)
+        pose_msg.pose.pose.orientation.w = math.cos(theta * 0.5)
+
+        covariance = [0.0] * 36
+        covariance[0] = 0.25
+        covariance[7] = 0.25
+        covariance[35] = 0.068
+        pose_msg.pose.covariance = covariance
+
+        self.initialpose_pub.publish(pose_msg)
+        self.initial_pose_set = True
+        self.auto_initial_pose_published = True
+        self.get_logger().warn(
+            f"⚠️ Auto-published initial pose after {init_time_elapsed:.1f}s at x={x:.2f}, y={y:.2f}, yaw={math.degrees(theta):.1f}°"
+        )
     
     def main_loop(self):
         """Main exploration state machine"""
@@ -1595,7 +1670,12 @@ class ExplorationCoordinator(Node):
             self.last_phase_log_time = now
             phase_name = self.current_phase.name
             frontier_count = len(self.current_frontiers)
-            self.get_logger().info(f"📊 Phase: {phase_name} | Frontiers: {frontier_count} | Failures: {self.consecutive_failures}/{self.max_consecutive_failures}")
+            percent_complete = self.last_percent_known if hasattr(self, 'last_percent_known') else 0.0
+            self.get_logger().info(
+                f"📊 Phase: {phase_name} | Frontiers: {frontier_count} | Failures: {self.consecutive_failures}/{self.max_consecutive_failures} | Map completion: {percent_complete:.2f}%"
+            )
+            # Always print map completion percentage for debugging
+            self.get_logger().info(f"[DEBUG] Map completion percentage: {percent_complete:.2f}%")
             # Periodic odom freshness check
             if not self._odom_recent():
                 if now - self.last_odom_stale_log_time > self.odom_stale_log_interval:
@@ -1605,129 +1685,102 @@ class ExplorationCoordinator(Node):
         # ==== PHASE 1: INITIALIZATION ====
         if self.current_phase == Phase.INIT:
             # Throttled startup status logging
-            now = time.time()
-            if now - self.last_startup_status_log >= self.startup_status_log_interval:
-                self.last_startup_status_log = now
-                self.get_logger().info("⏳ Waiting for LiDAR, frontiers, pose, and Nav2...")
-            # Detailed startup diagnostics
-            self._log_startup_diagnostics()
-            
-            # Start timer when we first detect frontiers
-            if self.current_frontiers and self.phase_start_time is None:
-                self.phase_start_time = time.time()
-                self.get_logger().info(f"✅ Frontiers detected! Waiting {self.nav2_activation_time}s for Nav2 lifecycle activation...")
-                self.first_frontier_time = self.phase_start_time
-            
-            # Start initial scan window once LiDAR is available
-            now = time.time()
-            frontiers_ready = len(self.current_frontiers) > 0
-            lidar_ready = frontiers_ready or ((now - self.last_scan_time) <= self.lidar_stale_timeout) or (
-                (now - self.last_frontier_time) <= self.frontier_lidar_fallback_timeout
-            )
-            if self.startup_scan_end_time is None and lidar_ready:
-                self.startup_scan_end_time = time.time() + self.startup_scan_time
-                self.get_logger().info(f"🔍 Startup scan window: {self.startup_scan_time:.1f}s")
-                self.first_lidar_time = time.time()
-
             # Update pose during init to verify localization
             self.update_pose()
-            if self.pose_valid and not self.pose_stale and self.first_pose_time is None:
-                self.first_pose_time = time.time()
-            
-                # Wait for Nav2 to be ready AND fully activated
-            # LENIENT: Allow exploration to start even with stale pose (TF takes time to update)
-            if self.nav_client.wait_for_server(timeout_sec=1.0):
-                init_time_elapsed = time.time() - self.init_start_time
-                scan_ready = (self.startup_scan_end_time is not None and time.time() >= self.startup_scan_end_time)
-                now = time.time()
-                frontiers_ready = len(self.current_frontiers) > 0
-                lidar_ready = frontiers_ready or ((now - self.last_scan_time) <= self.lidar_stale_timeout) or (
-                    (now - self.last_frontier_time) <= self.frontier_lidar_fallback_timeout
-                )
-                pose_ready = self.pose_valid and not self.pose_stale
-                pose_moved = math.hypot(self.robot_pose[0], self.robot_pose[1]) >= self.pose_movement_threshold
-                costmap_ready = (
-                    (self.costmap is not None or self.local_costmap is not None) or
-                    self.costmap_raw_received or
-                    self.local_costmap_raw_received
-                )
-                if self.require_costmap and not costmap_ready:
-                    if self.costmap_wait_timeout > 0.0 and init_time_elapsed >= self.costmap_wait_timeout:
-                        costmap_ready = True
-                        if not self.costmap_waited_out:
-                            self.costmap_waited_out = True
-                            self.get_logger().warn(
-                                "⚠️ Costmap not received in time; proceeding to explore with Nav2 active."
-                            )
-                else:
-                    costmap_ready = costmap_ready or not self.require_costmap
-                
-                # Check Nav2 lifecycle state
-                nav2_server_ready = self.nav_client.wait_for_server(timeout_sec=0.1)
-                nav2_services_ready = self._nav2_services_ready()
-                nav2_lifecycle_active = self._nav2_active(require_active=self.require_nav2_active, services_ready=nav2_services_ready)
-                nav2_ready = nav2_server_ready
-                
-                # Track Nav2 active state
-                if nav2_lifecycle_active:
-                    self.nav2_fully_active = True
-                
-                # TF transforms must also be available
+
+            init_time_elapsed = time.time() - self.startup_time
+            self._maybe_auto_publish_initial_pose(init_time_elapsed)
+            frontiers_ready = len(self.current_frontiers) > 0
+            scan_ready = (time.time() - self.last_scan_time) <= self.lidar_stale_timeout
+            lidar_ready = frontiers_ready or scan_ready or (
+                (time.time() - self.last_frontier_time) <= self.frontier_lidar_fallback_timeout
+            )
+            pose_ready = self.pose_valid and not self.pose_stale
+
+            nav2_server_ready = self.nav_client.wait_for_server(timeout_sec=0.1)
+            nav2_services_ready = self._nav2_services_ready()
+            nav2_lifecycle_active = self._nav2_active(
+                require_active=self.require_nav2_active,
+                services_ready=nav2_services_ready
+            )
+            nav2_ready = nav2_server_ready and (nav2_lifecycle_active if self.require_nav2_active else True)
+
+            try:
                 can_map_odom = self.tf_buffer.can_transform('map', 'odom', rclpy.time.Time(), timeout=Duration(seconds=0.05))
                 can_odom_base = self.tf_buffer.can_transform('odom', self.base_frame, rclpy.time.Time(), timeout=Duration(seconds=0.05))
                 tf_ready = can_map_odom and can_odom_base
-                
-                clear_for_hold = (time.time() - self.last_obstacle_time) >= self.startup_clear_hold_time
-                obstacle_blocking = self.obstacle_detected and (self.strict_obstacle_handling or not self.nav2_handles_obstacles)
-                
-                # Handle obstacle blocking with timeout - proceed after max_obstacle_block_time
-                if obstacle_blocking:
-                    if self.obstacle_blocking_start == 0.0:
-                        self.obstacle_blocking_start = time.time()
-                        self.get_logger().warn(f"⚠️ Obstacle detected at startup - waiting up to {self.max_obstacle_block_time}s for clearance")
-                    elif (time.time() - self.obstacle_blocking_start) >= self.max_obstacle_block_time:
-                        # Timeout reached - proceed despite obstacle
-                        self.get_logger().warn(f"⚠️ Obstacle timeout reached ({self.max_obstacle_block_time}s) - proceeding anyway")
-                        obstacle_blocking = False
-                else:
-                    self.obstacle_blocking_start = 0.0
-                
-                nav2_acceptable = nav2_lifecycle_active if self.require_nav2_active else nav2_ready
+            except Exception:
+                tf_ready = False
 
-                frontier_timeout_reached = (
-                    self.startup_frontier_timeout > 0.0 and
-                    init_time_elapsed >= self.startup_frontier_timeout
+            costmap_ready = (
+                (self.costmap is not None) or
+                (self.local_costmap is not None) or
+                self.costmap_raw_received or
+                self.local_costmap_raw_received
+            )
+            if self.require_costmap and not costmap_ready and self.init_start_time is not None:
+                if self.costmap_wait_timeout > 0.0 and (time.time() - self.init_start_time) >= self.costmap_wait_timeout:
+                    costmap_ready = True
+                    if not self.costmap_waited_out:
+                        self.costmap_waited_out = True
+                        self.get_logger().warn(
+                            "⚠️ Costmap not received in time; proceeding to explore with Nav2 active."
+                        )
+
+            clear_for_hold = (time.time() - self.last_obstacle_time) >= self.startup_clear_hold_time
+            obstacle_blocking = self.obstacle_detected and (self.strict_obstacle_handling or not self.nav2_handles_obstacles)
+
+            # Handle obstacle blocking with timeout - proceed after max_obstacle_block_time
+            if obstacle_blocking:
+                if self.obstacle_blocking_start == 0.0:
+                    self.obstacle_blocking_start = time.time()
+                    self.get_logger().warn(f"⚠️ Obstacle detected at startup - waiting up to {self.max_obstacle_block_time}s for clearance")
+                elif (time.time() - self.obstacle_blocking_start) >= self.max_obstacle_block_time:
+                    # Timeout reached - proceed despite obstacle
+                    self.get_logger().warn(f"⚠️ Obstacle timeout reached ({self.max_obstacle_block_time}s) - proceeding anyway")
+                    obstacle_blocking = False
+            else:
+                self.obstacle_blocking_start = 0.0
+
+            nav2_acceptable = nav2_lifecycle_active if self.require_nav2_active else nav2_ready
+
+            frontier_timeout_reached = (
+                self.startup_frontier_timeout > 0.0 and
+                init_time_elapsed >= self.startup_frontier_timeout
+            )
+            lidar_gate = lidar_ready or frontier_timeout_reached
+            frontiers_gate = frontiers_ready or frontier_timeout_reached
+            if frontier_timeout_reached and (not frontiers_ready) and (not self.startup_frontier_timeout_warned):
+                self.startup_frontier_timeout_warned = True
+                self.get_logger().warn(
+                    f"⚠️ No frontiers after {self.startup_frontier_timeout:.1f}s; starting explore mode anyway"
                 )
-                lidar_gate = lidar_ready or frontier_timeout_reached
-                frontiers_gate = frontiers_ready or frontier_timeout_reached
-                if frontier_timeout_reached and (not frontiers_ready) and (not self.startup_frontier_timeout_warned):
-                    self.startup_frontier_timeout_warned = True
-                    self.get_logger().warn(
-                        f"⚠️ No frontiers after {self.startup_frontier_timeout:.1f}s; starting explore mode anyway"
-                    )
-                
-                gate_ok = (
-                    init_time_elapsed >= self.nav2_activation_time and
-                    scan_ready and lidar_gate and frontiers_gate and pose_ready and
-                    costmap_ready and tf_ready and nav2_acceptable and clear_for_hold and
-                    not obstacle_blocking
+
+            gate_ok = (
+                init_time_elapsed >= self.nav2_activation_time and
+                lidar_gate and pose_ready and
+                costmap_ready and tf_ready and nav2_acceptable and clear_for_hold and
+                not obstacle_blocking
+            )
+
+            if not gate_ok and (time.time() - self.last_init_gate_log_time) >= self.init_gate_log_interval:
+                self.last_init_gate_log_time = time.time()
+                self.get_logger().info(
+                    "⛳ INIT gate: "
+                    f"elapsed={init_time_elapsed:.1f}/{self.nav2_activation_time:.1f}, "
+                    f"scan_ready={scan_ready}, lidar_ready={lidar_ready}, lidar_gate={lidar_gate}, frontiers={frontiers_ready}, frontiers_gate={frontiers_gate}, "
+                    f"pose={pose_ready}, costmap={costmap_ready}, "
+                    f"tf_ready={tf_ready}, nav2_server={nav2_server_ready}, nav2_ready={nav2_ready}, "
+                    f"clear={clear_for_hold}, obstacle={self.obstacle_detected}, blocking={obstacle_blocking}"
                 )
-                
-                if not gate_ok and (time.time() - self.last_init_gate_log_time) >= self.init_gate_log_interval:
-                    self.last_init_gate_log_time = time.time()
-                    self.get_logger().info(
-                        "⛳ INIT gate: "
-                        f"elapsed={init_time_elapsed:.1f}/{self.nav2_activation_time:.1f}, "
-                        f"scan_ready={scan_ready}, lidar_ready={lidar_ready}, lidar_gate={lidar_gate}, frontiers={frontiers_ready}, frontiers_gate={frontiers_gate}, "
-                        f"pose={pose_ready}, costmap={costmap_ready}, "
-                        f"tf_ready={tf_ready}, nav2_server={nav2_server_ready}, nav2_ready={nav2_ready}, "
-                        f"clear={clear_for_hold}, obstacle={self.obstacle_detected}, blocking={obstacle_blocking}"
-                    )
-                if gate_ok:
-                    self.exploration_start_time = time.time()  # Mark when exploration actually starts
-                    self.get_logger().info("✅ Startup complete! Starting exploration")
-                    self.current_phase = Phase.EXPLORE
-                    self.phase_start_time = time.time()
+            if gate_ok:
+                if not self.initial_pose_set:
+                    self.get_logger().warn("Waiting for initial pose to be set via RViz 2D Pose Estimate before starting exploration.")
+                    return
+                self.exploration_start_time = time.time()  # Mark when exploration actually starts
+                self.get_logger().info("✅ Startup complete! Starting exploration")
+                self.current_phase = Phase.EXPLORE
+                self.phase_start_time = time.time()
         
         # ==== PHASE 2: EXPLORE ====
         elif self.current_phase == Phase.EXPLORE:
@@ -1869,11 +1922,39 @@ class ExplorationCoordinator(Node):
                     # Only declare complete if we've actually explored (reached some goals)
                     # AND frontiers have been stable for a while
                     if self.goals_reached >= self.min_goals_for_complete:
-                        if self.last_percent_known < self.coverage_complete_percent:
+                        # Use only coverage percentage for completion
+                        min_coverage = 80.0
+                        if self.last_percent_known < min_coverage:
                             self.get_logger().warn(
-                                f"⚠️ Coverage {self.last_percent_known:.1f}% < {self.coverage_complete_percent:.1f}% - continuing exploration"
+                                f"⚠️ Coverage {self.last_percent_known:.1f}% < {min_coverage:.1f}% - continuing exploration"
                             )
                             self.no_frontier_cycles = 0
+                            return
+                        else:
+                            self.get_logger().info(f"🎉 EXPLORATION COMPLETE! Coverage {self.last_percent_known:.1f}% (min {min_coverage:.1f}%) reached.")
+                            self.get_logger().info(f"   Goals reached: {self.goals_reached}")
+                            self.get_logger().info(f"   Final frontier count: {total_frontiers}")
+                            self.get_logger().info(f"   All accessible areas have been explored!")
+                            self.get_logger().info(f"🗺️ Map completion: {self.last_percent_known:.2f}% of the map explored.")
+                            # Cancel any active navigation goal
+                            try:
+                                if hasattr(self, 'goal_handle') and self.goal_handle is not None:
+                                    cancel_future = self.goal_handle.cancel_goal_async()
+                                    cancel_future.add_done_callback(lambda f: self.get_logger().info("🛑 Nav2 goal cancel requested"))
+                                    self.goal_handle = None
+                                    self.goal_in_progress = False
+                            except Exception as e:
+                                self.get_logger().warn(f"⚠️ Could not cancel goal: {e}")
+                            # Stop the robot by publishing zero velocity
+                            try:
+                                stop_msg = Twist()
+                                self.cmd_vel_pub.publish(stop_msg)
+                                if hasattr(self, 'cmd_vel_nav_pub'):
+                                    self.cmd_vel_nav_pub.publish(stop_msg)
+                            except Exception as e:
+                                self.get_logger().warn(f"⚠️ Could not publish stop command: {e}")
+                            self.current_phase = Phase.DONE
+                            self._on_exploration_complete()
                             return
                         # Check if frontiers have been stable (unchanged for some time)
                         now = time.time()
@@ -2045,6 +2126,8 @@ class ExplorationCoordinator(Node):
         if not self.complete_marker_sent:
             self._publish_complete_marker()
             self.complete_marker_sent = True
+        # Log the final map coverage percentage
+        self.get_logger().info(f"🗺️ Map completion: {self.last_percent_known:.2f}% of the map explored.")
         if self.auto_save_on_complete and not self.map_save_requested:
             self.map_save_requested = True
             self._request_map_save()

@@ -16,6 +16,10 @@ class ScanTimestampFix(Node):
     def __init__(self):
         super().__init__('scan_timestamp_fix')
 
+        # Force ROS time usage for synchronization
+        self.use_clock = True
+        self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, False)])
+
         self.declare_parameter('input_topic', '/scan_raw')
         self.declare_parameter('output_topic', '/scan')
         self.declare_parameter('expected_scan_size', -1)
@@ -32,7 +36,7 @@ class ScanTimestampFix(Node):
         self.last_size_log_time = 0.0
         self.size_mismatch_count = 0
         self.last_output_stamp_ns = 0
-        
+
         # Message counters for diagnostics
         self.input_count = 0
         self.output_count = 0
@@ -51,12 +55,19 @@ class ScanTimestampFix(Node):
         self.get_logger().info(
             f"🔧 Scan timestamp fix: {self.input_topic} -> {self.output_topic} (pub: reliable, sub: sensor_data)"
         )
+        self.get_logger().info("[TimeSync] use_sim_time set to False. Using system (real) time.")
 
     def _scan_cb(self, msg: LaserScan):
-        """Callback to republish scan with corrected timestamp"""
+        """Callback to republish scan with corrected timestamp and time diagnostics"""
         self.input_count += 1
         self.last_input_time = self.get_clock().now()
-        
+
+        # Diagnostics: print incoming and outgoing timestamps
+        msg_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        now_time = self.get_clock().now().nanoseconds / 1e9
+        if abs(now_time - msg_time) > 0.1:
+            self.get_logger().warn(f"[TimeSync] Incoming scan timestamp {msg_time:.3f} is {now_time - msg_time:.3f}s different from node time {now_time:.3f}")
+
         try:
             fixed = LaserScan()
             # Use current clock time with a small positive offset and enforce monotonicity.
@@ -117,7 +128,6 @@ class ScanTimestampFix(Node):
             self.pub.publish(fixed)
             self.output_count += 1
             self.last_output_time = self.get_clock().now()
-            
             # Log periodically (every 100 messages)
             if self.output_count % 100 == 0:
                 elapsed = (self.get_clock().now() - self.last_input_time).nanoseconds / 1e9

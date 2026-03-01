@@ -2,9 +2,14 @@
 # FEA-SLAM Robot Startup Script
 # This script starts the complete autonomous exploration system
 
+
 set -eo pipefail
 
 cd /home/pi/FEA_SLAM_WS
+
+
+# --- Source the workspace after build ---
+echo "[SOURCE] Sourcing ROS and workspace setup files..."
 
 if [[ ! -f /opt/ros/humble/setup.bash ]]; then
 	echo "[ERROR] Missing ROS setup: /opt/ros/humble/setup.bash"
@@ -43,7 +48,7 @@ cleanup_stop() {
 trap cleanup_stop INT TERM EXIT
 
 post_launch_healthcheck() {
-	local timeout_sec="${HEALTHCHECK_TIMEOUT_SEC:-20}"
+	local timeout_sec="${HEALTHCHECK_TIMEOUT_SEC:-8}"
 	local interval_sec=1
 	local elapsed=0
 	local got_scan_raw=0
@@ -73,6 +78,68 @@ post_launch_healthcheck() {
 }
 
 # Run health check in background so launch remains foreground and interruptible
+
+
 post_launch_healthcheck &
 
-ros2 launch fea_slam robot_full.launch.py slam:=true exploration:=true map_odom_fallback:=false nav2_lifecycle_override:=false
+ros2 launch fea_slam robot_full.launch.py slam:=true exploration:=true map_odom_fallback:=false nav2_lifecycle_override:=false &
+LAUNCH_PID=$!
+
+# Trap SIGINT/SIGTERM and kill background launch
+cleanup_all() {
+	echo "[STOP] Sending zero velocity before shutdown..."
+	timeout 2 ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}' >/dev/null 2>&1 || true
+	timeout 2 ros2 topic pub --once /cmd_vel_nav geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}' >/dev/null 2>&1 || true
+	if [[ -n "$LAUNCH_PID" ]]; then
+		kill $LAUNCH_PID 2>/dev/null || true
+	fi
+}
+trap cleanup_all INT TERM EXIT
+
+
+
+# --- Wait for /initialpose topic to exist, then for subscriber, then publish initial pose ---
+echo "[POSE] Waiting for /initialpose topic to be created..."
+sleep 3
+topic_timeout=20
+topic_elapsed=0
+topic_interval=1
+topic_exists=""
+pose_published=0
+while [[ $topic_elapsed -lt $topic_timeout ]]; do
+	topic_exists="$(ros2 topic list 2>/dev/null | grep -w "/initialpose" || true)"
+	if [[ -n "$topic_exists" ]]; then
+		echo "[POSE] /initialpose topic detected. Waiting for subscription..."
+		break
+	fi
+	sleep $topic_interval
+	topic_elapsed=$((topic_elapsed + topic_interval))
+done
+if [[ -z "$topic_exists" ]]; then
+	echo "[POSE][ERROR] Timeout waiting for /initialpose topic. Initial pose not published."
+        echo "[POSE][STATUS] initialized=false reason=topic_timeout"
+else
+	timeout=20
+	interval=1
+	elapsed=0
+	subs_count=""
+	while [[ $elapsed -lt $timeout ]]; do
+		subs_count="$(ros2 topic info /initialpose 2>/dev/null | awk '/Subscription count:/ {print $3}' || true)"
+		if [[ -n "$subs_count" && "$subs_count" -gt 0 ]]; then
+			echo "[POSE] /initialpose subscription detected. Publishing initial pose..."
+			ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped "{pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {z: 0.0, w: 1.0}}, covariance: [1.0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, 0, 100.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}"
+			pose_published=1
+			echo "[POSE][STATUS] initialized=true reason=published_once"
+			echo "[NOTE] Exploration will NOT start even if nav2 is ready until the initial pose is initialized."
+			break
+		fi
+		sleep $interval
+		elapsed=$((elapsed + interval))
+	done
+	if [[ $elapsed -ge $timeout ]]; then
+		echo "[POSE][ERROR] Timeout waiting for /initialpose subscriber. Initial pose not published."
+		echo "[POSE][STATUS] initialized=false reason=no_subscription"
+	fi
+fi
+
+wait $LAUNCH_PID
