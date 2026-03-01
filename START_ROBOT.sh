@@ -43,9 +43,71 @@ cleanup_stop() {
 		'{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}' >/dev/null 2>&1 || true
 	timeout 2 ros2 topic pub --once /cmd_vel_nav geometry_msgs/msg/Twist \
 		'{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}' >/dev/null 2>&1 || true
+
+	for dev in /dev/ttyACM0 /dev/ttyACM1; do
+		if [[ -w "$dev" ]]; then
+			timeout 1 bash -lc "printf 'MOTOR:0,0\\nSTOP\\n' > '$dev'" >/dev/null 2>&1 || true
+		fi
+	done
 }
 
-trap cleanup_stop INT TERM EXIT
+cleanup_done=0
+stop_requested=0
+
+cleanup_all() {
+	if [[ "$cleanup_done" -eq 1 ]]; then
+		return
+	fi
+	cleanup_done=1
+
+	cleanup_stop
+
+	if [[ -n "${HEALTHCHECK_PID:-}" ]]; then
+		kill "$HEALTHCHECK_PID" 2>/dev/null || true
+	fi
+
+	local launch_pgid
+	launch_pgid="${LAUNCH_PGID:-}"
+	if [[ -z "$launch_pgid" && -n "${LAUNCH_PID:-}" ]]; then
+		launch_pgid="$(ps -o pgid= -p "$LAUNCH_PID" 2>/dev/null | tr -d '[:space:]' || true)"
+	fi
+
+	if [[ -n "$launch_pgid" ]]; then
+		kill -INT -- "-$launch_pgid" 2>/dev/null || true
+		kill -TERM -- "-$launch_pgid" 2>/dev/null || true
+		pkill -TERM -g "$launch_pgid" 2>/dev/null || true
+	fi
+
+	if [[ -n "${LAUNCH_PID:-}" ]]; then
+		kill -TERM "$LAUNCH_PID" 2>/dev/null || true
+	fi
+
+	sleep 0.5
+
+	if [[ -n "$launch_pgid" ]]; then
+		kill -KILL -- "-$launch_pgid" 2>/dev/null || true
+		pkill -KILL -g "$launch_pgid" 2>/dev/null || true
+	fi
+
+	if [[ -n "${LAUNCH_PID:-}" ]]; then
+		kill -KILL "$LAUNCH_PID" 2>/dev/null || true
+	fi
+
+	pkill -f 'exploration_coordinator_simple|arduino_motor_bridge_simple|frontier_detector|ydlidar_ros2_driver_node|sync_slam_toolbox_node|controller_server|planner_server|bt_navigator|lifecycle_manager_navigation|rviz2|ros2 launch fea_slam robot_full.launch.py' 2>/dev/null || true
+	pkill -9 -f 'exploration_coordinator_simple|arduino_motor_bridge_simple|frontier_detector|ydlidar_ros2_driver_node|sync_slam_toolbox_node|controller_server|planner_server|bt_navigator|lifecycle_manager_navigation|rviz2|ros2 launch fea_slam robot_full.launch.py' 2>/dev/null || true
+
+	cleanup_stop
+}
+
+on_signal() {
+	stop_requested=1
+	echo "[STOP] Ctrl+C received. Stopping all ROS processes..."
+	cleanup_all
+	exit 130
+}
+
+trap on_signal INT TERM
+trap cleanup_all EXIT
 
 post_launch_healthcheck() {
 	local timeout_sec="${HEALTHCHECK_TIMEOUT_SEC:-8}"
@@ -81,20 +143,11 @@ post_launch_healthcheck() {
 
 
 post_launch_healthcheck &
+HEALTHCHECK_PID=$!
 
-ros2 launch fea_slam robot_full.launch.py slam:=true exploration:=true map_odom_fallback:=false nav2_lifecycle_override:=false &
+setsid ros2 launch fea_slam robot_full.launch.py slam:=true exploration:=true rviz:=false map_odom_fallback:=false nav2_lifecycle_override:=false &
 LAUNCH_PID=$!
-
-# Trap SIGINT/SIGTERM and kill background launch
-cleanup_all() {
-	echo "[STOP] Sending zero velocity before shutdown..."
-	timeout 2 ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}' >/dev/null 2>&1 || true
-	timeout 2 ros2 topic pub --once /cmd_vel_nav geometry_msgs/msg/Twist '{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}' >/dev/null 2>&1 || true
-	if [[ -n "$LAUNCH_PID" ]]; then
-		kill $LAUNCH_PID 2>/dev/null || true
-	fi
-}
-trap cleanup_all INT TERM EXIT
+LAUNCH_PGID="$(ps -o pgid= -p "$LAUNCH_PID" 2>/dev/null | tr -d '[:space:]' || true)"
 
 
 
@@ -107,6 +160,10 @@ topic_interval=1
 topic_exists=""
 pose_published=0
 while [[ $topic_elapsed -lt $topic_timeout ]]; do
+	if [[ "$stop_requested" -eq 1 ]]; then
+		echo "[STOP] Interrupted while waiting for /initialpose topic"
+		exit 130
+	fi
 	topic_exists="$(ros2 topic list 2>/dev/null | grep -w "/initialpose" || true)"
 	if [[ -n "$topic_exists" ]]; then
 		echo "[POSE] /initialpose topic detected. Waiting for subscription..."
@@ -124,10 +181,14 @@ else
 	elapsed=0
 	subs_count=""
 	while [[ $elapsed -lt $timeout ]]; do
+		if [[ "$stop_requested" -eq 1 ]]; then
+			echo "[STOP] Interrupted while waiting for /initialpose subscriber"
+			exit 130
+		fi
 		subs_count="$(ros2 topic info /initialpose 2>/dev/null | awk '/Subscription count:/ {print $3}' || true)"
 		if [[ -n "$subs_count" && "$subs_count" -gt 0 ]]; then
 			echo "[POSE] /initialpose subscription detected. Publishing initial pose..."
-			ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped "{pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {z: 0.0, w: 1.0}}, covariance: [1.0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, 0, 100.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}"
+			timeout 3 ros2 topic pub --once /initialpose geometry_msgs/msg/PoseWithCovarianceStamped '{header: {frame_id: map}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0}, orientation: {z: 0.0, w: 1.0}}, covariance: [1.0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 0, 0, 100.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}}' >/dev/null 2>&1 || true
 			pose_published=1
 			echo "[POSE][STATUS] initialized=true reason=published_once"
 			echo "[NOTE] Exploration will NOT start even if nav2 is ready until the initial pose is initialized."
@@ -142,4 +203,4 @@ else
 	fi
 fi
 
-wait $LAUNCH_PID
+wait $LAUNCH_PID || true
