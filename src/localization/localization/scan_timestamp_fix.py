@@ -2,13 +2,15 @@
 """
 Scan Timestamp Fix
 
-Republishes LaserScan with header.stamp set to node clock time.
-This prevents TF message filter drops due to stale scan timestamps.
+Republishes LaserScan with corrected timestamp.
+Uses sensor stamp + configurable offset when valid, and drops stale delayed scans
+to prevent TF message filter drops and map smearing from mis-timed scans.
 """
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.executors import ExternalShutdownException
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import LaserScan
 
 
@@ -16,26 +18,36 @@ class ScanTimestampFix(Node):
     def __init__(self):
         super().__init__('scan_timestamp_fix')
 
-        # Force ROS time usage for synchronization
-        self.use_clock = True
-        self.set_parameters([rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, False)])
-
         self.declare_parameter('input_topic', '/scan_raw')
         self.declare_parameter('output_topic', '/scan')
         self.declare_parameter('expected_scan_size', -1)
         self.declare_parameter('auto_lock_scan_size', True)
         self.declare_parameter('size_mismatch_log_interval', 10.0)
-        self.declare_parameter('timestamp_offset_sec', 0.03)
+        self.declare_parameter('timestamp_offset_sec', 0.02)
+        self.declare_parameter('input_queue_depth', 1)
+        self.declare_parameter('max_input_age_sec', 0.70)
+        self.declare_parameter('rebase_stale_to_now', False)
+        self.declare_parameter('debug_timestamps', False)
+        self.declare_parameter('debug_log_interval_sec', 1.0)
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         self.expected_scan_size = int(self.get_parameter('expected_scan_size').value)
         self.auto_lock_scan_size = bool(self.get_parameter('auto_lock_scan_size').value)
         self.size_mismatch_log_interval = float(self.get_parameter('size_mismatch_log_interval').value)
         self.timestamp_offset_sec = float(self.get_parameter('timestamp_offset_sec').value)
+        self.max_input_age_sec = float(self.get_parameter('max_input_age_sec').value)
+        self.input_queue_depth = max(1, int(self.get_parameter('input_queue_depth').value))
+        self.rebase_stale_to_now = bool(self.get_parameter('rebase_stale_to_now').value)
+        self.debug_timestamps = bool(self.get_parameter('debug_timestamps').value)
+        self.debug_log_interval_sec = float(self.get_parameter('debug_log_interval_sec').value)
         self.scan_size_ref = self.expected_scan_size if self.expected_scan_size > 0 else None
         self.last_size_log_time = 0.0
         self.size_mismatch_count = 0
         self.last_output_stamp_ns = 0
+        self.last_stale_drop_log_time = 0.0
+        self.stale_drop_count = 0
+        self.stale_rebase_count = 0
+        self.last_debug_log_time = 0.0
 
         # Message counters for diagnostics
         self.input_count = 0
@@ -43,24 +55,60 @@ class ScanTimestampFix(Node):
         self.last_input_time = self.get_clock().now()
         self.last_output_time = self.get_clock().now()
 
-        # Subscribe with sensor_data QoS to match the LiDAR driver (often best-effort).
+        # Subscribe with best-effort depth=1 to avoid callback backlog and stale scan queueing.
         # Publish with reliable QoS so Nav2 costmaps (reliable subscribers) receive scans.
+        input_qos = QoSProfile(depth=self.input_queue_depth)
+        input_qos.reliability = ReliabilityPolicy.BEST_EFFORT
+        input_qos.durability = DurabilityPolicy.VOLATILE
+
         reliable_qos = QoSProfile(depth=1)
         reliable_qos.reliability = ReliabilityPolicy.RELIABLE
         reliable_qos.durability = DurabilityPolicy.VOLATILE
 
         self.pub = self.create_publisher(LaserScan, self.output_topic, reliable_qos)
-        self.sub = self.create_subscription(LaserScan, self.input_topic, self._scan_cb, qos_profile_sensor_data)
+        self.sub = self.create_subscription(LaserScan, self.input_topic, self._scan_cb, input_qos)
 
         self.get_logger().info(
-            f"🔧 Scan timestamp fix: {self.input_topic} -> {self.output_topic} (pub: reliable, sub: sensor_data)"
+            f"🔧 Scan timestamp fix: {self.input_topic} -> {self.output_topic} "
+            f"(pub: reliable depth=1, sub: best_effort depth={self.input_queue_depth})"
         )
-        self.get_logger().info("[TimeSync] use_sim_time set to False. Using system (real) time.")
+        use_sim_time = bool(self.get_parameter('use_sim_time').value)
+        self.get_logger().info(f"[TimeSync] use_sim_time={use_sim_time}")
+        self.get_logger().info(
+            f"[TimeSync] debug_timestamps={self.debug_timestamps}, "
+            f"debug_log_interval_sec={self.debug_log_interval_sec:.2f}, "
+            f"max_input_age_sec={self.max_input_age_sec:.3f}, "
+            f"timestamp_offset_sec={self.timestamp_offset_sec:.3f}, "
+            f"rebase_stale_to_now={self.rebase_stale_to_now}"
+        )
+
+    def _log_timing_debug(self, now_ns: int, msg_stamp_ns: int, stamp_ns: int | None, dropped: bool, reason: str):
+        if not self.debug_timestamps:
+            return
+        now_sec = now_ns / 1e9
+        if (now_sec - self.last_debug_log_time) < max(0.1, self.debug_log_interval_sec):
+            return
+        self.last_debug_log_time = now_sec
+
+        msg_sec = msg_stamp_ns / 1e9 if msg_stamp_ns > 0 else 0.0
+        input_age_sec = (now_ns - msg_stamp_ns) / 1e9 if msg_stamp_ns > 0 else 0.0
+        line = (
+            f"[TimeSync][DEBUG] frame={self.input_topic} src_frame={getattr(self, '_last_frame_id', 'unknown')} "
+            f"msg_t={msg_sec:.6f} now_t={now_sec:.6f} age={input_age_sec:.3f}s "
+            f"limit={self.max_input_age_sec:.3f}s offset={self.timestamp_offset_sec:.3f}s "
+            f"dropped={int(dropped)} reason={reason}"
+        )
+        if stamp_ns is not None:
+            out_sec = stamp_ns / 1e9
+            out_skew_sec = out_sec - now_sec
+            line += f" out_t={out_sec:.6f} out_minus_now={out_skew_sec:.3f}s"
+        self.get_logger().info(line)
 
     def _scan_cb(self, msg: LaserScan):
         """Callback to republish scan with corrected timestamp and time diagnostics"""
         self.input_count += 1
         self.last_input_time = self.get_clock().now()
+        self._last_frame_id = msg.header.frame_id
 
         # Diagnostics: print incoming and outgoing timestamps
         msg_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
@@ -70,10 +118,44 @@ class ScanTimestampFix(Node):
 
         try:
             fixed = LaserScan()
-            # Use current clock time with a small positive offset and enforce monotonicity.
-            # This avoids occasional "earlier than transform cache" drops under scheduling jitter.
+            # Prefer sensor timestamp + offset to preserve temporal alignment with robot pose.
+            # Drop stale delayed scans to avoid map smearing and TF message-filter drops.
             now_ns = self.get_clock().now().nanoseconds
-            stamp_ns = now_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
+            msg_stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+            input_age_sec = (now_ns - msg_stamp_ns) / 1e9 if msg_stamp_ns > 0 else 0.0
+
+            if msg_stamp_ns > 0 and input_age_sec > self.max_input_age_sec:
+                now_sec = now_ns / 1e9
+                if self.rebase_stale_to_now:
+                    self.stale_rebase_count += 1
+                    if (now_sec - self.last_stale_drop_log_time) >= 1.0:
+                        self.last_stale_drop_log_time = now_sec
+                        self.get_logger().warn(
+                            f"[TimeSync] Rebasing stale scan age={input_age_sec:.3f}s "
+                            f"(limit={self.max_input_age_sec:.3f}s, rebased={self.stale_rebase_count})"
+                        )
+                    msg_stamp_ns = 0
+                else:
+                    self.stale_drop_count += 1
+                    if (now_sec - self.last_stale_drop_log_time) >= 1.0:
+                        self.last_stale_drop_log_time = now_sec
+                        self.get_logger().warn(
+                            f"[TimeSync] Dropping stale scan age={input_age_sec:.3f}s "
+                            f"(limit={self.max_input_age_sec:.3f}s, drops={self.stale_drop_count})"
+                        )
+                    self._log_timing_debug(now_ns, msg_stamp_ns, None, True, 'stale_input')
+                    return
+
+            if msg_stamp_ns > 0:
+                stamp_ns = msg_stamp_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
+            else:
+                stamp_ns = now_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
+
+            # Ensure output stamp is not in the past relative to processing time.
+            min_stamp_ns = now_ns - int(0.01 * 1e9)
+            if stamp_ns < min_stamp_ns:
+                stamp_ns = min_stamp_ns
+
             if stamp_ns <= self.last_output_stamp_ns:
                 stamp_ns = self.last_output_stamp_ns + 1
             self.last_output_stamp_ns = stamp_ns
@@ -128,6 +210,7 @@ class ScanTimestampFix(Node):
             self.pub.publish(fixed)
             self.output_count += 1
             self.last_output_time = self.get_clock().now()
+            self._log_timing_debug(now_ns, msg_stamp_ns, stamp_ns, False, 'published')
             # Log periodically (every 100 messages)
             if self.output_count % 100 == 0:
                 elapsed = (self.get_clock().now() - self.last_input_time).nanoseconds / 1e9
@@ -161,8 +244,17 @@ def main(args=None):
     # Add diagnostics timer
     timer = node.create_timer(5.0, node._timer_cb)
     
-    rclpy.spin(node)
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

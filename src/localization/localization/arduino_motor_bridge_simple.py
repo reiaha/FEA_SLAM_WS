@@ -93,6 +93,9 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('serial_max_error_streak', 5)
         self.declare_parameter('serial_error_log_interval', 2.0)
         self.declare_parameter('motor_log_interval', 0.25)
+        self.declare_parameter('odom_feedback_gate_enabled', True)
+        self.declare_parameter('odom_stationary_speed_threshold', 5.0)
+        self.declare_parameter('odom_freeze_pose_when_stationary', True)
         
         serial_port = self.get_parameter('serial_port').value
         baud_rate = self.get_parameter('baud_rate').value
@@ -181,6 +184,9 @@ class ArduinoMotorBridge(Node):
         self.serial_max_error_streak = int(self.get_parameter('serial_max_error_streak').value)
         self.serial_error_log_interval = float(self.get_parameter('serial_error_log_interval').value)
         self.motor_log_interval = float(self.get_parameter('motor_log_interval').value)
+        self.odom_feedback_gate_enabled = bool(self.get_parameter('odom_feedback_gate_enabled').value)
+        self.odom_stationary_speed_threshold = float(self.get_parameter('odom_stationary_speed_threshold').value)
+        self.odom_freeze_pose_when_stationary = bool(self.get_parameter('odom_freeze_pose_when_stationary').value)
         self.cmd_vel_override_duration = 0.2
         self.cmd_vel_override_until = 0.0
 
@@ -328,6 +334,8 @@ class ArduinoMotorBridge(Node):
         self.safety_stop_obstacle_hits = 0
         self.safety_stop_clear_hits = 0
         self.last_safety_stop_brake_time = 0.0
+        self.last_odom_feedback_gate_log_time = 0.0
+        self.odom_feedback_gate_log_interval = 1.0
 
         if self.enable_stuck_recovery:
             self.create_timer(0.1, self._stuck_recovery_loop)
@@ -826,21 +834,47 @@ class ArduinoMotorBridge(Node):
             self.last_time = now
             return
 
-        v = self.last_cmd_linear
-        # Use IMU yaw if available, else integrate
-        if self.imu_yaw is not None:
-            # Integrate x, y using IMU yaw
-            dx = v * math.cos(self.imu_yaw) * dt
-            dy = v * math.sin(self.imu_yaw) * dt
-            self.x += dx
-            self.y += dy
-            self.yaw = self.imu_yaw
-        else:
-            w = self.last_cmd_angular
-            self.x += v * math.cos(self.yaw) * dt
-            self.y += v * math.sin(self.yaw) * dt
-            self.yaw += w * dt
-            self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
+        v_cmd = self.last_cmd_linear
+        w_cmd = self.last_cmd_angular
+        v = v_cmd
+        w = w_cmd
+        freeze_pose_update = False
+
+        if self.odom_feedback_gate_enabled:
+            feedback_recent = (time.time() - self.last_motor_speed_time) <= 0.5
+            if feedback_recent and self.last_motor_speed_left is not None and self.last_motor_speed_right is not None:
+                motors_stationary = (
+                    abs(self.last_motor_speed_left) <= self.odom_stationary_speed_threshold and
+                    abs(self.last_motor_speed_right) <= self.odom_stationary_speed_threshold
+                )
+                cmd_demands_linear_motion = abs(v_cmd) > self.velocity_deadband
+                cmd_demands_rotation = abs(w_cmd) > self.angular_deadband
+
+                # Freeze pose only when linear motion is commanded but feedback says stationary.
+                # Do not freeze on pure rotation commands, to preserve heading updates for SLAM.
+                if motors_stationary and cmd_demands_linear_motion and not cmd_demands_rotation:
+                    v = 0.0
+                    w = 0.0
+                    freeze_pose_update = self.odom_freeze_pose_when_stationary
+                    now_wall = time.time()
+                    if (now_wall - self.last_odom_feedback_gate_log_time) >= self.odom_feedback_gate_log_interval:
+                        self.last_odom_feedback_gate_log_time = now_wall
+                        self.get_logger().warn(
+                            "🧭 Odom gate: blocked linear motion detected; suppressing cmd-based odom integration"
+                        )
+        # Use IMU yaw only while moving; when stationary-gated, freeze pose to avoid IMU jitter smear.
+        if not freeze_pose_update:
+            if self.imu_yaw is not None:
+                dx = v * math.cos(self.imu_yaw) * dt
+                dy = v * math.sin(self.imu_yaw) * dt
+                self.x += dx
+                self.y += dy
+                self.yaw = self.imu_yaw
+            else:
+                self.x += v * math.cos(self.yaw) * dt
+                self.y += v * math.sin(self.yaw) * dt
+                self.yaw += w * dt
+                self.yaw = math.atan2(math.sin(self.yaw), math.cos(self.yaw))
 
         # Use slightly backdated timestamp to avoid "future" TF errors
         stamp = now - rclpy.duration.Duration(seconds=0.002)
@@ -852,8 +886,8 @@ class ArduinoMotorBridge(Node):
         t.transform.translation.x = self.x
         t.transform.translation.y = self.y
         t.transform.translation.z = 0.0
-        # Use IMU quaternion if available, else synthesize from yaw
-        if self.imu_quat is not None:
+        # Use IMU quaternion only when not stationary-gated to avoid orientation jitter at standstill.
+        if self.imu_quat is not None and not freeze_pose_update:
             t.transform.rotation = self.imu_quat
         else:
             t.transform.rotation.z = math.sin(self.yaw / 2.0)
@@ -870,13 +904,13 @@ class ArduinoMotorBridge(Node):
         odom.pose.pose.position.x = self.x
         odom.pose.pose.position.y = self.y
         odom.pose.pose.position.z = 0.0
-        if self.imu_quat is not None:
+        if self.imu_quat is not None and not freeze_pose_update:
             odom.pose.pose.orientation = self.imu_quat
         else:
             odom.pose.pose.orientation.z = math.sin(self.yaw / 2.0)
             odom.pose.pose.orientation.w = math.cos(self.yaw / 2.0)
         odom.twist.twist.linear.x = v
-        odom.twist.twist.angular.z = self.last_cmd_angular
+        odom.twist.twist.angular.z = w
 
         # DEBUG: Show odometry being published
         self.get_logger().debug(f'Publishing Odometry: ({odom.pose.pose.position.x:.3f}, {odom.pose.pose.position.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={self.last_cmd_angular:.3f}')
@@ -892,7 +926,7 @@ class ArduinoMotorBridge(Node):
 
         # DIAGNOSTIC: keep at debug to avoid flooding logs and starving controller loops
         if abs(v) > 0.001 or abs(self.last_cmd_angular) > 0.001:
-            self.get_logger().debug(f'📍 TF published: odom->base_footprint at ({self.x:.3f}, {self.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={self.last_cmd_angular:.3f}')
+            self.get_logger().debug(f'📍 TF published: odom->base_footprint at ({self.x:.3f}, {self.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={w:.3f}')
 
         self.last_time = now
     
@@ -1261,8 +1295,14 @@ class ArduinoMotorBridge(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = ArduinoMotorBridge()
+    from rclpy.executors import ExternalShutdownException
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    except Exception as e:
+        if 'context is not valid' not in str(e):
+            node.get_logger().error(f'Arduino motor bridge error: {e}')
     finally:
         try:
             node.destroy_node()

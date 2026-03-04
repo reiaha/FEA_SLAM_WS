@@ -53,6 +53,7 @@ cleanup_stop() {
 
 cleanup_done=0
 stop_requested=0
+LAUNCH_MATCH='exploration_coordinator_simple|arduino_motor_bridge_simple|frontier_detector|scan_timestamp_fix|ydlidar_ros2_driver_node|async_slam_toolbox_node|sync_slam_toolbox_node|controller_server|planner_server|bt_navigator|behavior_server|waypoint_follower|velocity_smoother|lifecycle_manager_navigation|lifecycle_manager_navigation_override|rviz2|joint_state_publisher|robot_state_publisher|static_transform_publisher|ekf_node|ros2 launch fea_slam robot_full.launch.py'
 
 cleanup_all() {
 	if [[ "$cleanup_done" -eq 1 ]]; then
@@ -67,34 +68,53 @@ cleanup_all() {
 	fi
 
 	local launch_pgid
+	local script_pgid
 	launch_pgid="${LAUNCH_PGID:-}"
+	script_pgid="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]' || true)"
 	if [[ -z "$launch_pgid" && -n "${LAUNCH_PID:-}" ]]; then
 		launch_pgid="$(ps -o pgid= -p "$LAUNCH_PID" 2>/dev/null | tr -d '[:space:]' || true)"
 	fi
 
-	if [[ -n "$launch_pgid" ]]; then
+	if [[ -n "$launch_pgid" && "$launch_pgid" != "$script_pgid" ]]; then
 		kill -INT -- "-$launch_pgid" 2>/dev/null || true
-		kill -TERM -- "-$launch_pgid" 2>/dev/null || true
-		pkill -TERM -g "$launch_pgid" 2>/dev/null || true
 	fi
 
 	if [[ -n "${LAUNCH_PID:-}" ]]; then
-		kill -TERM "$LAUNCH_PID" 2>/dev/null || true
+		# Prefer graceful launch-managed shutdown first
+		for _ in {1..10}; do
+			if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then
+				break
+			fi
+			sleep 0.2
+		done
+
+		# Escalate only if still alive
+		if kill -0 "$LAUNCH_PID" 2>/dev/null; then
+			kill -TERM "$LAUNCH_PID" 2>/dev/null || true
+			for _ in {1..10}; do
+				if ! kill -0 "$LAUNCH_PID" 2>/dev/null; then
+					break
+				fi
+				sleep 0.2
+			done
+		fi
+
+		if kill -0 "$LAUNCH_PID" 2>/dev/null; then
+			kill -KILL "$LAUNCH_PID" 2>/dev/null || true
+		fi
 	fi
 
-	sleep 0.5
-
-	if [[ -n "$launch_pgid" ]]; then
-		kill -KILL -- "-$launch_pgid" 2>/dev/null || true
+	# Fallback cleanup for orphaned processes in the launch process group only
+	if [[ -n "$launch_pgid" && "$launch_pgid" != "$script_pgid" ]]; then
+		pkill -TERM -g "$launch_pgid" 2>/dev/null || true
+		sleep 0.5
 		pkill -KILL -g "$launch_pgid" 2>/dev/null || true
 	fi
 
-	if [[ -n "${LAUNCH_PID:-}" ]]; then
-		kill -KILL "$LAUNCH_PID" 2>/dev/null || true
-	fi
-
-	pkill -f 'exploration_coordinator_simple|arduino_motor_bridge_simple|frontier_detector|ydlidar_ros2_driver_node|sync_slam_toolbox_node|controller_server|planner_server|bt_navigator|lifecycle_manager_navigation|rviz2|ros2 launch fea_slam robot_full.launch.py' 2>/dev/null || true
-	pkill -9 -f 'exploration_coordinator_simple|arduino_motor_bridge_simple|frontier_detector|ydlidar_ros2_driver_node|sync_slam_toolbox_node|controller_server|planner_server|bt_navigator|lifecycle_manager_navigation|rviz2|ros2 launch fea_slam robot_full.launch.py' 2>/dev/null || true
+	# Final safety fallback: terminate any known stack nodes (including duplicates)
+	pkill -TERM -f "$LAUNCH_MATCH" 2>/dev/null || true
+	sleep 0.5
+	pkill -KILL -f "$LAUNCH_MATCH" 2>/dev/null || true
 
 	cleanup_stop
 }
@@ -141,11 +161,14 @@ post_launch_healthcheck() {
 
 # Run health check in background so launch remains foreground and interruptible
 
+SMALL_TEST_MODE="${SMALL_TEST_MODE:-false}"
+echo "[MODE] small_test_mode=${SMALL_TEST_MODE}"
 
 post_launch_healthcheck &
 HEALTHCHECK_PID=$!
 
-setsid ros2 launch fea_slam robot_full.launch.py slam:=true exploration:=true rviz:=false map_odom_fallback:=false nav2_lifecycle_override:=false &
+# Run launch in a dedicated session/process-group so Ctrl+C handler can reliably terminate it
+setsid ros2 launch fea_slam robot_full.launch.py slam:=true exploration:=true rviz:=true map_odom_fallback:=false nav2_lifecycle_override:=false small_test_mode:=${SMALL_TEST_MODE} &
 LAUNCH_PID=$!
 LAUNCH_PGID="$(ps -o pgid= -p "$LAUNCH_PID" 2>/dev/null | tr -d '[:space:]' || true)"
 

@@ -287,15 +287,20 @@ class FrontierDetector(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = FrontierDetector()
+    from rclpy.executors import ExternalShutdownException
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     except Exception as e:
         node.get_logger().error(f'Frontier detector error: {e}')
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
