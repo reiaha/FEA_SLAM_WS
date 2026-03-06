@@ -29,6 +29,10 @@ class ScanTimestampFix(Node):
         self.declare_parameter('rebase_stale_to_now', False)
         self.declare_parameter('debug_timestamps', False)
         self.declare_parameter('debug_log_interval_sec', 1.0)
+        # Spatial outlier filter: replace isolated spikes with inf
+        self.declare_parameter('range_filter_enabled', True)
+        self.declare_parameter('range_filter_window', 3)       # beams each side
+        self.declare_parameter('range_filter_max_deviation', 0.20)  # metres
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         self.expected_scan_size = int(self.get_parameter('expected_scan_size').value)
@@ -40,6 +44,9 @@ class ScanTimestampFix(Node):
         self.rebase_stale_to_now = bool(self.get_parameter('rebase_stale_to_now').value)
         self.debug_timestamps = bool(self.get_parameter('debug_timestamps').value)
         self.debug_log_interval_sec = float(self.get_parameter('debug_log_interval_sec').value)
+        self.range_filter_enabled = bool(self.get_parameter('range_filter_enabled').value)
+        self.range_filter_window = int(self.get_parameter('range_filter_window').value)
+        self.range_filter_max_deviation = float(self.get_parameter('range_filter_max_deviation').value)
         self.scan_size_ref = self.expected_scan_size if self.expected_scan_size > 0 else None
         self.last_size_log_time = 0.0
         self.size_mismatch_count = 0
@@ -173,6 +180,29 @@ class ScanTimestampFix(Node):
 
             ranges = list(msg.ranges)
             intensities = list(msg.intensities)
+
+            # Spatial outlier filter: kill isolated spikes before publishing
+            if self.range_filter_enabled and len(ranges) > 2 * self.range_filter_window:
+                w = self.range_filter_window
+                n = len(ranges)
+                filtered = ranges[:]
+                for i in range(n):
+                    r = ranges[i]
+                    if not (msg.range_min <= r <= msg.range_max):
+                        continue
+                    # Collect valid neighbours (wrap-around for 360 scans)
+                    neighbours = [
+                        ranges[(i + d) % n]
+                        for d in range(-w, w + 1) if d != 0
+                        if msg.range_min <= ranges[(i + d) % n] <= msg.range_max
+                    ]
+                    if len(neighbours) < w:  # too few valid neighbours — keep as-is
+                        continue
+                    neighbours.sort()
+                    median = neighbours[len(neighbours) // 2]
+                    if abs(r - median) > self.range_filter_max_deviation:
+                        filtered[i] = float('inf')
+                ranges = filtered
 
             if self.scan_size_ref is None and self.auto_lock_scan_size and len(ranges) > 0:
                 self.scan_size_ref = len(ranges)

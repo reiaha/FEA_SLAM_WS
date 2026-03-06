@@ -51,13 +51,14 @@ class ExplorationCoordinator(Node):
         self.initialpose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.max_total_cells = 0  # Track the largest map size seen
         # Parameters
-        self.declare_parameter('nav2_timeout', 30.0)
+        self.declare_parameter('nav2_timeout', 12.0)
         self.declare_parameter('obstacle_distance', 0.35)      # meters (35cm - earlier stop)
         self.declare_parameter('backup_speed', -0.3)           # m/s (gentler backward)
         self.declare_parameter('backup_time', 2.0)             # seconds (2 seconds duration)
         self.declare_parameter('use_lidar_obstacle', True)
         self.declare_parameter('strict_obstacle_handling', True)
         self.declare_parameter('use_ultrasonic_backup', True)
+        self.declare_parameter('scan_min_range', 0.27)           # m: ignore closer readings (filters chassis self-hits)
         self.declare_parameter('lidar_obstacle_distance', 0.45)   # meters (wider trigger distance for earlier stop)
         self.declare_parameter('ultrasonic_backup_distance', 0.15)  # meters
         self.declare_parameter('ultrasonic_confirm_count', 2)     # consecutive hits to confirm obstacle
@@ -128,6 +129,8 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('map_save_dir', '/home/pi/FEA_SLAM_WS/saved_maps')
         self.declare_parameter('map_save_name', 'auto_explore_map')
         self.declare_parameter('mapped_area_file', 'auto_explore_area.csv')
+        self.declare_parameter('robot_path_file', 'auto_explore_path.csv')
+        self.declare_parameter('path_record_min_dist', 0.2)  # metres between recorded waypoints
         self.declare_parameter('replan_on_frontier_update', True)
         self.declare_parameter('replan_interval', 6.0)
         self.declare_parameter('replan_goal_change_distance', 1.0)
@@ -162,6 +165,7 @@ class ExplorationCoordinator(Node):
         self.use_lidar_obstacle = self.get_parameter('use_lidar_obstacle').value
         self.strict_obstacle_handling = bool(self.get_parameter('strict_obstacle_handling').value)
         self.use_ultrasonic_backup = self.get_parameter('use_ultrasonic_backup').value
+        self.scan_min_range = float(self.get_parameter('scan_min_range').value)
         self.lidar_obstacle_distance = self.get_parameter('lidar_obstacle_distance').value
         self.ultrasonic_backup_distance = self.get_parameter('ultrasonic_backup_distance').value
         self.ultrasonic_confirm_count = int(self.get_parameter('ultrasonic_confirm_count').value)
@@ -232,6 +236,8 @@ class ExplorationCoordinator(Node):
         self.map_save_dir = self.get_parameter('map_save_dir').value
         self.map_save_name = self.get_parameter('map_save_name').value
         self.mapped_area_file = self.get_parameter('mapped_area_file').value
+        self.robot_path_file = self.get_parameter('robot_path_file').value
+        self._path_record_min_dist_val = float(self.get_parameter('path_record_min_dist').value)
         self.replan_on_frontier_update = self.get_parameter('replan_on_frontier_update').value
         self.replan_interval = float(self.get_parameter('replan_interval').value)
         self.replan_goal_change_distance = float(self.get_parameter('replan_goal_change_distance').value)
@@ -308,6 +314,19 @@ class ExplorationCoordinator(Node):
         self.corner_recovery_until = 0.0
         self.corner_recovery_mode = None
         self.last_goal_time = 0.0  # Track when we last sent a goal
+        # Lethal-space escape: back up when same position fails N times
+        self._lethal_fail_pos = None            # (x, y) of last planning failure
+        self._lethal_fail_count = 0              # consecutive failures from same position
+        # Static-obstacle deep escape
+        self.static_stuck_start = 0.0          # wall-clock when STATIC first appeared
+        self.static_stuck_escape_active = False
+        self.static_stuck_escape_step = 0      # 0=backup, 1=turn
+        self.static_stuck_escape_step_start = 0.0
+        self.static_stuck_escape_backup_dur = 1.5   # seconds to reverse
+        self.static_stuck_escape_turn_dur = 2.5     # seconds to rotate after backup
+        self.static_stuck_escape_turn_dir = 1.0
+        self.static_stuck_escape_attempts = 0       # alternates direction each time
+        self.static_stuck_trigger_time = 8.0        # trigger after this many seconds stuck
         self.last_costmap_clear_time = 0.0
         self.goal_cooldown = 0.5   # Reduced from 3s for faster exploration
         self.ever_had_frontiers = False
@@ -327,6 +346,9 @@ class ExplorationCoordinator(Node):
         self.mapped_area_series = []
         self.last_mapped_area_m2 = 0.0
         self.last_percent_known = 0.0
+        self.robot_path_series = []          # list of (elapsed_s, x, y)
+        self.last_recorded_path_x = None    # last recorded x for distance check
+        self.last_recorded_path_y = None    # last recorded y for distance check
         
         # EXPLORATION TRACKING - ensure bot actually explores area
         self.goals_reached = 0              # Track how many goals actually reached
@@ -690,7 +712,7 @@ class ExplorationCoordinator(Node):
         front_hit_count = 0
         rear_hit_count = 0
         for i, distance in enumerate(msg.ranges):
-            if distance < msg.range_min or distance > msg.range_max:
+            if distance <= max(msg.range_min, self.scan_min_range) or distance > msg.range_max:
                 continue
             
             angle = angle_min + i * angle_increment
@@ -782,6 +804,14 @@ class ExplorationCoordinator(Node):
             self.obstacle_detected = True
             if self.lidar_backup_on_obstacle:
                 self.lidar_backup_until = now + self.backup_time
+            # Track how long a STATIC obstacle has been present (for deep escape)
+            if obstacle_type == "static":
+                if self.static_stuck_start == 0.0:
+                    self.static_stuck_start = now
+            else:
+                # Dynamic obstacle → reset stuck timer
+                self.static_stuck_start = 0.0
+                self.static_stuck_escape_active = False
         elif self.use_lidar_obstacle:
             if min_front_distance < float('inf'):
                 self.last_lidar_front_distance = min_front_distance
@@ -791,6 +821,9 @@ class ExplorationCoordinator(Node):
                 self.obstacle_detected = False
             if self.front_obstacle_detected and (time.time() - self.last_front_obstacle_time) >= self.obstacle_hold_time:
                 self.front_obstacle_detected = False
+            # Front cleared → reset static stuck state
+            self.static_stuck_start = 0.0
+            self.static_stuck_escape_active = False
 
     def scan_raw_cb(self, msg: LaserScan):
         """Track raw scan timing for startup readiness"""
@@ -946,6 +979,7 @@ class ExplorationCoordinator(Node):
             self.robot_pose = (x, y, 0.0)
             self.pose_valid = True
             self._update_pose_stale_state(x, y, tf.header.stamp)
+            self._record_path_point(x, y)
             
             # Warn if pose remains near origin while odom is updating (throttled)
             if abs(x) < 0.01 and abs(y) < 0.01:
@@ -971,6 +1005,7 @@ class ExplorationCoordinator(Node):
                 self.robot_pose = (x, y, 0.0)
                 self.pose_valid = True
                 self._update_pose_stale_state(x, y, tf.header.stamp)
+                self._record_path_point(x, y)
             except Exception as e2:
                 self.pose_valid = False
                 # Log TF errors to debug localization issues (throttled to avoid spam)
@@ -1658,6 +1693,10 @@ class ExplorationCoordinator(Node):
                 self.current_phase = Phase.RECOVERY
                 self.stuck_recovery_in_progress = True
                 self.recovery_start_time = time.time()
+            else:
+                # Clear global costmap immediately so the next plan doesn't hit lethal space
+                self._clear_costmaps('aborted_planning_failure')
+                self._maybe_lethal_escape(robot_x, robot_y)
         elif result.status == 6:  # CANCELED
             self.get_logger().warn(f"⚠️ Navigation canceled at ({robot_x:.2f}, {robot_y:.2f})")
             if self.last_goal_target is not None and self.strict_no_revisit:
@@ -1667,9 +1706,30 @@ class ExplorationCoordinator(Node):
                 self.get_logger().warn(f"🚧 Goal canceled with obstacle present - will wait for obstacle handling")
                 # Don't immediately retry - let obstacle handling run
             else:
-                # No obstacle - safe to try new frontier immediately
-                self.get_logger().warn(f"🔄 Goal canceled but path clear - will try new frontier immediately")
+                # No obstacle and not an intentional replan cancel → treat as a planning failure.
+                # bt_navigator sends CANCELED (not ABORTED) when SmacPlanner exhausts iterations,
+                # so if we don't count this the failure counter stays 0 forever and we loop endlessly.
+                self.consecutive_failures += 1
+                self.get_logger().warn(
+                    f"🔄 Goal canceled (no obstacle) — treating as planning failure "
+                    f"#{self.consecutive_failures}/{self.max_consecutive_failures}"
+                )
+                # Blacklist this goal so we don't immediately re-send the same unreachable frontier
+                if self.last_goal_target is not None:
+                    self._blacklist_goal(self.last_goal_target)
                 self.last_goal_time = 0.0
+
+                if self.consecutive_failures >= self.max_consecutive_failures:
+                    self.get_logger().error(
+                        f"🚨 STUCK DETECTED! {self.consecutive_failures} consecutive planning failures — entering RECOVERY mode"
+                    )
+                    self.current_phase = Phase.RECOVERY
+                    self.stuck_recovery_in_progress = True
+                    self.recovery_start_time = time.time()
+                else:
+                    # Clear global costmap immediately so the next plan doesn't hit lethal space
+                    self._clear_costmaps('canceled_planning_failure')
+                    self._maybe_lethal_escape(robot_x, robot_y)
         else:
             self.get_logger().warn(f"⚠️ Navigation ended with status: {result.status} at ({robot_x:.2f}, {robot_y:.2f})")
 
@@ -1695,13 +1755,54 @@ class ExplorationCoordinator(Node):
                 self.get_logger().warn(f"🧹 Requested local costmap clear ({reason})")
             except Exception as e:
                 self.get_logger().warn(f"⚠️ Local costmap clear failed ({reason}): {e}")
-        if self.clear_global_costmap_client.service_is_ready():
+        # NOTE: global costmap is NOT cleared here — nav2 handles lethal-start via
+        # footprint_clearing_enabled: true in nav2_params.yaml (global_costmap section).
+        # Clearing the global costmap would wipe the static_layer and cause 2s repopulate lag.
+
+    def _maybe_lethal_escape(self, robot_x: float, robot_y: float):
+        """Track same-position failures; fire a physical backup escape when stuck in lethal space."""
+        if self._lethal_fail_pos is not None:
+            dx = robot_x - self._lethal_fail_pos[0]
+            dy = robot_y - self._lethal_fail_pos[1]
+            if math.sqrt(dx * dx + dy * dy) < 0.25:
+                self._lethal_fail_count += 1
+            else:
+                self._lethal_fail_count = 1
+        else:
+            self._lethal_fail_count = 1
+        self._lethal_fail_pos = (robot_x, robot_y)
+        if self._lethal_fail_count >= 2:
+            self._fire_lethal_escape()
+
+    def _fire_lethal_escape(self):
+        """Physically back up the robot to move out of lethal space on the global costmap."""
+        import threading
+        self.get_logger().warn(
+            f"🏃 Lethal-space escape: {self._lethal_fail_count} consecutive failures "
+            f"at same position ({self._lethal_fail_pos[0]:.2f}, {self._lethal_fail_pos[1]:.2f}) "
+            f"— backing up to escape lethal costmap cell"
+        )
+        self._lethal_fail_count = 0
+        self._lethal_fail_pos = None
+        # Block goal sending for 4 s while we physically move
+        self.last_goal_time = time.time() + 4.0
+
+        def _backup_thread():
             try:
-                self.clear_global_costmap_client.call_async(req)
-                self.get_logger().warn(f"🧹 Requested global costmap clear ({reason})")
-            except Exception as e:
-                self.get_logger().warn(f"⚠️ Global costmap clear failed ({reason}): {e}")
-    
+                msg = Twist()
+                msg.linear.x = -0.15
+                end_t = time.time() + 2.0
+                while time.time() < end_t:
+                    self.cmd_vel_pub.publish(msg)
+                    time.sleep(0.1)
+                stop = Twist()
+                self.cmd_vel_pub.publish(stop)
+                self.get_logger().info("✅ Lethal-space backup complete")
+            except Exception as exc:
+                self.get_logger().warn(f"⚠️ Lethal escape thread error: {exc}")
+
+        threading.Thread(target=_backup_thread, daemon=True).start()
+
     def emergency_backup(self):
         """Obstacle detected - move backward while scanning for clear path"""
         self.get_logger().error(f"🚨 OBSTACLE at {self.obstacle_distance_m:.3f}m - BACKING UP + SCANNING!")
@@ -2027,9 +2128,80 @@ class ExplorationCoordinator(Node):
                 self.current_phase = Phase.OBSTACLE
                 self.phase_start_time = time.time()
                 return
-            
-            # Rate limit frontier checks to avoid spamming at 20Hz
+
             now = time.time()
+
+            # ── Static-obstacle deep escape (NOT rate-limited — runs every loop tick) ──
+            # If a STATIC obstacle has blocked the front for > trigger_time seconds the
+            # normal spin recovery has clearly failed.  Execute: backup → turn → resume.
+            static_stuck_duration = (now - self.static_stuck_start) if self.static_stuck_start > 0.0 else 0.0
+            if static_stuck_duration >= self.static_stuck_trigger_time:
+                if not self.static_stuck_escape_active:
+                    self.static_stuck_escape_active = True
+                    self.static_stuck_escape_step = 0
+                    self.static_stuck_escape_step_start = now
+                    self.static_stuck_escape_attempts += 1
+                    self.static_stuck_escape_turn_dir = (
+                        1.0 if (self.static_stuck_escape_attempts % 2 == 1) else -1.0
+                    )
+                    self.get_logger().error(
+                        f"🆘 Static obstacle stuck {static_stuck_duration:.1f}s — "
+                        f"deep escape #{self.static_stuck_escape_attempts} "
+                        f"({'LEFT' if self.static_stuck_escape_turn_dir > 0 else 'RIGHT'})"
+                    )
+                    # Blacklist the Nav2 goal that brought us near this wall
+                    if self.last_goal_target is not None:
+                        self._blacklist_goal(self.last_goal_target)
+                    # Blacklist robot's current stuck position so nearby frontiers are skipped
+                    self.update_pose()
+                    if self.pose_valid:
+                        stuck_key = (round(self.robot_pose[0], 2), round(self.robot_pose[1], 2))
+                        self._blacklist_goal(stuck_key)
+                        self.get_logger().warn(
+                            f"⚠️ Blacklisting stuck position ({stuck_key[0]:.2f}, {stuck_key[1]:.2f}) "
+                            f"for {self.blacklist_duration:.0f}s"
+                        )
+                    # Cancel any active Nav2 goal and corner recovery spin
+                    try:
+                        if self.goal_handle is not None:
+                            self.goal_handle.cancel_goal_async()
+                            self.goal_handle = None
+                            self.goal_in_progress = False
+                    except Exception:
+                        pass
+                    self.corner_recovery_until = 0.0
+
+            if self.static_stuck_escape_active:
+                step_elapsed = now - self.static_stuck_escape_step_start
+                escape_msg = Twist()
+                if self.static_stuck_escape_step == 0:
+                    # Step 0: back away from the wall
+                    if step_elapsed < self.static_stuck_escape_backup_dur:
+                        escape_msg.linear.x = self.backup_speed  # negative = backward
+                        self.cmd_vel_pub.publish(escape_msg)
+                        return
+                    else:
+                        self.static_stuck_escape_step = 1
+                        self.static_stuck_escape_step_start = now
+                        step_elapsed = 0.0
+                if self.static_stuck_escape_step == 1:
+                    # Step 1: rotate to a new heading
+                    if step_elapsed < self.static_stuck_escape_turn_dur:
+                        escape_msg.angular.z = (
+                            self.static_stuck_escape_turn_dir * self.corner_recovery_turn_speed
+                        )
+                        self.cmd_vel_pub.publish(escape_msg)
+                        return
+                    else:
+                        # Escape complete — reset state and resume frontier exploration
+                        self.static_stuck_escape_active = False
+                        self.static_stuck_start = 0.0
+                        self.no_frontier_cycles = 0
+                        self.last_goal_time = 0.0   # allow immediate goal pick
+                        self.get_logger().warn("✅ Deep escape complete — resuming exploration")
+                        return
+
+            # Rate limit frontier checks to avoid spamming at 20Hz
             if now - self.last_explore_check < self.explore_check_interval:
                 return  # Skip this cycle
             self.last_explore_check = now
@@ -2426,6 +2598,7 @@ class ExplorationCoordinator(Node):
             self.complete_marker_sent = True
         self.get_logger().info(f"🗺️ Map completion: {self.last_percent_known:.2f}% of the map explored.")
         self._save_mapped_area_series()
+        self._save_robot_path_series()
         # Save map then shut down
         self._save_and_shutdown()
 
@@ -2483,6 +2656,41 @@ class ExplorationCoordinator(Node):
             self.get_logger().info(f"📈 Mapped area data saved to {out_path}")
         except Exception as e:
             self.get_logger().error(f"❌ Failed to save mapped area data: {e}")
+
+    def _record_path_point(self, x: float, y: float):
+        """Record robot position when it has moved at least path_record_min_dist metres."""
+        min_dist = getattr(self, '_path_record_min_dist_val', None)
+        if min_dist is None:
+            try:
+                min_dist = self.get_parameter('path_record_min_dist').value
+            except Exception:
+                min_dist = 0.2
+            self._path_record_min_dist_val = min_dist
+        lx = self.last_recorded_path_x
+        ly = self.last_recorded_path_y
+        if lx is None or ((x - lx) ** 2 + (y - ly) ** 2) >= min_dist ** 2:
+            elapsed = time.time() - self.startup_time
+            self.robot_path_series.append((elapsed, x, y))
+            self.last_recorded_path_x = x
+            self.last_recorded_path_y = y
+
+    def _save_robot_path_series(self):
+        """Save the robot's visited waypoints to CSV."""
+        if not self.robot_path_series:
+            self.get_logger().warn('⚠️ No robot path data to save')
+            return
+        os.makedirs(self.map_save_dir, exist_ok=True)
+        path_file = getattr(self, 'robot_path_file', 'auto_explore_path.csv')
+        out_path = os.path.join(self.map_save_dir, path_file)
+        try:
+            with open(out_path, 'w', encoding='ascii') as f:
+                f.write('elapsed_s,x_m,y_m\n')
+                for row in self.robot_path_series:
+                    f.write(f"{row[0]:.2f},{row[1]:.4f},{row[2]:.4f}\n")
+            self.get_logger().info(
+                f"🗺️ Robot path saved: {len(self.robot_path_series)} waypoints → {out_path}")
+        except Exception as e:
+            self.get_logger().error(f"❌ Failed to save robot path: {e}")
 
     def _publish_complete_marker(self):
         marker = Marker()

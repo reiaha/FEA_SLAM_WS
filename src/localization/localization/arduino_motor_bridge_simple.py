@@ -64,12 +64,13 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('rear_backup_min_distance', 0.30)
         self.declare_parameter('rear_stop_hold_time', 0.6)
         self.declare_parameter('rear_block_min_hits', 3)
-        self.declare_parameter('front_stop_distance', 0.80)
+        self.declare_parameter('scan_min_range', 0.27)       # m: ignore readings closer than this (filters self-hits)
+        self.declare_parameter('front_stop_distance', 0.50)
         self.declare_parameter('front_stop_hold_time', 0.6)
         self.declare_parameter('any_obstacle_stop_distance', 0.20)
         self.declare_parameter('any_obstacle_stop_hold_time', 0.5)
-        self.declare_parameter('front_block_min_hits', 4)
-        self.declare_parameter('any_obstacle_min_hits', 6)
+        self.declare_parameter('front_block_min_hits', 1)
+        self.declare_parameter('any_obstacle_min_hits', 2)
         self.declare_parameter('scan_stale_timeout', 1.2)
         self.declare_parameter('flip_guard_time', 0.15)
         self.declare_parameter('wall_debug_log_interval', 1.0)
@@ -155,6 +156,7 @@ class ArduinoMotorBridge(Node):
         self.rear_backup_min_distance = float(self.get_parameter('rear_backup_min_distance').value)
         self.rear_stop_hold_time = float(self.get_parameter('rear_stop_hold_time').value)
         self.rear_block_min_hits = int(self.get_parameter('rear_block_min_hits').value)
+        self.scan_min_range = float(self.get_parameter('scan_min_range').value)
         self.front_stop_distance = float(self.get_parameter('front_stop_distance').value)
         self.front_stop_hold_time = float(self.get_parameter('front_stop_hold_time').value)
         self.any_obstacle_stop_distance = float(self.get_parameter('any_obstacle_stop_distance').value)
@@ -316,6 +318,8 @@ class ArduinoMotorBridge(Node):
         self.last_front_distance = float('inf')
         self.any_obstacle_blocked_until = 0.0
         self.last_any_obstacle_distance = float('inf')
+        self.spin_only_start = 0.0        # tracks start of spin-only (rotate, no backup) escape
+        self.spin_escape_timeout = 8.0    # seconds of continuous spin before forcing a backup
         self.last_rear_block_log_time = 0.0
         self.rear_block_log_interval = 1.0
         self.last_front_block_log_time = 0.0
@@ -337,8 +341,24 @@ class ArduinoMotorBridge(Node):
         self.last_odom_feedback_gate_log_time = 0.0
         self.odom_feedback_gate_log_interval = 1.0
 
+        # Motion-oscillation detector: fires when the robot cycles FORWARD/TURN ↔ STOPPED
+        # repeatedly without making progress (e.g. stuck against a wall the planner can't resolve).
+        from collections import deque
+        self._motion_state_history = deque()  # (timestamp, state_str)
+        self._osc_window_sec   = 15.0   # rolling window to count oscillations
+        self._osc_trip_count   = 5      # flip transitions to trigger escape
+        self._osc_escape_until = 0.0    # wall-clock time until next allowed check
+        self._osc_escape_backup_dur = 2.0
+        self._osc_escape_turn_dur   = 3.0
+        self._osc_escape_active     = False
+        self._osc_escape_step       = 0   # 0=backup, 1=turn
+        self._osc_escape_step_start = 0.0
+        self._osc_escape_turn_dir   = 1.0
+
         if self.enable_stuck_recovery:
             self.create_timer(0.1, self._stuck_recovery_loop)
+        # Oscillation escape step updater (runs every 0.1s regardless of stuck_recovery flag)
+        self.create_timer(0.1, self._osc_escape_step_loop)
 
         # Safety stop override loop (ultrasonic emergency)
         self.create_timer(0.05, self._safety_override_loop)
@@ -409,6 +429,10 @@ class ArduinoMotorBridge(Node):
         if self.stuck_recovery_active:
             return
 
+        # Oscillation deep-escape: robot is cycling FORWARD↔STOPPED so supersede normal cmd_vel
+        if self._osc_escape_active:
+            return
+
         # Any /cmd_vel message takes priority for a short window
         self.cmd_vel_override_until = time.time() + self.cmd_vel_override_duration
         
@@ -473,68 +497,65 @@ class ArduinoMotorBridge(Node):
             math.isfinite(self.last_rear_distance) and
             (self.last_rear_distance > self.rear_backup_min_distance)
         )
-        if (not scan_stale) and self._front_blocked() and linear > 0.0:
-            if self._rear_blocked():
-                # Front and rear blocked: allow in-place turning instead of backing up.
-                linear = 0.0
-                if now - self.last_front_block_log_time >= self.rear_block_log_interval:
-                    self.last_front_block_log_time = now
-                    self.get_logger().warn(
-                        f"🌀 Front+rear blocked (front {self.last_front_distance:.2f}m, "
-                        f"rear {self.last_rear_distance:.2f}m); allowing turn only"
-                    )
-            elif abs(angular) > self.angular_deadband and can_front_backup:
-                # Back away from front obstacle while preserving turn direction.
-                linear = -abs(self.front_obstacle_backup_speed_mps)
-                angular *= self.front_obstacle_backup_turn_scale
-                if now - self.last_front_block_log_time >= self.rear_block_log_interval:
-                    self.last_front_block_log_time = now
-                    self.get_logger().warn(
-                        f"⬇️ Front blocked at {self.last_front_distance:.2f}m; backing while turning"
-                    )
-            else:
-                # Default escape: back away if rear is clear, else rotate in place.
-                angular = self._select_escape_turn(angular)
-                if can_front_backup:
-                    linear = -abs(self.front_obstacle_backup_speed_mps)
-                    angular *= self.front_obstacle_backup_turn_scale
-                    auto_backup = True
-                else:
-                    linear = 0.0
-                if now - self.last_front_block_log_time >= self.rear_block_log_interval:
-                    self.last_front_block_log_time = now
-                    self.get_logger().warn(
-                        f"⬇️ Front blocked at {self.last_front_distance:.2f}m; {'backing off' if can_front_backup else 'rotate-only'}"
-                    )
 
-        # Any-angle near-field safety gate: stop forward if anything is dangerously close,
-        # even when front/rear sector classification is imperfect.
-        if linear > 0.0 and self._any_obstacle_blocked():
-            angular = self._select_escape_turn(angular)
-            if can_front_backup:
-                linear = -abs(self.front_obstacle_backup_speed_mps)
-                angular *= self.front_obstacle_backup_turn_scale
-            else:
-                linear = 0.0
+        # Pre-compute obstacle flags so every branch uses the same snapshot.
+        front_blocked  = (not scan_stale) and self._front_blocked()
+        any_blocked    = self._any_obstacle_blocked()
+        spin_timeout_exceeded = (
+            self.spin_only_start > 0.0 and
+            (now - self.spin_only_start) >= self.spin_escape_timeout
+        )
+
+        # ── Single obstacle gate: exactly one branch executes ─────────────────
+        if linear > 0.0 and front_blocked and self._rear_blocked():
+            # Case 1 — sandwiched: front AND rear blocked → turn only, no movement
+            linear = 0.0
             if now - self.last_front_block_log_time >= self.rear_block_log_interval:
                 self.last_front_block_log_time = now
                 self.get_logger().warn(
-                    f"🛑 Forward blocked by near obstacle at {self.last_any_obstacle_distance:.2f}m (any-angle gate, {'backup' if can_front_backup else 'rotate'})"
+                    f"🌀 Front+rear blocked (front {self.last_front_distance:.2f}m, "
+                    f"rear {self.last_rear_distance:.2f}m); allowing turn only"
                 )
 
-        # Hard safety gate: if front obstacle is latched, never allow forward command.
-        if linear > 0.0 and self._front_blocked():
-            angular = self._select_escape_turn(angular)
-            if can_front_backup:
-                linear = -abs(self.front_obstacle_backup_speed_mps)
-                angular *= self.front_obstacle_backup_turn_scale
-            else:
-                linear = 0.0
+        elif linear > 0.0 and front_blocked and abs(angular) > self.angular_deadband and can_front_backup:
+            # Case 2 — front blocked, Nav2 already turning → back while preserving turn direction
+            linear = -abs(self.front_obstacle_backup_speed_mps)
+            angular *= self.front_obstacle_backup_turn_scale
+            self.spin_only_start = 0.0
             if now - self.last_front_block_log_time >= self.rear_block_log_interval:
                 self.last_front_block_log_time = now
                 self.get_logger().warn(
-                    f"🛑 Forward blocked by latched front obstacle at {self.last_front_distance:.2f}m ({'backup' if can_front_backup else 'rotate'})"
+                    f"⬇️ Front blocked at {self.last_front_distance:.2f}m; backing while turning"
                 )
+
+        elif linear > 0.0 and (front_blocked or any_blocked or spin_timeout_exceeded):
+            # Case 3 — front blocked / any-angle near-field hit / stuck spinning too long → escape
+            angular = self._select_escape_turn(angular)
+            if can_front_backup or spin_timeout_exceeded:
+                linear = -abs(self.front_obstacle_backup_speed_mps)
+                angular *= self.front_obstacle_backup_turn_scale
+                auto_backup = True
+                if spin_timeout_exceeded:
+                    self.spin_only_start = 0.0
+                    self.get_logger().warn(
+                        f"🔀 Spin-escape: forced backup after {self.spin_escape_timeout:.0f}s of rotation"
+                    )
+            else:
+                linear = 0.0
+                if self.spin_only_start == 0.0:
+                    self.spin_only_start = now
+            dist_str = (f"{self.last_front_distance:.2f}m" if front_blocked
+                        else f"{self.last_any_obstacle_distance:.2f}m")
+            if now - self.last_front_block_log_time >= self.rear_block_log_interval:
+                self.last_front_block_log_time = now
+                self.get_logger().warn(
+                    f"⬇️ Obstacle at {dist_str}; "
+                    f"{'backing off' if (can_front_backup or spin_timeout_exceeded) else 'rotate-only'}"
+                )
+
+        else:
+            # Case 4 — path clear: reset spin timer
+            self.spin_only_start = 0.0
 
         if linear < 0.0 and (now - self.last_wall_debug_log_time) >= self.wall_debug_log_interval:
             self.last_wall_debug_log_time = now
@@ -658,8 +679,85 @@ class ArduinoMotorBridge(Node):
         self.last_cmd_pwm_left = pwm_left
         self.last_cmd_pwm_right = pwm_right
         self.last_cmd_time = time.time()
-        
+
         self._send_motor_pwm(pwm_left, pwm_right, source=source)
+        self._track_motion_oscillation(pwm_left, pwm_right)
+
+    def _classify_motion(self, pwm_left, pwm_right) -> str:
+        db = self.min_pwm
+        fwd  = pwm_left  > db and pwm_right > db
+        back = pwm_left  < -db and pwm_right < -db
+        turn = (pwm_left > db and pwm_right < -db) or (pwm_left < -db and pwm_right > db)
+        if fwd:   return 'FORWARD'
+        if back:  return 'BACKWARD'
+        if turn:  return 'TURN'
+        return 'STOPPED'
+
+    def _track_motion_oscillation(self, pwm_left, pwm_right):
+        """Detect motor stuck in FORWARD/TURN ↔ STOPPED oscillation and fire a deep escape."""
+        now  = time.time()
+
+        # Don't re-trigger during escape cooldown
+        if now < self._osc_escape_until:
+            return
+
+        state = self._classify_motion(pwm_left, pwm_right)
+
+        # Prune old entries outside the rolling window
+        cutoff = now - self._osc_window_sec
+        while self._motion_state_history and self._motion_state_history[0][0] < cutoff:
+            self._motion_state_history.popleft()
+
+        # Append current state
+        self._motion_state_history.append((now, state))
+
+        # Count STOPPED↔non-STOPPED transitions in the window
+        transitions = 0
+        prev = None
+        for _, s in self._motion_state_history:
+            if prev is not None:
+                was_moving = prev  != 'STOPPED'
+                is_moving  = s     != 'STOPPED'
+                if was_moving != is_moving:
+                    transitions += 1
+            prev = s
+
+        # Also require that BACKWARD is NOT dominant (robot is already escaping fine)
+        backward_count = sum(1 for _, s in self._motion_state_history if s == 'BACKWARD')
+        history_len = len(self._motion_state_history)
+        if history_len == 0:
+            return
+        backward_ratio = backward_count / history_len
+
+        if transitions >= self._osc_trip_count and backward_ratio < 0.2:
+            self.get_logger().warn(
+                f"🔁 Motion oscillation detected: {transitions} STOP↔MOVE flips "
+                f"in {self._osc_window_sec:.0f}s — firing deep escape"
+            )
+            self._oscillation_escape()
+
+    def _oscillation_escape(self):
+        """Deep escape when robot is oscillating FORWARD/TURN ↔ STOPPED.
+        Backs up longer and turns further than the normal front-obstacle escape."""
+        back_pwm = max(0, min(255, abs(self.fixed_pwm_backward)))
+        # Step 1: backup for _osc_escape_backup_dur seconds
+        self.cmd_vel_override_until = time.time() + self._osc_escape_backup_dur + self._osc_escape_turn_dur + 0.5
+        self._osc_escape_active     = True
+        self._osc_escape_step       = 0
+        self._osc_escape_step_start = time.time()
+        self._osc_escape_turn_dir   = self.escape_turn_dir  # use current oscillating escape dir
+        self.escape_turn_dir       *= -1.0  # alternate for next call
+        # Send first command immediately
+        self._send_motor_pwm(-back_pwm, -back_pwm, source='osc_escape_backup')
+        # Schedule the turn step via the stuck-recovery timer (0.1s tick)
+        self._osc_escape_until = time.time() + self._osc_window_sec  # cooldown
+        # Clear history so we don't re-trigger right after
+        self._motion_state_history.clear()
+        # Log
+        self.get_logger().warn(
+            f"🆘 Oscillation escape: backing up {self._osc_escape_backup_dur:.1f}s "
+            f"then turning {self._osc_escape_turn_dur:.1f}s"
+        )
 
     def cmd_vel_nav_cb(self, msg: Twist):
         """Handle cmd_vel_nav only when no override is active"""
@@ -676,9 +774,10 @@ class ArduinoMotorBridge(Node):
         front_hit_count = 0
         rear_hit_count = 0
         any_hit_count = 0
+        effective_min_range = max(msg.range_min, self.scan_min_range)
         angle = msg.angle_min
         for distance in msg.ranges:
-            if distance < msg.range_min or distance > msg.range_max:
+            if distance <= effective_min_range or distance > msg.range_max:
                 angle += msg.angle_increment
                 continue
             if distance < min_any:
@@ -700,24 +799,63 @@ class ArduinoMotorBridge(Node):
                     rear_hit_count += 1
             angle += msg.angle_increment
 
+        newly_blocked = False
         if min_front < float('inf'):
             self.last_front_distance = min_front
             if min_front <= self.front_stop_distance and front_hit_count >= max(1, self.front_block_min_hits):
                 self.front_blocked_until = now + self.front_stop_hold_time
+                newly_blocked = True
 
         if min_rear < float('inf'):
             self.last_rear_distance = min_rear
             if min_rear <= self.rear_stop_distance and rear_hit_count >= max(1, self.rear_block_min_hits):
                 self.rear_blocked_until = now + self.rear_stop_hold_time
+                newly_blocked = True
+        else:
+            # No LiDAR hits in rear zone → rear is open/clear.
+            # Use range_max as a sentinel so backward-suppression logic treats
+            # this as a *known* safe distance (inf is not finite → rear_known=False).
+            self.last_rear_distance = msg.range_max
 
         if min_any < float('inf'):
             self.last_any_obstacle_distance = min_any
             if min_any <= self.any_obstacle_stop_distance and any_hit_count >= max(1, self.any_obstacle_min_hits):
                 self.any_obstacle_blocked_until = now + self.any_obstacle_stop_hold_time
+                newly_blocked = True
 
         if self.swap_lidar_front_back:
             self.last_front_distance, self.last_rear_distance = self.last_rear_distance, self.last_front_distance
             self.front_blocked_until, self.rear_blocked_until = self.rear_blocked_until, self.front_blocked_until
+
+        # Immediate reaction: when front is newly blocked while moving forward,
+        # start backing up right now — don't wait for Nav2's next cmd_vel cycle.
+        if newly_blocked:
+            was_forward = (self.last_cmd_pwm_left > 0 and self.last_cmd_pwm_right > 0)
+            front_just_blocked = (now < self.front_blocked_until) and (min_front <= self.front_stop_distance)
+            if front_just_blocked and was_forward and not self.safety_override_active and not self.stuck_recovery_active:
+                self._fire_obstacle_escape()
+            else:
+                self._send_motor_pwm(0, 0, source='scan')
+
+    def _fire_obstacle_escape(self):
+        """Immediately drive backward when a front obstacle is detected while moving forward.
+        Bypasses the Nav2 cmd_vel cycle so reaction is instant (bounded only by scan rate)."""
+        back_pwm = max(0, min(255, abs(self.fixed_pwm_backward)))
+        turn_pwm = max(0, min(255, abs(self.fixed_pwm_turn)))
+        escape_dir = self._select_escape_turn(0.0)   # pick a turn direction
+        if escape_dir > 0.0:                          # backing left
+            pwm_left  = -turn_pwm
+            pwm_right = -back_pwm
+        else:                                          # backing right
+            pwm_left  = -back_pwm
+            pwm_right = -turn_pwm
+        # Hold the override window so the next nav cmd_vel cannot re-accelerate forward
+        # before the front_blocked latch clears naturally.
+        self.cmd_vel_override_until = time.time() + self.front_stop_hold_time
+        self._send_motor_pwm(pwm_left, pwm_right, source='scan_escape')
+        self.get_logger().info(
+            f"⚡ Immediate escape: front={self.last_front_distance:.2f}m — backing away now"
+        )
 
     def _rear_blocked(self) -> bool:
         return time.time() < self.rear_blocked_until
@@ -991,6 +1129,38 @@ class ArduinoMotorBridge(Node):
                     self.last_motor_log_cmd = cmd_key
         except Exception as e:
             self.get_logger().error(f'Serial write error: {e}')
+
+    def _osc_escape_step_loop(self):
+        """Timer callback (10 Hz) that drives the backup→turn sequence of an oscillation escape."""
+        if not self._osc_escape_active:
+            return
+        now  = time.time()
+        back_pwm = max(0, min(255, abs(self.fixed_pwm_backward)))
+        turn_pwm = max(0, min(255, abs(self.fixed_pwm_turn)))
+
+        if self._osc_escape_step == 0:  # BACKUP phase
+            if now - self._osc_escape_step_start < self._osc_escape_backup_dur:
+                self._send_motor_pwm(-back_pwm, -back_pwm, source='osc_backup')
+            else:
+                # Transition to TURN phase
+                self._osc_escape_step       = 1
+                self._osc_escape_step_start = now
+                if self._osc_escape_turn_dir > 0:
+                    self._send_motor_pwm(-turn_pwm, turn_pwm, source='osc_turn')
+                else:
+                    self._send_motor_pwm(turn_pwm, -turn_pwm, source='osc_turn')
+        elif self._osc_escape_step == 1:  # TURN phase
+            if now - self._osc_escape_step_start < self._osc_escape_turn_dur:
+                if self._osc_escape_turn_dir > 0:
+                    self._send_motor_pwm(-turn_pwm, turn_pwm, source='osc_turn')
+                else:
+                    self._send_motor_pwm(turn_pwm, -turn_pwm, source='osc_turn')
+            else:
+                # Escape done
+                self._osc_escape_active = False
+                self.cmd_vel_override_until = 0.0
+                self._send_motor_pwm(0, 0, source='osc_done')
+                self.get_logger().info("✅ Oscillation escape complete — resuming normal control")
 
     def _stuck_recovery_loop(self):
         if self.ser is None:
