@@ -51,7 +51,8 @@ class BootstrapMover(Node):
         self.cmd_vel_pub.publish(twist)
         self.get_logger().info('Rotation complete - stopped')
 
-def main():
+def main():rhea
+
     rclpy.init()
     node = BootstrapMover()
     
