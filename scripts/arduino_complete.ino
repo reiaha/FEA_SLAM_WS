@@ -1,7 +1,6 @@
 #include <Wire.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
-#include <Servo.h>
 
 
 #define MIN_SPEED       0
@@ -10,36 +9,28 @@
 #define BACKWARD_SPEED  200
 #define TURN_SPEED      220
 
-#define SAFETY_STOP_CM      10.0  // Emergency stop at 10cm (ultrasonic only at close range)
-#define SAFETY_HIT_COUNT    3     // Require 3 consecutive hits to trigger
-#define SAFETY_CLEAR_COUNT  3     // Require 3 consecutive clears to reset
+#define SAFETY_STOP_CM      12.0
+#define SAFETY_HIT_COUNT    2     
+#define SAFETY_CLEAR_COUNT  3    
 
 Adafruit_MPU6050 mpu;
 
 // Calibrated offsets
 float gx_offset = -2.8;
 float gy_offset = -1.4;
-float gz_offset = -1.1;
+float gz_offset = 0.96;  // recalibrated: raw bias was -0.96 deg/s → offset +0.96 nulls it (measured 2026-03-10)
 float ax_offset = 0.0;
 float ay_offset = 0.0;
 float az_offset = 0.0;
 
-// Servo + Ultrasonic Pins
-const int SERVO_PIN = 10;
+// Ultrasonic Pins
 const int TRIG_PIN = A0;
 const int ECHO_PIN = A1;
-
-// Servo positions (degrees)
-#define SERVO_LEFT   110
-#define SERVO_CENTER 150
-#define SERVO_RIGHT  170
-Servo scan_servo;
-int servo_angle = SERVO_CENTER;
 
 // Motor Control Pins
 const int MOTOR_A_IN1 = 5;   
 const int MOTOR_A_IN2 = 4;  
-const int MOTOR_A_PWM = 6;   
+const int MOTOR_A_PWM = 6;
 const int MOTOR_B_IN1 = 7;  
 const int MOTOR_B_IN2 = 8;   
 const int MOTOR_B_PWM = 11; 
@@ -81,31 +72,61 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // Servo setup
-  scan_servo.attach(SERVO_PIN);
-  scan_servo.write(servo_angle);
+  // Timer2 (pin 11 = MOTOR_B_PWM): fast PWM, prescaler=1 → 62.5kHz
+  TCCR2B = (TCCR2B & 0b11111000) | 0x01;
 
   stopMotors();
 
-  // Initialize MPU6050
-  Serial.print("Initializing MPU6050...");
-  int retries = 3;
-  while (retries > 0 && !imu_initialized) {
-    if (mpu.begin()) {
-      mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
-      mpu.setGyroRange(MPU6050_RANGE_250_DEG);
-      mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-      imu_initialized = true;
-      Serial.println(" OK");
-    } else {
-      retries--;
-      Serial.print(".");
-      delay(500);
-    }
-  }
-  if (!imu_initialized) Serial.println(" FAILED - Motors still operational");
+  // Initialize I2C and MPU6050
+  Wire.begin();  // Explicit init: SDA=A4, SCL=A5 on Uno
+  delay(100);    // Let I2C bus settle
+  initMPU6050();
 
   Serial.println("IMU-Motor-Ultrasonic System Ready");
+}
+
+// Try to initialize MPU6050 — attempts address 0x68 first, then 0x69 (AD0 high)
+void initMPU6050() {
+  imu_initialized = false;
+  Serial.print("Initializing MPU6050...");
+
+  uint8_t addresses[] = {0x68, 0x69};
+  for (int a = 0; a < 2 && !imu_initialized; a++) {
+    for (int retry = 0; retry < 3 && !imu_initialized; retry++) {
+      if (mpu.begin(addresses[a])) {
+        mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+        mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+        mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+        imu_initialized = true;
+        Serial.print(" OK at 0x");
+        Serial.println(addresses[a], HEX);
+      } else {
+        Serial.print(".");
+        delay(500);
+      }
+    }
+  }
+  if (!imu_initialized) {
+    Serial.println(" FAILED - send REINIT_IMU to retry, or check SDA/SCL wiring");
+  }
+}
+
+// Scan I2C bus and print found addresses
+void i2cScan() {
+  Serial.println("I2C_SCAN:start");
+  int found = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err == 0) {
+      Serial.print("I2C_SCAN:found:0x");
+      Serial.println(addr, HEX);
+      found++;
+    }
+    delay(5);
+  }
+  if (found == 0) Serial.println("I2C_SCAN:none_found");
+  Serial.println("I2C_SCAN:done");
 }
 
 void loop() {
@@ -219,6 +240,10 @@ void setMotorB(int speed) {
 }
 
 void setMotors(int speedA, int speedB) {
+  // Always record the commanded speeds so the CSV feedback is accurate.
+  motorA_speed = constrain(speedA, -MAX_SPEED, MAX_SPEED);
+  motorB_speed = constrain(speedB, -MAX_SPEED, MAX_SPEED);
+
   if (!motors_enabled) {
     Serial.println("IGNORED: Motors disabled (send START)");
     return;
@@ -251,11 +276,7 @@ void turnRight(int speed) {
   Serial.print("Turning right at speed "); Serial.println(speed);
 }
 
-
 void processCommand(String cmd) {
-  cmd.trim();
-  
-  // Remove any carriage returns
   cmd.replace("\r", "");
   cmd.replace("\n", "");
 
@@ -272,26 +293,6 @@ void processCommand(String cmd) {
     Serial.flush();
     return;
   }
-  if (cmd.startsWith("SERVO:")) {
-    String arg = cmd.substring(6);
-    arg.trim();
-    if (arg == "LEFT") {
-      servo_angle = SERVO_LEFT;
-    } else if (arg == "CENTER") {
-      servo_angle = SERVO_CENTER;
-    } else if (arg == "RIGHT") {
-      servo_angle = SERVO_RIGHT;
-    } else {
-      int angle = arg.toInt();
-      servo_angle = constrain(angle, 0, 180);
-    }
-    scan_servo.write(servo_angle);
-    Serial.print("ACK:SERVO:");
-    Serial.println(servo_angle);
-    Serial.flush();
-    return;
-  }
-  
   // Check if motors are enabled for motor commands
   if (!motors_enabled && cmd.startsWith("MOTOR:")) {
     Serial.println("IGNORED: Motors disabled (send START)");
@@ -326,6 +327,23 @@ void processCommand(String cmd) {
   } else if (cmd.startsWith("RIGHT:")) {
     turnRight(TURN_SPEED);
     Serial.print("ACK:RIGHT:"); Serial.println(TURN_SPEED);
+    Serial.flush();
+  } else if (cmd == "REINIT_IMU") {
+    // Retry MPU6050 init without power cycling — useful when wiring was loose on boot
+    Wire.begin();
+    delay(100);
+    initMPU6050();
+    Serial.print("ACK:REINIT_IMU:");
+    Serial.println(imu_initialized ? "OK" : "FAILED");
+    Serial.flush();
+  } else if (cmd == "I2C_SCAN") {
+    // Scan I2C bus and report device addresses — helps diagnose MPU6050 wiring
+    i2cScan();
+    Serial.flush();
+  } else if (cmd.startsWith("AUTO:")) {
+    // AUTO:ON / AUTO:OFF — sent by ROS bridge to enable/disable onboard avoidance.
+    // This firmware delegates all avoidance to ROS; just acknowledge.
+    Serial.print("ACK:"); Serial.println(cmd);
     Serial.flush();
   }
 }

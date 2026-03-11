@@ -23,7 +23,8 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'map = visualization_pkg.map:main',  # Updated to map.py
+            'map = visualization_pkg.map:main',
+            'map_clean = visualization_pkg.map_clean:main',
         ],
     },
 )

@@ -18,7 +18,7 @@ class MapOdomFallback(Node):
 
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
-        self.declare_parameter('stop_when_map_tf', False)
+        self.declare_parameter('stop_when_map_tf', True)
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('map_fresh_timeout', 2.0)
         self.declare_parameter('publish_rate', 10.0)  # Hz

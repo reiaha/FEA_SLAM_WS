@@ -2,6 +2,7 @@
 
 import math
 import rclpy
+import rclpy.time
 from rclpy.node import Node
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
@@ -41,6 +42,7 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('angular_deadband', 0.05)
         self.declare_parameter('pwm_change_threshold', 8)
         self.declare_parameter('publish_odom', True)
+        self.declare_parameter('publish_tf', True)  # Set False when EKF publishes the odom->base_footprint TF
         self.declare_parameter('odom_rate', 50.0)
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_footprint')  # Changed from base_link to match Nav2
@@ -78,6 +80,7 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('escape_turn_speed', 0.6)
         self.declare_parameter('escape_turn_period', 2.0)
         self.declare_parameter('escape_turn_toggle_interval', 1.2)
+        self.declare_parameter('osc_escape_turn_dur', 3.0)  # set to 0.0 to disable turn phase (avoids SLAM scan gaps during spin)
         self.declare_parameter('turn_angular_scale', 0.75)
         self.declare_parameter('turn_pwm_limit', 125)
         self.declare_parameter('front_obstacle_backup_speed_mps', 0.12)
@@ -89,7 +92,11 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('zero_cmd_forward_pwm', 110)
         self.declare_parameter('allow_backward_when_rear_blocked', False)
         self.declare_parameter('require_nav2_active', True)
+        self.declare_parameter('require_active_goal', True)   # Stop motors when no active Nav2 goal
         self.declare_parameter('nav2_state_check_interval', 1.0)
+        self.declare_parameter('nav2_state_response_timeout', 2.5)
+        self.declare_parameter('nav2_inactive_confirm_sec', 6.0)
+        self.declare_parameter('nav2_allow_goal_override', True)
         self.declare_parameter('serial_reconnect_interval', 1.0)
         self.declare_parameter('serial_max_error_streak', 5)
         self.declare_parameter('serial_error_log_interval', 2.0)
@@ -97,6 +104,11 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('odom_feedback_gate_enabled', True)
         self.declare_parameter('odom_stationary_speed_threshold', 5.0)
         self.declare_parameter('odom_freeze_pose_when_stationary', True)
+        self.declare_parameter('use_imu_yaw_in_odom', True)  # False = cmd_vel dead-reckoning only (no IMU drift)
+        self.declare_parameter('imu_publish', True)          # Publish MPU6050 data from Arduino CSV to /imu/data_raw
+        self.declare_parameter('imu_rotated_180', False)     # True if MPU6050 is mounted 180° rotated (USB port faces rear) — negates angular.z, linear.x/y
+        self.declare_parameter('imu_gyro_scale', 0.017453)   # deg/s → rad/s (π/180). Adafruit lib returns deg/s, not raw LSB.
+        self.declare_parameter('imu_accel_scale', 1.0)        # already m/s². Adafruit lib converts raw LSB → m/s².
         
         serial_port = self.get_parameter('serial_port').value
         baud_rate = self.get_parameter('baud_rate').value
@@ -118,11 +130,15 @@ class ArduinoMotorBridge(Node):
         self.angular_deadband = float(self.get_parameter('angular_deadband').value)
         self.pwm_change_threshold = int(self.get_parameter('pwm_change_threshold').value)
         self.publish_odom = self.get_parameter('publish_odom').value
+        self.publish_tf = self.get_parameter('publish_tf').value
 
         # IMU orientation state
         self.imu_yaw = None
         self.imu_quat = None
         self.imu_last_stamp = None
+        self.imu_angular_vel_z = None  # raw gyro z (rad/s) — actual physical turn rate
+        self.imu_hardware_dead = False  # True when MPU6050 failed to init (all-zero stream)
+        self._imu_zero_streak = 0       # consecutive all-zero IMU reads
 
         # Subscribe to IMU
         from sensor_msgs.msg import Imu
@@ -170,6 +186,7 @@ class ArduinoMotorBridge(Node):
         self.escape_turn_speed = float(self.get_parameter('escape_turn_speed').value)
         self.escape_turn_period = float(self.get_parameter('escape_turn_period').value)
         self.escape_turn_toggle_interval = float(self.get_parameter('escape_turn_toggle_interval').value)
+        _osc_turn_dur_param = float(self.get_parameter('osc_escape_turn_dur').value)
         self.turn_angular_scale = float(self.get_parameter('turn_angular_scale').value)
         self.turn_pwm_limit = int(self.get_parameter('turn_pwm_limit').value)
         self.front_obstacle_backup_speed_mps = float(self.get_parameter('front_obstacle_backup_speed_mps').value)
@@ -181,14 +198,24 @@ class ArduinoMotorBridge(Node):
         self.zero_cmd_forward_pwm = int(self.get_parameter('zero_cmd_forward_pwm').value)
         self.allow_backward_when_rear_blocked = bool(self.get_parameter('allow_backward_when_rear_blocked').value)
         self.require_nav2_active = bool(self.get_parameter('require_nav2_active').value)
+        self.require_active_goal = bool(self.get_parameter('require_active_goal').value)
         self.nav2_state_check_interval = float(self.get_parameter('nav2_state_check_interval').value)
+        self.nav2_state_response_timeout = float(self.get_parameter('nav2_state_response_timeout').value)
+        self.nav2_inactive_confirm_sec = float(self.get_parameter('nav2_inactive_confirm_sec').value)
+        self.nav2_allow_goal_override = bool(self.get_parameter('nav2_allow_goal_override').value)
         self.serial_reconnect_interval = float(self.get_parameter('serial_reconnect_interval').value)
         self.serial_max_error_streak = int(self.get_parameter('serial_max_error_streak').value)
         self.serial_error_log_interval = float(self.get_parameter('serial_error_log_interval').value)
         self.motor_log_interval = float(self.get_parameter('motor_log_interval').value)
         self.odom_feedback_gate_enabled = bool(self.get_parameter('odom_feedback_gate_enabled').value)
+        self.use_imu_yaw_in_odom = bool(self.get_parameter('use_imu_yaw_in_odom').value)
+        self.imu_publish = bool(self.get_parameter('imu_publish').value)
+        self.imu_rotated_180 = bool(self.get_parameter('imu_rotated_180').value)
+        self.imu_gyro_scale = float(self.get_parameter('imu_gyro_scale').value)
+        self.imu_accel_scale = float(self.get_parameter('imu_accel_scale').value)
         self.odom_stationary_speed_threshold = float(self.get_parameter('odom_stationary_speed_threshold').value)
         self.odom_freeze_pose_when_stationary = bool(self.get_parameter('odom_freeze_pose_when_stationary').value)
+
         self.cmd_vel_override_duration = 0.2
         self.cmd_vel_override_until = 0.0
 
@@ -197,10 +224,15 @@ class ArduinoMotorBridge(Node):
         )
 
         self.nav2_ready = not self.require_nav2_active
+        self.has_active_goal = False
+        self.goal_cleared_at = 0.0          # time.time() when last goal cleared
+        self.goal_cleared_grace = 1.5       # seconds: allow cmd_vel after goal clears before blocking
+        self.last_goal_block_log_time = 0.0
+        self.goal_block_log_interval = 2.0
         self.nav2_state_log_interval = 2.0
         self.last_nav2_state_log_time = 0.0
         self.last_nav2_ready = self.nav2_ready
-        self.nav2_state_response_timeout = 1.0
+        self.nav2_not_ready_since = 0.0
         self.nav2_clients = {
             'controller_server': self.create_client(GetState, '/controller_server/get_state'),
             'planner_server': self.create_client(GetState, '/planner_server/get_state'),
@@ -271,9 +303,21 @@ class ArduinoMotorBridge(Node):
         self.create_subscription(Twist, '/cmd_vel_nav', self.cmd_vel_nav_cb, 10)
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
 
+        # Track active Nav2 goal via action status topic
+        from action_msgs.msg import GoalStatusArray
+        self.create_subscription(
+            GoalStatusArray,
+            '/navigate_to_pose/_action/status',
+            self._nav2_goal_status_cb,
+            10
+        )
+
         self.ultrasonic_pub = self.create_publisher(Float32, '/ultrasonic_distance', 10)
         self.ultrasonic_range_pub = self.create_publisher(Range, '/ultrasonic_range', 10)
         self.safety_stop_pub = self.create_publisher(Float32, '/safety_stop', 10)
+        from sensor_msgs.msg import Imu
+        self._Imu = Imu
+        self.imu_pub = self.create_publisher(Imu, '/imu/data_raw', 10) if self.imu_publish else None
 
         self.odom_pub = None
         self.tf_broadcaster = None
@@ -285,7 +329,8 @@ class ArduinoMotorBridge(Node):
 
         if self.publish_odom:
             self.odom_pub = self.create_publisher(Odometry, '/odom', 106)
-            self.tf_broadcaster = TransformBroadcaster(self)
+            if self.publish_tf:
+                self.tf_broadcaster = TransformBroadcaster(self)
             self.x = 0.0
             self.y = 0.0
             self.yaw = 0.0
@@ -319,7 +364,7 @@ class ArduinoMotorBridge(Node):
         self.any_obstacle_blocked_until = 0.0
         self.last_any_obstacle_distance = float('inf')
         self.spin_only_start = 0.0        # tracks start of spin-only (rotate, no backup) escape
-        self.spin_escape_timeout = 8.0    # seconds of continuous spin before forcing a backup
+        self.spin_escape_timeout = 4.0    # shorter spin timeout to avoid long noisy spin loops
         self.last_rear_block_log_time = 0.0
         self.rear_block_log_interval = 1.0
         self.last_front_block_log_time = 0.0
@@ -340,16 +385,17 @@ class ArduinoMotorBridge(Node):
         self.last_safety_stop_brake_time = 0.0
         self.last_odom_feedback_gate_log_time = 0.0
         self.odom_feedback_gate_log_interval = 1.0
+        self.last_imu_sign_mismatch_log_time = 0.0
 
         # Motion-oscillation detector: fires when the robot cycles FORWARD/TURN ↔ STOPPED
         # repeatedly without making progress (e.g. stuck against a wall the planner can't resolve).
         from collections import deque
         self._motion_state_history = deque()  # (timestamp, state_str)
-        self._osc_window_sec   = 15.0   # rolling window to count oscillations
-        self._osc_trip_count   = 5      # flip transitions to trigger escape
+        self._osc_window_sec   = 20.0   # rolling window to count oscillations
+        self._osc_trip_count   = 8      # require more flips before triggering deep escape
         self._osc_escape_until = 0.0    # wall-clock time until next allowed check
-        self._osc_escape_backup_dur = 2.0
-        self._osc_escape_turn_dur   = 3.0
+        self._osc_escape_backup_dur = 0.8
+        self._osc_escape_turn_dur   = _osc_turn_dur_param  # 0.0 = backup only, no spin
         self._osc_escape_active     = False
         self._osc_escape_step       = 0   # 0=backup, 1=turn
         self._osc_escape_step_start = 0.0
@@ -394,6 +440,12 @@ class ArduinoMotorBridge(Node):
         return False
 
     def imu_cb(self, msg):
+        # Always capture gyro angular velocity — this is the ACTUAL physical turn rate
+        # regardless of whether orientation (quaternion) is populated.
+        # Raw MPU6050 sets orientation_covariance[0]=-1 (no orientation) so quaternion is
+        # zero-norm. We still get valid gyro data on angular_velocity.z.
+        self.imu_angular_vel_z = msg.angular_velocity.z
+        self.imu_last_stamp = msg.header.stamp  # mark stamp here so freshness check works
         # Extract yaw from quaternion
         import math
         q = msg.orientation
@@ -412,6 +464,23 @@ class ArduinoMotorBridge(Node):
         self.imu_quat = q
         self.imu_last_stamp = msg.header.stamp
     
+    def _nav2_goal_status_cb(self, msg):
+        # STATUS_ACCEPTED=1, STATUS_EXECUTING=2 — any of these means an active goal
+        from action_msgs.msg import GoalStatus
+        was_active = self.has_active_goal
+        self.has_active_goal = any(
+            gs.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING)
+            for gs in msg.status_list
+        )
+        if self.has_active_goal != was_active:
+            state = 'ACTIVE' if self.has_active_goal else 'NONE'
+            self.get_logger().info(f'🎯 Nav2 goal state changed: {state}')
+            if not self.has_active_goal:
+                # Start grace period — do NOT hard-stop motors here.
+                # The coordinator needs ~0.5-1s to detect goal success and issue
+                # the next goal; a hard stop mid-transition causes jerk.
+                self.goal_cleared_at = time.time()
+
     def cmd_vel_cb(self, msg: Twist):
         self._handle_cmd_vel(msg, source='cmd_vel')
 
@@ -422,6 +491,21 @@ class ArduinoMotorBridge(Node):
                 self.last_nav2_block_log_time = now
                 self.get_logger().warn(f"🛑 Nav2 not active; suppressing {source}")
             return
+        # Gate only Nav2 stream commands when no goal is active.
+        # Keep coordinator safety/recovery commands on /cmd_vel available,
+        # otherwise startup can deadlock if the robot must back away first.
+        if self.require_active_goal and source == 'cmd_vel_nav' and not self.has_active_goal:
+            now = time.time()
+            # Allow brief grace period after goal completion before blocking motors.
+            # This gives the exploration coordinator time to issue the next goal
+            # without causing a hard motor stop mid-transition.
+            if (now - self.goal_cleared_at) < self.goal_cleared_grace:
+                pass  # Still within grace period — let cmd_vel through
+            else:
+                if now - self.last_goal_block_log_time >= self.goal_block_log_interval:
+                    self.last_goal_block_log_time = now
+                    self.get_logger().warn(f"🛑 No active Nav2 goal; suppressing {source}")
+                return
         # Safety override: ignore normal commands while backing up
         if self.enable_safety_override and self.safety_override_active:
             return
@@ -528,8 +612,12 @@ class ArduinoMotorBridge(Node):
                     f"⬇️ Front blocked at {self.last_front_distance:.2f}m; backing while turning"
                 )
 
-        elif linear > 0.0 and (front_blocked or any_blocked or spin_timeout_exceeded):
-            # Case 3 — front blocked / any-angle near-field hit / stuck spinning too long → escape
+        elif linear > 0.0 and (front_blocked or spin_timeout_exceeded):
+            # Case 3 — front blocked / stuck spinning too long → escape
+            # NOTE: any_blocked intentionally removed here. any_obstacle now only fires for
+            # front-hemisphere (±90°) hits, but front_blocked (±50°, front_stop_distance)
+            # already covers those. Keeping any_blocked here caused rear-wall hits (rear=0.17m
+            # while front=1.45m clear) to force rotate-only, permanently blocking forward nav.
             angular = self._select_escape_turn(angular)
             if can_front_backup or spin_timeout_exceeded:
                 linear = -abs(self.front_obstacle_backup_speed_mps)
@@ -604,6 +692,7 @@ class ArduinoMotorBridge(Node):
         # Store for odom integration
         if self.publish_odom:
             self.last_cmd_linear = linear
+            # Pivot turning is slower than in-place spin; keep angular integration tied to cmd_vel.
             self.last_cmd_angular = angular
         
         v_left = linear - (angular * self.wheel_base / 2.0)
@@ -644,16 +733,26 @@ class ArduinoMotorBridge(Node):
             pwm_left = -back_pwm
             pwm_right = -back_pwm
         elif abs(linear) <= self.velocity_deadband and abs(angular) > self.angular_deadband:
+            # Pivot turn only: one wheel stopped, one wheel forward.
             if angular > 0.0:
-                pwm_left = -turn_pwm
+                pwm_left = 0
                 pwm_right = turn_pwm
             else:
                 pwm_left = turn_pwm
-                pwm_right = -turn_pwm
+                pwm_right = 0
         elif linear > self.velocity_deadband and abs(angular) > self.angular_deadband:
-            # FORCE: Both motors get same PWM for forward motion, regardless of angular
-            pwm_left = fwd_pwm
-            pwm_right = fwd_pwm
+            # Differential steering: outer wheel at fwd_pwm, inner wheel slows proportionally
+            # to the angular command so the robot actually follows curved Nav2 arc paths.
+            # Without this the robot drove straight on every arc command, forcing Nav2 into
+            # a stop-pivot-forward stutter that caused frequent direction changes and map drift.
+            turn_fraction = min(abs(angular) / self.max_angular_speed_radps, 1.0)
+            inner_pwm = max(self.min_pwm_forward, int(fwd_pwm * (1.0 - turn_fraction)))
+            if angular > 0.0:   # turning left: left is inner, right is outer
+                pwm_left = inner_pwm
+                pwm_right = fwd_pwm
+            else:               # turning right: right is inner, left is outer
+                pwm_left = fwd_pwm
+                pwm_right = inner_pwm
         elif linear < -self.velocity_deadband and abs(angular) > self.angular_deadband:
             if angular > 0.0:
                 pwm_left = -turn_pwm
@@ -662,7 +761,7 @@ class ArduinoMotorBridge(Node):
                 pwm_left = -back_pwm
                 pwm_right = -turn_pwm
 
-        # Keep in-place left/right turns controlled and symmetric.
+        # Keep pivot turns bounded.
         if linear == 0.0 and abs(angular) > self.angular_deadband:
             turn_limit = max(self.min_pwm, self.turn_pwm_limit)
             pwm_left = max(-turn_limit, min(turn_limit, pwm_left))
@@ -680,6 +779,25 @@ class ArduinoMotorBridge(Node):
         self.last_cmd_pwm_right = pwm_right
         self.last_cmd_time = time.time()
 
+        # IMU sign sanity check: during a clear-path pure pivot, commanded and measured
+        # rotation should agree in sign. A persistent disagreement means imu_rotated_180
+        # needs to be True in the launch file → robot will loop-pivot without converging.
+        if (not self.imu_hardware_dead and
+                self.imu_angular_vel_z is not None and
+                abs(angular) > 0.3 and
+                abs(linear) <= self.velocity_deadband and
+                not self._front_blocked() and
+                abs(self.imu_angular_vel_z) > 0.08 and
+                (angular > 0) != (self.imu_angular_vel_z > 0)):
+            if (now - self.last_imu_sign_mismatch_log_time) >= 5.0:
+                self.last_imu_sign_mismatch_log_time = now
+                self.get_logger().warn(
+                    f"⚠️ IMU sign mismatch: Nav2 cmd angular={angular:.2f} rad/s but "
+                    f"IMU gz={self.imu_angular_vel_z:.3f} rad/s (opposite sign). "
+                    f"Robot heading drifts opposite to command → endless pivot loop. "
+                    f"Fix: set  imu_rotated_180: True  in launch file."
+                )
+
         self._send_motor_pwm(pwm_left, pwm_right, source=source)
         self._track_motion_oscillation(pwm_left, pwm_right)
 
@@ -687,7 +805,14 @@ class ArduinoMotorBridge(Node):
         db = self.min_pwm
         fwd  = pwm_left  > db and pwm_right > db
         back = pwm_left  < -db and pwm_right < -db
-        turn = (pwm_left > db and pwm_right < -db) or (pwm_left < -db and pwm_right > db)
+        turn = (
+            (pwm_left > db and pwm_right < -db) or
+            (pwm_left < -db and pwm_right > db) or
+            (pwm_left > db and abs(pwm_right) <= db) or
+            (abs(pwm_left) <= db and pwm_right > db) or
+            (pwm_left < -db and abs(pwm_right) <= db) or
+            (abs(pwm_left) <= db and pwm_right < -db)
+        )
         if fwd:   return 'FORWARD'
         if back:  return 'BACKWARD'
         if turn:  return 'TURN'
@@ -771,9 +896,11 @@ class ArduinoMotorBridge(Node):
         min_rear = float('inf')
         min_front = float('inf')
         min_any = float('inf')
+        min_any_front_half = float('inf')   # closest obstacle in front ±90° hemisphere
         front_hit_count = 0
         rear_hit_count = 0
         any_hit_count = 0
+        any_front_half_hit_count = 0
         effective_min_range = max(msg.range_min, self.scan_min_range)
         angle = msg.angle_min
         for distance in msg.ranges:
@@ -782,6 +909,14 @@ class ArduinoMotorBridge(Node):
                 continue
             if distance < min_any:
                 min_any = distance
+            # Front hemisphere = angles within ±90° (π/2); rear hemisphere excluded.
+            # any_obstacle only blocks forward motion — rear walls must not trigger it.
+            in_front_half = (-math.pi / 2.0 <= angle <= math.pi / 2.0)
+            if in_front_half:
+                if distance < min_any_front_half:
+                    min_any_front_half = distance
+                if distance <= self.any_obstacle_stop_distance:
+                    any_front_half_hit_count += 1
             if distance <= self.any_obstacle_stop_distance:
                 any_hit_count += 1
             in_front_zone = (-self.front_obstacle_half_angle <= angle <= self.front_obstacle_half_angle)
@@ -819,7 +954,11 @@ class ArduinoMotorBridge(Node):
 
         if min_any < float('inf'):
             self.last_any_obstacle_distance = min_any
-            if min_any <= self.any_obstacle_stop_distance and any_hit_count >= max(1, self.any_obstacle_min_hits):
+        # any_obstacle_blocked only latches for front-hemisphere hits: rear walls must not
+        # prevent forward motion. Front zone (±50°, front_stop_distance) already handles
+        # obstacles directly ahead; any_obstacle covers the ±90° flanks at close range.
+        if min_any_front_half < float('inf'):
+            if min_any_front_half <= self.any_obstacle_stop_distance and any_front_half_hit_count >= max(1, self.any_obstacle_min_hits):
                 self.any_obstacle_blocked_until = now + self.any_obstacle_stop_hold_time
                 newly_blocked = True
 
@@ -832,10 +971,38 @@ class ArduinoMotorBridge(Node):
         if newly_blocked:
             was_forward = (self.last_cmd_pwm_left > 0 and self.last_cmd_pwm_right > 0)
             front_just_blocked = (now < self.front_blocked_until) and (min_front <= self.front_stop_distance)
+            # Don't send MOTOR:0,0 for REAR-ONLY blocks. The rear_blocked flag only matters when
+            # backing up (handled in cmd_vel_cb). Sending a full STOP here when only rear is blocked
+            # cancels any forward motion Nav2 is trying to execute — robot can never move away from wall.
+            only_rear_newly_blocked = (
+                (now < self.rear_blocked_until)
+                and not front_just_blocked
+                and not self._any_obstacle_blocked()
+            )
+            # Don't interrupt an active in-place turn used to escape a front obstacle.
+            # scan_cb fires every ~140ms while front is still blocked; sending 0,0 here
+            # while the robot is turning-to-escape creates STOP↔TURN oscillation because
+            # the turn cmd_vel (100ms) and the scan stop (140ms) fight each other.
+            # Opposite-sign PWMs on left/right = in-place turn = already the correct escape.
+            turning_to_escape = (
+                front_just_blocked and
+                abs(self.last_cmd_pwm_left) >= max(1, self.min_pwm_turn) and
+                (self.last_cmd_pwm_left * self.last_cmd_pwm_right < 0)  # opposite signs = in-place turn
+            )
             if front_just_blocked and was_forward and not self.safety_override_active and not self.stuck_recovery_active:
                 self._fire_obstacle_escape()
+            elif only_rear_newly_blocked:
+                pass  # rear-only: cmd_vel_cb already suppresses backward commands; do NOT stop forward motion
+            elif turning_to_escape:
+                pass  # turning is the correct escape — don't interrupt it with a hard stop
             else:
-                self._send_motor_pwm(0, 0, source='scan')
+                # Only stop for a front-blocked situation not already dispatched as an escape.
+                # any_obstacle (360°) fires for normal room-wall proximity and MUST NOT cancel
+                # forward navigation — the front zone (±50°, 0.26m) already covers diagonal threats.
+                # Stopping here for side/rear any_obstacle was preventing the robot from moving
+                # at all: scan fires every 140ms and kills Nav2 cmd_vel before robot travels 1cm.
+                if front_just_blocked:
+                    self._send_motor_pwm(0, 0, source='scan')
 
     def _fire_obstacle_escape(self):
         """Immediately drive backward when a front obstacle is detected while moving forward.
@@ -905,6 +1072,7 @@ class ArduinoMotorBridge(Node):
         all_active = True
         active_count = 0
         status_lines = []
+        explicit_non_active = False
 
         for name in self.nav2_clients.keys():
             if not self.nav2_clients[name].service_is_ready():
@@ -928,9 +1096,25 @@ class ArduinoMotorBridge(Node):
                 active_count += 1
             else:
                 all_active = False
+                explicit_non_active = True
                 status_lines.append(f"{name}: {state_map.get(state_id, str(state_id))}")
 
-        self.nav2_ready = all_active
+        instant_ready = all_active
+
+        # If lifecycle services are flaky but Nav2 currently has an active goal,
+        # avoid false STOPPED (NAV2 INACTIVE) flapping unless we explicitly saw
+        # a non-active lifecycle state.
+        if self.nav2_allow_goal_override and self.has_active_goal and (not explicit_non_active):
+            instant_ready = True
+
+        # Debounce readiness drops so transient timeouts do not hard-stop motors.
+        if instant_ready:
+            self.nav2_not_ready_since = 0.0
+            self.nav2_ready = True
+        else:
+            if self.nav2_not_ready_since <= 0.0:
+                self.nav2_not_ready_since = now
+            self.nav2_ready = (now - self.nav2_not_ready_since) < self.nav2_inactive_confirm_sec
 
         if self.nav2_ready != self.last_nav2_ready:
             self.last_nav2_ready = self.nav2_ready
@@ -942,7 +1126,10 @@ class ArduinoMotorBridge(Node):
                 self.last_nav2_state_log_time = now
                 if status_lines:
                     status = '; '.join(status_lines)
-                    self.get_logger().warn(f"🧭 Nav2 not ready: {status}")
+                    self.get_logger().warn(
+                        f"🧭 Nav2 not ready: {status} "
+                        f"(confirming for {self.nav2_inactive_confirm_sec:.1f}s)"
+                    )
                 else:
                     self.get_logger().warn(f"🧭 Nav2 check in progress... ({active_count}/3 active)")
 
@@ -978,6 +1165,32 @@ class ArduinoMotorBridge(Node):
         w = w_cmd
         freeze_pose_update = False
 
+        # Heading correction for pivot turns using MPU6050 gyro Z.
+        # The motor always runs at fixed_pwm_turn (110) regardless of the cmd_vel angular
+        # magnitude, so cmd_vel dead-reckoning under-reports the actual turn by ~70%.
+        # SLAM cannot match the post-turn scan to the existing map → duplicate/overlapping
+        # walls appear in RViz each time the robot turns to a new direction.
+        #
+        # Fix: during any commanded rotation use the MPU6050 gyro Z (actual physical rate)
+        # when fresh.  Bias concern (~0.01–0.02 rad/s) is negligible while turning
+        # (~1.5 rad/s signal) and SLAM corrects residual drift at each keyframe anyway.
+        # Fall back to PWM-ratio estimate only when IMU data is stale.
+        if abs(w_cmd) > self.angular_deadband:
+            imu_angular_fresh = (
+                self.imu_angular_vel_z is not None and
+                self.imu_last_stamp is not None and
+                (self.get_clock().now() - rclpy.time.Time.from_msg(self.imu_last_stamp)).nanoseconds / 1e9 < 0.25
+            )
+            if imu_angular_fresh and not self.imu_hardware_dead:
+                # Use the real gyro measurement — most accurate source available
+                w = self.imu_angular_vel_z
+            elif abs(v_cmd) <= self.velocity_deadband:
+                # IMU stale: fall back to physical PWM-ratio estimate for pure pivot
+                _pivot_wheel_vel = (self.fixed_pwm_turn / float(self.max_speed_forward)) * self.max_linear_speed_mps
+                w = math.copysign(_pivot_wheel_vel / self.wheel_base, w_cmd)
+            if abs(v_cmd) <= self.velocity_deadband:
+                v = 0.0
+
         if self.odom_feedback_gate_enabled:
             feedback_recent = (time.time() - self.last_motor_speed_time) <= 0.5
             if feedback_recent and self.last_motor_speed_left is not None and self.last_motor_speed_right is not None:
@@ -1000,9 +1213,10 @@ class ArduinoMotorBridge(Node):
                         self.get_logger().warn(
                             "🧭 Odom gate: blocked linear motion detected; suppressing cmd-based odom integration"
                         )
-        # Use IMU yaw only while moving; when stationary-gated, freeze pose to avoid IMU jitter smear.
+        # Integrate pose: IMU yaw mode = set heading from IMU directly (prone to gyro drift over time).
+        # cmd_vel mode = integrate angular velocity from commands (no drift; SLAM scan-matching corrects).
         if not freeze_pose_update:
-            if self.imu_yaw is not None:
+            if self.use_imu_yaw_in_odom and self.imu_yaw is not None:
                 dx = v * math.cos(self.imu_yaw) * dt
                 dy = v * math.sin(self.imu_yaw) * dt
                 self.x += dx
@@ -1024,8 +1238,8 @@ class ArduinoMotorBridge(Node):
         t.transform.translation.x = self.x
         t.transform.translation.y = self.y
         t.transform.translation.z = 0.0
-        # Use IMU quaternion only when not stationary-gated to avoid orientation jitter at standstill.
-        if self.imu_quat is not None and not freeze_pose_update:
+        # Use IMU quaternion for TF only when use_imu_yaw_in_odom is enabled.
+        if self.use_imu_yaw_in_odom and self.imu_quat is not None and not freeze_pose_update:
             t.transform.rotation = self.imu_quat
         else:
             t.transform.rotation.z = math.sin(self.yaw / 2.0)
@@ -1033,7 +1247,8 @@ class ArduinoMotorBridge(Node):
 
         # DEBUG: Show TF being published
         self.get_logger().debug(f'Publishing TF: {t.header.frame_id} -> {t.child_frame_id} at ({t.transform.translation.x:.3f}, {t.transform.translation.y:.3f}, {self.yaw:.3f})')
-        self.tf_broadcaster.sendTransform(t)
+        if self.tf_broadcaster is not None:
+            self.tf_broadcaster.sendTransform(t)
 
         odom = Odometry()
         odom.header.stamp = stamp.to_msg()
@@ -1042,13 +1257,32 @@ class ArduinoMotorBridge(Node):
         odom.pose.pose.position.x = self.x
         odom.pose.pose.position.y = self.y
         odom.pose.pose.position.z = 0.0
-        if self.imu_quat is not None and not freeze_pose_update:
+        if self.use_imu_yaw_in_odom and self.imu_quat is not None and not freeze_pose_update:
             odom.pose.pose.orientation = self.imu_quat
         else:
             odom.pose.pose.orientation.z = math.sin(self.yaw / 2.0)
             odom.pose.pose.orientation.w = math.cos(self.yaw / 2.0)
         odom.twist.twist.linear.x = v
         odom.twist.twist.angular.z = w
+
+        # Covariance for cmd_vel dead-reckoning (no encoders).
+        # Row/col order: x, y, z, roll, pitch, yaw (6x6 = 36 elements).
+        # Pose grows over time; twist is correlated directly to commands so lower uncertainty.
+        _PC = 0.05   # ~5cm positional uncertainty per integration step
+        _YC = 0.15   # raised from 0.05 — cmd_vel dead-reckoning yaw has ~10-30% calibration error;
+                     # higher covariance tells SLAM to search wider relative to the odom initial guess
+        odom.pose.covariance[0]  = _PC   # x
+        odom.pose.covariance[7]  = _PC   # y
+        odom.pose.covariance[14] = 1e6   # z (unused in 2D)
+        odom.pose.covariance[21] = 1e6   # roll (unused in 2D)
+        odom.pose.covariance[28] = 1e6   # pitch (unused in 2D)
+        odom.pose.covariance[35] = _YC   # yaw
+        odom.twist.covariance[0]  = 0.02  # vx
+        odom.twist.covariance[7]  = 1e6   # vy (differential drive: lateral velocity is zero)
+        odom.twist.covariance[14] = 1e6   # vz
+        odom.twist.covariance[21] = 1e6   # roll rate
+        odom.twist.covariance[28] = 1e6   # pitch rate
+        odom.twist.covariance[35] = 0.05  # yaw rate
 
         # DEBUG: Show odometry being published
         self.get_logger().debug(f'Publishing Odometry: ({odom.pose.pose.position.x:.3f}, {odom.pose.pose.position.y:.3f}, {self.yaw:.3f}) v={v:.3f} w={self.last_cmd_angular:.3f}')
@@ -1142,19 +1376,26 @@ class ArduinoMotorBridge(Node):
             if now - self._osc_escape_step_start < self._osc_escape_backup_dur:
                 self._send_motor_pwm(-back_pwm, -back_pwm, source='osc_backup')
             else:
-                # Transition to TURN phase
+                # Transition to TURN phase (or skip if turn is disabled)
+                if self._osc_escape_turn_dur <= 0.0:
+                    # Turn disabled — backup-only escape, done immediately
+                    self._osc_escape_active = False
+                    self.cmd_vel_override_until = 0.0
+                    self._send_motor_pwm(0, 0, source='osc_done')
+                    self.get_logger().info("✅ Oscillation escape complete (backup only) — resuming normal control")
+                    return
                 self._osc_escape_step       = 1
                 self._osc_escape_step_start = now
                 if self._osc_escape_turn_dir > 0:
-                    self._send_motor_pwm(-turn_pwm, turn_pwm, source='osc_turn')
+                    self._send_motor_pwm(0, turn_pwm, source='osc_turn')
                 else:
-                    self._send_motor_pwm(turn_pwm, -turn_pwm, source='osc_turn')
+                    self._send_motor_pwm(turn_pwm, 0, source='osc_turn')
         elif self._osc_escape_step == 1:  # TURN phase
             if now - self._osc_escape_step_start < self._osc_escape_turn_dur:
                 if self._osc_escape_turn_dir > 0:
-                    self._send_motor_pwm(-turn_pwm, turn_pwm, source='osc_turn')
+                    self._send_motor_pwm(0, turn_pwm, source='osc_turn')
                 else:
-                    self._send_motor_pwm(turn_pwm, -turn_pwm, source='osc_turn')
+                    self._send_motor_pwm(turn_pwm, 0, source='osc_turn')
             else:
                 # Escape done
                 self._osc_escape_active = False
@@ -1378,18 +1619,75 @@ class ArduinoMotorBridge(Node):
                         if len(parts) >= 7:
                             try:
                                 distance_raw = float(parts[6])  # Index 6 is distance in cm
-                                # Arduino sends in cm, convert to meters
-                                if distance_raw > 1.0:
+                                # Arduino sends cm; 0.0 = pulseIn timeout (no echo) — skip it
+                                if distance_raw > 0.0:
                                     distance_m = distance_raw / 100.0
+                                    msg = Float32()
+                                    msg.data = distance_m
+                                    self.ultrasonic_pub.publish(msg)
+                                    self._publish_ultrasonic_range(distance_m)
                                 else:
-                                    distance_m = distance_raw
-                                
-                                msg = Float32()
-                                msg.data = distance_m
-                                self.ultrasonic_pub.publish(msg)
-                                self._publish_ultrasonic_range(distance_m)
+                                    distance_m = None  # no echo / timeout — skip publishing
                             except (ValueError, IndexError):
                                 pass  # Skip malformed lines
+
+                            # Publish MPU6050 data as sensor_msgs/Imu on /imu/data_raw
+                            if self.imu_pub is not None and len(parts) >= 6:
+                                try:
+                                    ax = float(parts[0]) * self.imu_accel_scale
+                                    ay = float(parts[1]) * self.imu_accel_scale
+                                    az = float(parts[2]) * self.imu_accel_scale
+                                    gx = float(parts[3]) * self.imu_gyro_scale
+                                    gy = float(parts[4]) * self.imu_gyro_scale
+                                    gz = float(parts[5]) * self.imu_gyro_scale
+                                    # If MPU6050 is mounted 180° rotated about Z:
+                                    # forward/back and left/right axes are negated
+                                    if self.imu_rotated_180:
+                                        ax, ay, gz = -ax, -ay, -gz
+
+                                    # Dead IMU detection: MPU6050 init failure leaves ALL 6 values
+                                    # exactly 0.0 every cycle. Real sensors always have noise/bias.
+                                    _all_zero = (ax == 0.0 and ay == 0.0 and az == 0.0 and
+                                                 gx == 0.0 and gy == 0.0 and gz == 0.0)
+                                    if _all_zero:
+                                        self._imu_zero_streak += 1
+                                        if self._imu_zero_streak >= 5 and not self.imu_hardware_dead:
+                                            self.imu_hardware_dead = True
+                                            self.get_logger().warn(
+                                                '⚠️ IMU hardware DEAD: all-zero for 5+ reads. '
+                                                'Odom heading switching to PWM-ratio fallback. '
+                                                'Check MPU6050 I2C wiring on Arduino.')
+                                    else:
+                                        self._imu_zero_streak = 0
+                                        if self.imu_hardware_dead:
+                                            self.imu_hardware_dead = False
+                                            self.get_logger().info(
+                                                '✅ IMU hardware RECOVERED — switching back to gyro heading.')
+
+                                    imu_msg = self._Imu()
+                                    imu_msg.header.stamp = self.get_clock().now().to_msg()
+                                    imu_msg.header.frame_id = 'imu_link'
+                                    imu_msg.angular_velocity.x = gx
+                                    imu_msg.angular_velocity.y = gy
+                                    imu_msg.angular_velocity.z = gz
+                                    imu_msg.linear_acceleration.x = ax
+                                    imu_msg.linear_acceleration.y = ay
+                                    imu_msg.linear_acceleration.z = az
+                                    # No orientation estimate from raw MPU6050
+                                    imu_msg.orientation_covariance[0] = -1.0
+                                    # Covariance diagonals: gyro ~0.01 rad/s² normally.
+                                    # When IMU hardware is dead, publish very high covariance so
+                                    # EKF ignores this source entirely and falls back to odom yaw_dot.
+                                    _gyro_cov = 9999.0 if self.imu_hardware_dead else 0.01
+                                    imu_msg.angular_velocity_covariance[0] = _gyro_cov
+                                    imu_msg.angular_velocity_covariance[4] = _gyro_cov
+                                    imu_msg.angular_velocity_covariance[8] = _gyro_cov
+                                    imu_msg.linear_acceleration_covariance[0] = 0.1
+                                    imu_msg.linear_acceleration_covariance[4] = 0.1
+                                    imu_msg.linear_acceleration_covariance[8] = 0.1
+                                    self.imu_pub.publish(imu_msg)
+                                except (ValueError, IndexError):
+                                    pass  # Skip malformed IMU fields
 
                             # Optional motor speed feedback (indices 7,8)
                             if len(parts) >= 9:

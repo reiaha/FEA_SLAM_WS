@@ -38,7 +38,7 @@ Visualization Manager:
 
   Enabled: true
   Global Options:
-    Fixed Frame: odom
+    Fixed Frame: map
     Background Color: 0; 0; 0
     Frame Rate: 30
   Views:

@@ -36,7 +36,7 @@ class FrontierDetector(Node):
         
         # Performance: throttle processing to avoid slowing down RViz
         self.last_frontier_time = 0.0
-        self.frontier_throttle_rate = 4.0  # Process at most every 0.25 seconds
+        self.frontier_throttle_rate = 1.0  # Process at most once per second
         self.last_diag_log_time = 0.0
         
         # Publishers
@@ -161,6 +161,15 @@ class FrontierDetector(Node):
             
             marker_array.markers.append(marker)
         
+        # Cap markers to keep RViz rendering fast on low-power hardware
+        MAX_DISPLAYED_FRONTIERS = 30
+        if len(marker_array.markers) > MAX_DISPLAYED_FRONTIERS:
+            # Sort by scale (proxy for cluster size) descending, keep largest
+            marker_array.markers.sort(key=lambda m: m.scale.x, reverse=True)
+            marker_array.markers = marker_array.markers[:MAX_DISPLAYED_FRONTIERS]
+            # Re-index ids after slicing
+            for idx, m in enumerate(marker_array.markers):
+                m.id = idx
         self.frontiers_pub.publish(marker_array)
         self.get_logger().info(f'✅ Published MarkerArray with {len(marker_array.markers)} markers to /frontiers')
         if len(marker_array.markers) > 0:

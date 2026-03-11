@@ -27,6 +27,7 @@ class ScanTimestampFix(Node):
         self.declare_parameter('input_queue_depth', 1)
         self.declare_parameter('max_input_age_sec', 0.70)
         self.declare_parameter('rebase_stale_to_now', False)
+        self.declare_parameter('force_stamp_now', False)
         self.declare_parameter('debug_timestamps', False)
         self.declare_parameter('debug_log_interval_sec', 1.0)
         # Spatial outlier filter: replace isolated spikes with inf
@@ -42,6 +43,7 @@ class ScanTimestampFix(Node):
         self.max_input_age_sec = float(self.get_parameter('max_input_age_sec').value)
         self.input_queue_depth = max(1, int(self.get_parameter('input_queue_depth').value))
         self.rebase_stale_to_now = bool(self.get_parameter('rebase_stale_to_now').value)
+        self.force_stamp_now = bool(self.get_parameter('force_stamp_now').value)
         self.debug_timestamps = bool(self.get_parameter('debug_timestamps').value)
         self.debug_log_interval_sec = float(self.get_parameter('debug_log_interval_sec').value)
         self.range_filter_enabled = bool(self.get_parameter('range_filter_enabled').value)
@@ -55,6 +57,7 @@ class ScanTimestampFix(Node):
         self.stale_drop_count = 0
         self.stale_rebase_count = 0
         self.last_debug_log_time = 0.0
+        self._last_timesync_warn_time = 0.0   # throttle timestamp-skew warnings
 
         # Message counters for diagnostics
         self.input_count = 0
@@ -86,7 +89,8 @@ class ScanTimestampFix(Node):
             f"debug_log_interval_sec={self.debug_log_interval_sec:.2f}, "
             f"max_input_age_sec={self.max_input_age_sec:.3f}, "
             f"timestamp_offset_sec={self.timestamp_offset_sec:.3f}, "
-            f"rebase_stale_to_now={self.rebase_stale_to_now}"
+            f"rebase_stale_to_now={self.rebase_stale_to_now}, "
+            f"force_stamp_now={self.force_stamp_now}"
         )
 
     def _log_timing_debug(self, now_ns: int, msg_stamp_ns: int, stamp_ns: int | None, dropped: bool, reason: str):
@@ -120,8 +124,10 @@ class ScanTimestampFix(Node):
         # Diagnostics: print incoming and outgoing timestamps
         msg_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         now_time = self.get_clock().now().nanoseconds / 1e9
-        if abs(now_time - msg_time) > 0.1:
-            self.get_logger().warn(f"[TimeSync] Incoming scan timestamp {msg_time:.3f} is {now_time - msg_time:.3f}s different from node time {now_time:.3f}")
+        if abs(now_time - msg_time) > 0.25:
+            if (now_time - self._last_timesync_warn_time) >= 5.0:
+                self._last_timesync_warn_time = now_time
+                self.get_logger().warn(f"[TimeSync] Incoming scan timestamp {msg_time:.3f} is {now_time - msg_time:.3f}s different from node time {now_time:.3f}")
 
         try:
             fixed = LaserScan()
@@ -153,7 +159,9 @@ class ScanTimestampFix(Node):
                     self._log_timing_debug(now_ns, msg_stamp_ns, None, True, 'stale_input')
                     return
 
-            if msg_stamp_ns > 0:
+            if self.force_stamp_now:
+                stamp_ns = now_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
+            elif msg_stamp_ns > 0:
                 stamp_ns = msg_stamp_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
             else:
                 stamp_ns = now_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)

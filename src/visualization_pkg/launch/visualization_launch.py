@@ -14,6 +14,7 @@ def generate_launch_description():
             executable='rviz2',
             name='rviz2',
             arguments=['-d', '/home/pi/FEA_SLAM_WS/src/fea_slam/rviz/robot_autonomous.rviz'],
-            output='screen'
+            output='screen',
+            additional_env={'LIBGL_ALWAYS_SOFTWARE': '1'}  # force Mesa software rendering — avoids VideoCore GLSL sampler conflict
         ),
     ])
