@@ -1,6 +1,38 @@
 #!/bin/bash
 cd /home/pi/FEA_SLAM_WS
+
+set -e
+
+if [[ ! -f /opt/ros/humble/setup.bash ]]; then
+	echo "[ERROR] Missing ROS setup: /opt/ros/humble/setup.bash"
+	exit 1
+fi
+
+if [[ ! -f /home/pi/FEA_SLAM_WS/install/setup.bash ]]; then
+	echo "[ERROR] Missing workspace setup: /home/pi/FEA_SLAM_WS/install/setup.bash"
+	echo "[HINT] Build first: colcon build --packages-select localization fea_slam"
+	exit 1
+fi
+
+set +u
+source /opt/ros/humble/setup.bash
 source install/setup.bash
+set -u
+
+# Verify we launch with the freshly built workspace overlay.
+for pkg in localization fea_slam; do
+	prefix="$(ros2 pkg prefix "$pkg" 2>/dev/null || true)"
+	if [[ -z "$prefix" ]]; then
+		echo "[ERROR] Package '$pkg' not found after sourcing setup files"
+		exit 1
+	fi
+	if [[ "$prefix" != /home/pi/FEA_SLAM_WS/install/* ]]; then
+		echo "[ERROR] Package '$pkg' resolves to stale overlay: $prefix"
+		echo "[HINT] Open a fresh shell and run: source /home/pi/FEA_SLAM_WS/install/setup.bash"
+		exit 1
+	fi
+	echo "[SOURCE] $pkg -> $prefix"
+done
 
 echo "╔══════════════════════════════════════════════════════════╗"
 echo "║          AUTONOMOUS EXPLORATION STARTUP                  ║"

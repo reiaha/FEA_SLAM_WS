@@ -15,6 +15,15 @@ def generate_launch_description():
             name='rviz2',
             arguments=['-d', '/home/pi/FEA_SLAM_WS/src/fea_slam/rviz/robot_autonomous.rviz'],
             output='screen',
-            additional_env={'LIBGL_ALWAYS_SOFTWARE': '1'}  # force Mesa software rendering — avoids VideoCore GLSL sampler conflict
+            additional_env={
+                'LIBGL_ALWAYS_SOFTWARE': '1',
+                'QT_OPENGL': 'software',
+                'QT_XCB_FORCE_SOFTWARE_OPENGL': '1',
+                'MESA_GL_VERSION_OVERRIDE': '3.3',
+                'MESA_GLSL_VERSION_OVERRIDE': '330',
+                'MESA_LOADER_DRIVER_OVERRIDE': 'llvmpipe',
+                'GALLIUM_DRIVER': 'llvmpipe',
+                'OGRE_RTT_MODE': 'Copy',
+            }  # Robust software GL path for Pi/Mesa to avoid GLSL sampler conflicts in RViz map shaders
         ),
     ])

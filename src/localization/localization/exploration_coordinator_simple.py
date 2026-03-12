@@ -70,7 +70,7 @@ class ExplorationCoordinator(Node):
         # Parameters
         self.declare_parameter('nav2_timeout', 12.0)
         self.declare_parameter('obstacle_distance', 0.35)      # meters (35cm - earlier stop)
-        self.declare_parameter('backup_speed', -0.3)           # m/s (gentler backward)
+        self.declare_parameter('backup_speed', -0.45)           # m/s (gentler backward)
         self.declare_parameter('backup_time', 2.0)             # seconds (2 seconds duration)
         self.declare_parameter('use_lidar_obstacle', True)
         self.declare_parameter('strict_obstacle_handling', True)
@@ -135,7 +135,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('no_frontier_recovery_cycles', 2)
         self.declare_parameter('no_frontier_complete_cycles', 3)
         self.declare_parameter('corner_recovery_time', 1.5)
-        self.declare_parameter('corner_recovery_turn_speed', 0.4)
+        self.declare_parameter('corner_recovery_turn_speed', 0.65)
         self.declare_parameter('coverage_complete_percent', 90.0)
         self.declare_parameter('zero_frontier_complete_percent', 80.0)
         self.declare_parameter('min_goals_for_complete', 3)
@@ -173,6 +173,12 @@ class ExplorationCoordinator(Node):
         self.declare_parameter('frontier_stagnation_drop_pct', 10.0)  # frontiers must drop by this % to reset stagnation timer
         self.declare_parameter('frontier_debug', True)
         self.declare_parameter('frontier_debug_log_interval', 2.0)
+        self.declare_parameter('frontier_goal_refresh_min_interval', 0.8)
+        self.declare_parameter('goal_ack_timeout', 2.0)
+        self.declare_parameter('goal_watchdog_timeout', 18.0)
+        self.declare_parameter('goal_watchdog_min_motion', 0.15)
+        self.declare_parameter('frontier_change_pos_quant', 0.10)
+        self.declare_parameter('frontier_history_sample_interval', 1.0)
         self.declare_parameter('startup_clear_hold_time', 0.0)
         self.declare_parameter('startup_frontier_timeout', 20.0)
         self.declare_parameter('auto_publish_initial_pose', True)
@@ -293,6 +299,12 @@ class ExplorationCoordinator(Node):
         self.frontier_stagnation_drop_pct = float(self.get_parameter('frontier_stagnation_drop_pct').value)
         self.frontier_debug = bool(self.get_parameter('frontier_debug').value)
         self.frontier_debug_log_interval = float(self.get_parameter('frontier_debug_log_interval').value)
+        self.frontier_goal_refresh_min_interval = float(self.get_parameter('frontier_goal_refresh_min_interval').value)
+        self.goal_ack_timeout = float(self.get_parameter('goal_ack_timeout').value)
+        self.goal_watchdog_timeout = float(self.get_parameter('goal_watchdog_timeout').value)
+        self.goal_watchdog_min_motion = float(self.get_parameter('goal_watchdog_min_motion').value)
+        self.frontier_change_pos_quant = float(self.get_parameter('frontier_change_pos_quant').value)
+        self.frontier_history_sample_interval = float(self.get_parameter('frontier_history_sample_interval').value)
         self.startup_clear_hold_time = float(self.get_parameter('startup_clear_hold_time').value)
         self.startup_frontier_timeout = float(self.get_parameter('startup_frontier_timeout').value)
         self.auto_publish_initial_pose = bool(self.get_parameter('auto_publish_initial_pose').value)
@@ -368,6 +380,9 @@ class ExplorationCoordinator(Node):
         self.corner_recovery_until = 0.0
         self.corner_recovery_mode = None
         self.last_goal_time = 0.0  # Track when we last sent a goal
+        self.last_goal_dispatch_time = 0.0
+        self.goal_dispatch_pose = None
+        self.last_goal_watchdog_log_time = 0.0
         # Lethal-space escape: back up when same position fails N times
         self._lethal_fail_pos = None            # (x, y) of last planning failure
         self._lethal_fail_count = 0              # consecutive failures from same position
@@ -507,6 +522,10 @@ class ExplorationCoordinator(Node):
         self.odom_stale_log_interval = 5.0
         self.last_frontier_update_time = 0.0
         self.last_replan_time = 0.0
+        self.frontier_signature = None
+        self.frontiers_dirty = True
+        self.last_frontier_goal_eval_time = 0.0
+        self.last_frontier_history_log_time = 0.0
         self.pending_replan_goal = None
         self.last_goal_cancel_time = 0.0
         self.replan_cancel_pending = False
@@ -649,20 +668,30 @@ class ExplorationCoordinator(Node):
             y = marker.pose.position.y
             self.current_frontiers.append((x, y))
 
-        self.last_frontier_update_time = time.time()
+        now = time.time()
+        new_signature = self._compute_frontier_signature(self.current_frontiers)
+        if new_signature != self.frontier_signature:
+            self.frontier_signature = new_signature
+            self.frontiers_dirty = True
+            self.last_frontier_update_time = now
 
-        # Record snapshot of all frontier points for CSV export
-        if self.current_frontiers:
-            _elapsed = time.time() - self.startup_time
+        # Record frontier history at a lower sample rate to reduce load
+        if self.current_frontiers and (now - self.last_frontier_history_log_time) >= self.frontier_history_sample_interval:
+            _elapsed = now - self.startup_time
             for _fx, _fy in self.current_frontiers:
                 self.frontier_history_series.append((_elapsed, _fx, _fy))
+            self.last_frontier_history_log_time = now
 
         # If frontiers exist, LiDAR/map is flowing; use as fallback for lidar freshness
         if self.current_frontiers:
             self.ever_had_frontiers = True
-            self.last_frontier_time = time.time()
-            self.last_scan_time = time.time()
+            self.last_frontier_time = now
+            self.last_scan_time = now
     
+    def _compute_frontier_signature(self, frontiers):
+        q = max(0.01, float(self.frontier_change_pos_quant))
+        return frozenset((int(round(x / q)), int(round(y / q))) for x, y in frontiers)
+
     def obstacle_distance_cb(self, msg: Float32):
         """Handle Arduino safety stop signals"""
         if self.nav2_handles_obstacles and not self.strict_obstacle_handling:
@@ -673,8 +702,7 @@ class ExplorationCoordinator(Node):
         distance = msg.data
         now = time.time()
 
-        # 999.0 = sentinel value for SAFETY_STOP:0 (obstacle cleared)
-        is_clear_signal = distance >= 999.0
+        is_clear_signal = distance >= 999.0  # 999.0 = sentinel value for SAFETY_STOP:0 (obstacle cleared)
 
         # Reject invalid non-sentinel ultrasonic values
         if not is_clear_signal and distance < self.ultrasonic_min_valid_distance:
@@ -1045,6 +1073,24 @@ class ExplorationCoordinator(Node):
         if value < 0:
             return False
         if value >= self.costmap_free_threshold:
+            return False
+
+        # Require a small free neighborhood around the goal, not just a single cell.
+        # NavFn was still failing on goals that landed on a marginally-free cell inside
+        # an inflated pocket or map-edge notch. Requiring axial neighbors to be free
+        # keeps coordinator-selected goals traversable for the planner in practice.
+        free_neighbors = 0
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx = mx + dx
+            ny = my + dy
+            if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                return False
+            nindex = ny * width + nx
+            nvalue = data[nindex]
+            if 0 <= nvalue < self.costmap_free_threshold:
+                free_neighbors += 1
+
+        if free_neighbors < 3:
             return False
 
         return True
@@ -1701,6 +1747,8 @@ class ExplorationCoordinator(Node):
         
         send_goal_future = self.nav_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.goal_response_cb)
+        self.last_goal_dispatch_time = time.time()
+        self.goal_dispatch_pose = (robot_x, robot_y)
         # Publish heading arrow in RViz so the user can see where the robot is heading
         self._publish_goal_arrow(robot_x, robot_y, goal_x, goal_y)
 
@@ -1776,11 +1824,84 @@ class ExplorationCoordinator(Node):
             self.get_logger().warn("❌ Goal rejected by Nav2")
             self.goal_handle = None  # Clear so we can send a new goal
             self.goal_in_progress = False  # Clear flag on rejection
+
+    def _maintain_active_goal(self, now: float) -> bool:
+        """Return True when a goal is still active or still being processed."""
+        if not (self.goal_handle is not None or self.goal_in_progress):
+            return False
+
+        # Goal request sent but action server did not acknowledge yet.
+        if self.goal_in_progress and self.goal_handle is None:
+            if self.last_goal_dispatch_time > 0.0 and (now - self.last_goal_dispatch_time) >= self.goal_ack_timeout:
+                self.goal_in_progress = False
+                self.frontiers_dirty = True
+                self.last_goal_time = 0.0
+                self.get_logger().warn(
+                    f"⚠️ Nav2 goal ack timeout ({self.goal_ack_timeout:.1f}s); retrying frontier dispatch"
+                )
+                return False
+            return True
+
+        if self.goal_handle is None:
+            return self.goal_in_progress
+
+        # Only preempt stale goals when Nav2 itself is healthy.
+        nav2_services_ready = self._nav2_services_ready()
+        nav2_healthy = self._nav2_active(
+            require_active=self.require_nav2_active,
+            services_ready=nav2_services_ready
+        )
+        if self.require_nav2_active and not nav2_healthy:
+            return True
+
+        if self.goal_watchdog_timeout <= 0.0:
+            return True
+
+        if self.last_goal_dispatch_time <= 0.0:
+            self.last_goal_dispatch_time = now
+            return True
+
+        if (now - self.last_goal_dispatch_time) < self.goal_watchdog_timeout:
+            return True
+
+        self.update_pose()
+        if self.pose_valid and self.goal_dispatch_pose is not None:
+            moved = math.hypot(
+                self.robot_pose[0] - self.goal_dispatch_pose[0],
+                self.robot_pose[1] - self.goal_dispatch_pose[1]
+            )
+            # Robot is still progressing: extend watchdog window.
+            if moved >= self.goal_watchdog_min_motion:
+                self.goal_dispatch_pose = (self.robot_pose[0], self.robot_pose[1])
+                self.last_goal_dispatch_time = now
+                return True
+
+        if self.last_goal_target is not None:
+            self._blacklist_goal(self.last_goal_target)
+        try:
+            self.goal_handle.cancel_goal_async()
+        except Exception as e:
+            if (now - self.last_goal_watchdog_log_time) >= 2.0:
+                self.last_goal_watchdog_log_time = now
+                self.get_logger().warn(f"⚠️ Goal watchdog cancel failed: {e}")
+            return True
+
+        self.goal_handle = None
+        self.goal_in_progress = False
+        self.frontiers_dirty = True
+        self.last_goal_time = 0.0
+        if (now - self.last_goal_watchdog_log_time) >= 2.0:
+            self.last_goal_watchdog_log_time = now
+            self.get_logger().warn(
+                f"🔁 Goal watchdog: preempted stale goal after {self.goal_watchdog_timeout:.1f}s without motion"
+            )
+        return False
     
     def goal_result_cb(self, future):
         """Handle Nav2 goal completion"""
         result = future.result()
         self.goal_handle = None  # Clear goal handle to allow sending new goals
+        self.frontiers_dirty = True  # frontier/goal state changed; force fresh frontier eval
         self.goal_in_progress = False  # Clear flag to allow new goals
         # Goal is done (any status) — remove the heading arrow from RViz
         self._clear_goal_arrow()
@@ -2030,7 +2151,7 @@ class ExplorationCoordinator(Node):
             self.cmd_vel_pub.publish(rotate_msg)
         else:
             backup_msg = Twist()
-            backup_msg.linear.x = -0.06  # Short, gentle backward
+            backup_msg.linear.x = -0.12  # Stronger backward for heavy bot
             self.cmd_vel_pub.publish(backup_msg)
         
         self.scan_step += 1
@@ -2485,8 +2606,11 @@ class ExplorationCoordinator(Node):
                         for (bx, by) in self.blacklisted_goals
                     )
                     if not is_blacklisted:
-                        self.last_goal_time = now
-                        self.send_goal_to_nav2(goal_x, goal_y)
+                        if self.send_goal_to_nav2(goal_x, goal_y):
+                            self.last_goal_time = now
+                        else:
+                            self.last_goal_time = 0.0
+                            self.frontiers_dirty = True
                     else:
                         self.get_logger().warn(
                             f"🚫 Pending replan goal ({goal_x:.2f}, {goal_y:.2f}) is now blacklisted — skipping"
@@ -2494,7 +2618,7 @@ class ExplorationCoordinator(Node):
                 return
             
             # Check if we have an active goal or one in progress - wait for it
-            if self.goal_handle is not None or self.goal_in_progress:
+            if self._maintain_active_goal(now):
                 if self.cancel_active_goal_for_replan and self.replan_on_frontier_update and self.last_frontier_update_time > self.last_replan_time:
                     self._refresh_pending_goal_from_frontiers("frontier update")
                     if self.pending_replan_goal is not None:
@@ -2518,8 +2642,13 @@ class ExplorationCoordinator(Node):
                 # Still in cooldown period, wait
                 return
             
-            # Pick best frontier
+            # Pick best frontier only when needed (changed frontier set or refresh interval)
+            need_frontier_eval = self.frontiers_dirty or ((now - self.last_frontier_goal_eval_time) >= self.frontier_goal_refresh_min_interval)
+            if not need_frontier_eval:
+                return
+            self.last_frontier_goal_eval_time = now
             goal_info = self.pick_best_frontier()
+            self.frontiers_dirty = False
             if goal_info is None:
                 if self.enable_simple_exploration and self.no_frontier_cycles >= 2:
                     if not self.simple_exploration_active:
@@ -2540,7 +2669,7 @@ class ExplorationCoordinator(Node):
                             if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
                                 bootstrap_msg.angular.z = turn_dir * self.corner_recovery_turn_speed
                             else:
-                                bootstrap_msg.linear.x = max(0.05, min(0.12, abs(self.backup_speed)))
+                                bootstrap_msg.linear.x = max(0.08, min(0.18, abs(self.backup_speed)))
                         self.cmd_vel_pub.publish(bootstrap_msg)
                         return
                     else:
@@ -2747,8 +2876,14 @@ class ExplorationCoordinator(Node):
                 f"📏 Distance to goal: {distance_to_goal:.2f}m | Available frontiers: {total_frontiers}"
             )
             self.ever_sent_goal = True
-            self.last_goal_time = now  # Record goal send time
-            self.send_goal_to_nav2(goal_x, goal_y, goal_info.get('costmap_filtered'), frontier_xy=(frontier_x, frontier_y))
+            sent = self.send_goal_to_nav2(
+                goal_x, goal_y, goal_info.get('costmap_filtered'), frontier_xy=(frontier_x, frontier_y)
+            )
+            if sent:
+                self.last_goal_time = now  # Record successful goal dispatch time
+            else:
+                self.last_goal_time = 0.0
+                self.frontiers_dirty = True
         
         # ==== PHASE 3: OBSTACLE HANDLING ====
         elif self.current_phase == Phase.OBSTACLE:
@@ -2821,7 +2956,7 @@ class ExplorationCoordinator(Node):
             if elapsed < self.recovery_rotation_duration:
                 # Rotate in place to scan surroundings
                 rotate_msg = Twist()
-                rotate_msg.angular.z = 0.5  # Rotate at 0.5 rad/s
+                rotate_msg.angular.z = 0.75  # Rotate at 0.75 rad/s
                 self.cmd_vel_pub.publish(rotate_msg)
                 if int(elapsed * 2) % 2 == 0:  # Log every 0.5 seconds
                     self.get_logger().info(f"🔄 RECOVERY: Rotating in place ({elapsed:.1f}s/{self.recovery_rotation_duration}s)")

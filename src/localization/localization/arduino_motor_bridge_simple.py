@@ -26,18 +26,18 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('wheel_base', 0.18)
         self.declare_parameter('max_speed', 220)
-        self.declare_parameter('max_speed_forward', 167)
+        self.declare_parameter('max_speed_forward', 180)
         self.declare_parameter('max_speed_backward', 180)
         self.declare_parameter('max_linear_speed_mps', 0.35)
         self.declare_parameter('max_angular_speed_radps', 0.8)
-        self.declare_parameter('fixed_pwm_forward', 150)
-        self.declare_parameter('fixed_pwm_backward', 120)
-        self.declare_parameter('fixed_pwm_turn', 120)
+        self.declare_parameter('fixed_pwm_forward', 170)
+        self.declare_parameter('fixed_pwm_backward', 150)
+        self.declare_parameter('fixed_pwm_turn', 140)
         self.declare_parameter('auto_backup_speed_mps', 0.10)
         self.declare_parameter('min_pwm', 90)
-        self.declare_parameter('min_pwm_forward', 105)
-        self.declare_parameter('min_pwm_backward', 100)
-        self.declare_parameter('min_pwm_turn', 95)
+        self.declare_parameter('min_pwm_forward', 120)
+        self.declare_parameter('min_pwm_backward', 115)
+        self.declare_parameter('min_pwm_turn', 110)
         self.declare_parameter('velocity_deadband', 0.03)
         self.declare_parameter('angular_deadband', 0.05)
         self.declare_parameter('pwm_change_threshold', 8)
@@ -82,6 +82,7 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('escape_turn_toggle_interval', 1.2)
         self.declare_parameter('osc_escape_turn_dur', 3.0)  # set to 0.0 to disable turn phase (avoids SLAM scan gaps during spin)
         self.declare_parameter('turn_angular_scale', 0.75)
+        self.declare_parameter('invert_turn_direction', False)
         self.declare_parameter('turn_pwm_limit', 125)
         self.declare_parameter('front_obstacle_backup_speed_mps', 0.12)
         self.declare_parameter('front_obstacle_backup_turn_scale', 0.35)
@@ -93,6 +94,7 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('allow_backward_when_rear_blocked', False)
         self.declare_parameter('require_nav2_active', True)
         self.declare_parameter('require_active_goal', True)   # Stop motors when no active Nav2 goal
+        self.declare_parameter('prefer_nav_cmd_with_active_goal', True)  # Keep motor commands aligned with active Nav2 goal stream
         self.declare_parameter('nav2_state_check_interval', 1.0)
         self.declare_parameter('nav2_state_response_timeout', 2.5)
         self.declare_parameter('nav2_inactive_confirm_sec', 6.0)
@@ -106,7 +108,7 @@ class ArduinoMotorBridge(Node):
         self.declare_parameter('odom_freeze_pose_when_stationary', True)
         self.declare_parameter('use_imu_yaw_in_odom', True)  # False = cmd_vel dead-reckoning only (no IMU drift)
         self.declare_parameter('imu_publish', True)          # Publish MPU6050 data from Arduino CSV to /imu/data_raw
-        self.declare_parameter('imu_rotated_180', False)     # True if MPU6050 is mounted 180° rotated (USB port faces rear) — negates angular.z, linear.x/y
+        self.declare_parameter('imu_rotated_180', True)     # True if MPU6050 is mounted 180° rotated (USB port faces rear) — negates angular.z, linear.x/y
         self.declare_parameter('imu_gyro_scale', 0.017453)   # deg/s → rad/s (π/180). Adafruit lib returns deg/s, not raw LSB.
         self.declare_parameter('imu_accel_scale', 1.0)        # already m/s². Adafruit lib converts raw LSB → m/s².
         
@@ -188,6 +190,7 @@ class ArduinoMotorBridge(Node):
         self.escape_turn_toggle_interval = float(self.get_parameter('escape_turn_toggle_interval').value)
         _osc_turn_dur_param = float(self.get_parameter('osc_escape_turn_dur').value)
         self.turn_angular_scale = float(self.get_parameter('turn_angular_scale').value)
+        self.invert_turn_direction = bool(self.get_parameter('invert_turn_direction').value)
         self.turn_pwm_limit = int(self.get_parameter('turn_pwm_limit').value)
         self.front_obstacle_backup_speed_mps = float(self.get_parameter('front_obstacle_backup_speed_mps').value)
         self.front_obstacle_backup_turn_scale = float(self.get_parameter('front_obstacle_backup_turn_scale').value)
@@ -199,6 +202,7 @@ class ArduinoMotorBridge(Node):
         self.allow_backward_when_rear_blocked = bool(self.get_parameter('allow_backward_when_rear_blocked').value)
         self.require_nav2_active = bool(self.get_parameter('require_nav2_active').value)
         self.require_active_goal = bool(self.get_parameter('require_active_goal').value)
+        self.prefer_nav_cmd_with_active_goal = bool(self.get_parameter('prefer_nav_cmd_with_active_goal').value)
         self.nav2_state_check_interval = float(self.get_parameter('nav2_state_check_interval').value)
         self.nav2_state_response_timeout = float(self.get_parameter('nav2_state_response_timeout').value)
         self.nav2_inactive_confirm_sec = float(self.get_parameter('nav2_inactive_confirm_sec').value)
@@ -482,6 +486,18 @@ class ArduinoMotorBridge(Node):
                 self.goal_cleared_at = time.time()
 
     def cmd_vel_cb(self, msg: Twist):
+        # Keep goal tracking and motor actuation synchronized: while Nav2 has an active goal,
+        # prefer /cmd_vel_nav as the authoritative drive stream. Still allow backward
+        # /cmd_vel recovery commands so obstacle escape is never blocked.
+        if self.prefer_nav_cmd_with_active_goal and self.has_active_goal and self.nav2_ready:
+            linear = float(msg.linear.x)
+            allow_recovery = linear < -self.velocity_deadband
+            if not allow_recovery:
+                now = time.time()
+                if now - self.last_goal_block_log_time >= self.goal_block_log_interval:
+                    self.last_goal_block_log_time = now
+                    self.get_logger().warn('🧭 Active Nav2 goal: suppressing /cmd_vel to keep motor-goal sync')
+                return
         self._handle_cmd_vel(msg, source='cmd_vel')
 
     def _handle_cmd_vel(self, msg: Twist, source: str):
@@ -534,6 +550,12 @@ class ArduinoMotorBridge(Node):
             angular = 0.0
         elif linear == 0.0:
             angular *= self.turn_angular_scale
+
+        # Motor polarity can be opposite to the geometric yaw convention.
+        # Keep this independent from imu_rotated_180 so we can align commanded
+        # turn direction with physical turn direction without touching IMU axes.
+        if self.invert_turn_direction:
+            angular = -angular
 
         now = time.time()
         scan_stale = False
@@ -733,13 +755,14 @@ class ArduinoMotorBridge(Node):
             pwm_left = -back_pwm
             pwm_right = -back_pwm
         elif abs(linear) <= self.velocity_deadband and abs(angular) > self.angular_deadband:
-            # Pivot turn only: one wheel stopped, one wheel forward.
+            # Pure turn: use counter-rotating wheels for reliable in-place rotation.
+            # One-wheel pivot can stall on heavier chassis and appear as no movement.
             if angular > 0.0:
-                pwm_left = 0
+                pwm_left = -turn_pwm
                 pwm_right = turn_pwm
             else:
                 pwm_left = turn_pwm
-                pwm_right = 0
+                pwm_right = -turn_pwm
         elif linear > self.velocity_deadband and abs(angular) > self.angular_deadband:
             # Differential steering: outer wheel at fwd_pwm, inner wheel slows proportionally
             # to the angular command so the robot actually follows curved Nav2 arc paths.
@@ -907,11 +930,21 @@ class ArduinoMotorBridge(Node):
             if distance <= effective_min_range or distance > msg.range_max:
                 angle += msg.angle_increment
                 continue
+            # Interpret LaserScan angles in the robot's frame. When the LiDAR is mounted
+            # 180° reversed, rotate every beam by pi here so ALL front/rear logic uses
+            # the same corrected frame. The previous post-processing swap only flipped the
+            # front/rear latches, leaving front-half/any-obstacle logic in the raw sensor
+            # frame and causing real front/back mismatches.
+            robot_angle = angle
+            if self.swap_lidar_front_back:
+                robot_angle += math.pi
+                if robot_angle > math.pi:
+                    robot_angle -= 2.0 * math.pi
             if distance < min_any:
                 min_any = distance
             # Front hemisphere = angles within ±90° (π/2); rear hemisphere excluded.
             # any_obstacle only blocks forward motion — rear walls must not trigger it.
-            in_front_half = (-math.pi / 2.0 <= angle <= math.pi / 2.0)
+            in_front_half = (-math.pi / 2.0 <= robot_angle <= math.pi / 2.0)
             if in_front_half:
                 if distance < min_any_front_half:
                     min_any_front_half = distance
@@ -919,8 +952,8 @@ class ArduinoMotorBridge(Node):
                     any_front_half_hit_count += 1
             if distance <= self.any_obstacle_stop_distance:
                 any_hit_count += 1
-            in_front_zone = (-self.front_obstacle_half_angle <= angle <= self.front_obstacle_half_angle)
-            in_rear_zone = (abs(abs(angle) - math.pi) <= self.rear_obstacle_half_angle)
+            in_front_zone = (-self.front_obstacle_half_angle <= robot_angle <= self.front_obstacle_half_angle)
+            in_rear_zone = (abs(abs(robot_angle) - math.pi) <= self.rear_obstacle_half_angle)
 
             if in_front_zone:
                 if distance < min_front:
@@ -935,17 +968,28 @@ class ArduinoMotorBridge(Node):
             angle += msg.angle_increment
 
         newly_blocked = False
+        # Save previous blocked states BEFORE updating latches.
+        # newly_blocked should only be True when transitioning clear→blocked,
+        # NOT on every scan while the obstacle persists.  Firing STOPPED|SRC:scan
+        # every 125ms overrides Nav2 turn commands, preventing the robot from
+        # rotating away from the wall it's facing.
+        was_front_blocked     = (now < self.front_blocked_until)
+        was_rear_blocked      = (now < self.rear_blocked_until)
+        was_any_front_blocked = (now < self.any_obstacle_blocked_until)
+
         if min_front < float('inf'):
             self.last_front_distance = min_front
             if min_front <= self.front_stop_distance and front_hit_count >= max(1, self.front_block_min_hits):
                 self.front_blocked_until = now + self.front_stop_hold_time
-                newly_blocked = True
+                if not was_front_blocked:      # only fire on clear → blocked transition
+                    newly_blocked = True
 
         if min_rear < float('inf'):
             self.last_rear_distance = min_rear
             if min_rear <= self.rear_stop_distance and rear_hit_count >= max(1, self.rear_block_min_hits):
                 self.rear_blocked_until = now + self.rear_stop_hold_time
-                newly_blocked = True
+                if not was_rear_blocked:       # only fire on clear → blocked transition
+                    newly_blocked = True
         else:
             # No LiDAR hits in rear zone → rear is open/clear.
             # Use range_max as a sentinel so backward-suppression logic treats
@@ -960,11 +1004,8 @@ class ArduinoMotorBridge(Node):
         if min_any_front_half < float('inf'):
             if min_any_front_half <= self.any_obstacle_stop_distance and any_front_half_hit_count >= max(1, self.any_obstacle_min_hits):
                 self.any_obstacle_blocked_until = now + self.any_obstacle_stop_hold_time
-                newly_blocked = True
-
-        if self.swap_lidar_front_back:
-            self.last_front_distance, self.last_rear_distance = self.last_rear_distance, self.last_front_distance
-            self.front_blocked_until, self.rear_blocked_until = self.rear_blocked_until, self.front_blocked_until
+                if not was_any_front_blocked:  # only fire on clear → blocked transition
+                    newly_blocked = True
 
         # Immediate reaction: when front is newly blocked while moving forward,
         # start backing up right now — don't wait for Nav2's next cmd_vel cycle.

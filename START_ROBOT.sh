@@ -27,6 +27,26 @@ source /opt/ros/humble/setup.bash
 source install/setup.bash
 set -u
 
+# Ensure this shell resolves packages from THIS workspace install overlay.
+check_overlay_pkg_prefix() {
+	local pkg="$1"
+	local prefix
+	prefix="$(ros2 pkg prefix "$pkg" 2>/dev/null || true)"
+	if [[ -z "$prefix" ]]; then
+		echo "[ERROR] Package '$pkg' not found after sourcing workspace overlay"
+		exit 1
+	fi
+	if [[ "$prefix" != /home/pi/FEA_SLAM_WS/install/* ]]; then
+		echo "[ERROR] Package '$pkg' resolves to stale overlay: $prefix"
+		echo "[HINT] Open a fresh shell and run: source /home/pi/FEA_SLAM_WS/install/setup.bash"
+		exit 1
+	fi
+	echo "[SOURCE] $pkg -> $prefix"
+}
+
+check_overlay_pkg_prefix localization
+check_overlay_pkg_prefix fea_slam
+
 if ! command -v ros2 >/dev/null 2>&1; then
 	echo "[ERROR] ros2 command not found after sourcing setup files"
 	exit 1
