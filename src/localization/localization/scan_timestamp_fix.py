@@ -12,6 +12,7 @@ from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Float32
 
 
 class ScanTimestampFix(Node):
@@ -28,12 +29,13 @@ class ScanTimestampFix(Node):
         self.declare_parameter('max_input_age_sec', 0.70)
         self.declare_parameter('rebase_stale_to_now', False)
         self.declare_parameter('force_stamp_now', False)
-        self.declare_parameter('debug_timestamps', False)
-        self.declare_parameter('debug_log_interval_sec', 1.0)
-        # Spatial outlier filter: replace isolated spikes with inf
         self.declare_parameter('range_filter_enabled', True)
-        self.declare_parameter('range_filter_window', 3)       # beams each side
-        self.declare_parameter('range_filter_max_deviation', 0.20)  # metres
+        self.declare_parameter('range_filter_window', 3)                        
+        self.declare_parameter('range_filter_max_deviation', 0.20)          
+        self.declare_parameter('tilt_gating_enabled', True)
+        self.declare_parameter('tilt_gate_threshold_deg', 15.0)                               
+        self.declare_parameter('tilt_throttle_threshold_deg', 10.0)                              
+        self.declare_parameter('tilt_throttle_ratio', 3)                                                     
         self.input_topic = self.get_parameter('input_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         self.expected_scan_size = int(self.get_parameter('expected_scan_size').value)
@@ -44,11 +46,16 @@ class ScanTimestampFix(Node):
         self.input_queue_depth = max(1, int(self.get_parameter('input_queue_depth').value))
         self.rebase_stale_to_now = bool(self.get_parameter('rebase_stale_to_now').value)
         self.force_stamp_now = bool(self.get_parameter('force_stamp_now').value)
-        self.debug_timestamps = bool(self.get_parameter('debug_timestamps').value)
-        self.debug_log_interval_sec = float(self.get_parameter('debug_log_interval_sec').value)
         self.range_filter_enabled = bool(self.get_parameter('range_filter_enabled').value)
         self.range_filter_window = int(self.get_parameter('range_filter_window').value)
         self.range_filter_max_deviation = float(self.get_parameter('range_filter_max_deviation').value)
+        self.tilt_gating_enabled = bool(self.get_parameter('tilt_gating_enabled').value)
+        self.tilt_gate_threshold_deg = float(self.get_parameter('tilt_gate_threshold_deg').value)
+        self.tilt_throttle_threshold_deg = float(self.get_parameter('tilt_throttle_threshold_deg').value)
+        self.tilt_throttle_ratio = int(self.get_parameter('tilt_throttle_ratio').value)
+        self.tilt_roll_deg = 0.0
+        self.tilt_pitch_deg = 0.0
+        self.scan_throttle_counter = 0
         self.scan_size_ref = self.expected_scan_size if self.expected_scan_size > 0 else None
         self.last_size_log_time = 0.0
         self.size_mismatch_count = 0
@@ -56,17 +63,13 @@ class ScanTimestampFix(Node):
         self.last_stale_drop_log_time = 0.0
         self.stale_drop_count = 0
         self.stale_rebase_count = 0
-        self.last_debug_log_time = 0.0
-        self._last_timesync_warn_time = 0.0   # throttle timestamp-skew warnings
+        self._last_timesync_warn_time = 0.0                                     
 
-        # Message counters for diagnostics
         self.input_count = 0
         self.output_count = 0
         self.last_input_time = self.get_clock().now()
         self.last_output_time = self.get_clock().now()
 
-        # Subscribe with best-effort depth=1 to avoid callback backlog and stale scan queueing.
-        # Publish with reliable QoS so Nav2 costmaps (reliable subscribers) receive scans.
         input_qos = QoSProfile(depth=self.input_queue_depth)
         input_qos.reliability = ReliabilityPolicy.BEST_EFFORT
         input_qos.durability = DurabilityPolicy.VOLATILE
@@ -77,6 +80,9 @@ class ScanTimestampFix(Node):
 
         self.pub = self.create_publisher(LaserScan, self.output_topic, reliable_qos)
         self.sub = self.create_subscription(LaserScan, self.input_topic, self._scan_cb, input_qos)
+        
+        self.tilt_roll_sub = self.create_subscription(Float32, '/tilt_roll_deg', self._tilt_roll_cb, 10)
+        self.tilt_pitch_sub = self.create_subscription(Float32, '/tilt_pitch_deg', self._tilt_pitch_cb, 10)
 
         self.get_logger().info(
             f"🔧 Scan timestamp fix: {self.input_topic} -> {self.output_topic} "
@@ -85,35 +91,24 @@ class ScanTimestampFix(Node):
         use_sim_time = bool(self.get_parameter('use_sim_time').value)
         self.get_logger().info(f"[TimeSync] use_sim_time={use_sim_time}")
         self.get_logger().info(
-            f"[TimeSync] debug_timestamps={self.debug_timestamps}, "
-            f"debug_log_interval_sec={self.debug_log_interval_sec:.2f}, "
             f"max_input_age_sec={self.max_input_age_sec:.3f}, "
             f"timestamp_offset_sec={self.timestamp_offset_sec:.3f}, "
             f"rebase_stale_to_now={self.rebase_stale_to_now}, "
             f"force_stamp_now={self.force_stamp_now}"
         )
+        if self.tilt_gating_enabled:
+            self.get_logger().info(
+                f"[TiltGating] Enabled: gate_threshold={self.tilt_gate_threshold_deg}°, "
+                f"throttle_threshold={self.tilt_throttle_threshold_deg}°, throttle_ratio={self.tilt_throttle_ratio}"
+            )
 
-    def _log_timing_debug(self, now_ns: int, msg_stamp_ns: int, stamp_ns: int | None, dropped: bool, reason: str):
-        if not self.debug_timestamps:
-            return
-        now_sec = now_ns / 1e9
-        if (now_sec - self.last_debug_log_time) < max(0.1, self.debug_log_interval_sec):
-            return
-        self.last_debug_log_time = now_sec
+    def _tilt_roll_cb(self, msg):
+        """Update latest roll angle"""
+        self.tilt_roll_deg = msg.data
 
-        msg_sec = msg_stamp_ns / 1e9 if msg_stamp_ns > 0 else 0.0
-        input_age_sec = (now_ns - msg_stamp_ns) / 1e9 if msg_stamp_ns > 0 else 0.0
-        line = (
-            f"[TimeSync][DEBUG] frame={self.input_topic} src_frame={getattr(self, '_last_frame_id', 'unknown')} "
-            f"msg_t={msg_sec:.6f} now_t={now_sec:.6f} age={input_age_sec:.3f}s "
-            f"limit={self.max_input_age_sec:.3f}s offset={self.timestamp_offset_sec:.3f}s "
-            f"dropped={int(dropped)} reason={reason}"
-        )
-        if stamp_ns is not None:
-            out_sec = stamp_ns / 1e9
-            out_skew_sec = out_sec - now_sec
-            line += f" out_t={out_sec:.6f} out_minus_now={out_skew_sec:.3f}s"
-        self.get_logger().info(line)
+    def _tilt_pitch_cb(self, msg):
+        """Update latest pitch angle"""
+        self.tilt_pitch_deg = msg.data
 
     def _scan_cb(self, msg: LaserScan):
         """Callback to republish scan with corrected timestamp and time diagnostics"""
@@ -121,7 +116,17 @@ class ScanTimestampFix(Node):
         self.last_input_time = self.get_clock().now()
         self._last_frame_id = msg.header.frame_id
 
-        # Diagnostics: print incoming and outgoing timestamps
+        if self.tilt_gating_enabled:
+            max_tilt = max(abs(self.tilt_roll_deg), abs(self.tilt_pitch_deg))
+            
+            if max_tilt > self.tilt_gate_threshold_deg:
+                return
+            
+            if max_tilt > self.tilt_throttle_threshold_deg:
+                self.scan_throttle_counter += 1
+                if (self.scan_throttle_counter % self.tilt_throttle_ratio) != 0:
+                    return
+
         msg_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         now_time = self.get_clock().now().nanoseconds / 1e9
         if abs(now_time - msg_time) > 0.25:
@@ -131,8 +136,6 @@ class ScanTimestampFix(Node):
 
         try:
             fixed = LaserScan()
-            # Prefer sensor timestamp + offset to preserve temporal alignment with robot pose.
-            # Drop stale delayed scans to avoid map smearing and TF message-filter drops.
             now_ns = self.get_clock().now().nanoseconds
             msg_stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
             input_age_sec = (now_ns - msg_stamp_ns) / 1e9 if msg_stamp_ns > 0 else 0.0
@@ -156,7 +159,6 @@ class ScanTimestampFix(Node):
                             f"[TimeSync] Dropping stale scan age={input_age_sec:.3f}s "
                             f"(limit={self.max_input_age_sec:.3f}s, drops={self.stale_drop_count})"
                         )
-                    self._log_timing_debug(now_ns, msg_stamp_ns, None, True, 'stale_input')
                     return
 
             if self.force_stamp_now:
@@ -166,7 +168,6 @@ class ScanTimestampFix(Node):
             else:
                 stamp_ns = now_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
 
-            # Ensure output stamp is not in the past relative to processing time.
             min_stamp_ns = now_ns - int(0.01 * 1e9)
             if stamp_ns < min_stamp_ns:
                 stamp_ns = min_stamp_ns
@@ -189,7 +190,6 @@ class ScanTimestampFix(Node):
             ranges = list(msg.ranges)
             intensities = list(msg.intensities)
 
-            # Spatial outlier filter: kill isolated spikes before publishing
             if self.range_filter_enabled and len(ranges) > 2 * self.range_filter_window:
                 w = self.range_filter_window
                 n = len(ranges)
@@ -198,13 +198,12 @@ class ScanTimestampFix(Node):
                     r = ranges[i]
                     if not (msg.range_min <= r <= msg.range_max):
                         continue
-                    # Collect valid neighbours (wrap-around for 360 scans)
                     neighbours = [
                         ranges[(i + d) % n]
                         for d in range(-w, w + 1) if d != 0
                         if msg.range_min <= ranges[(i + d) % n] <= msg.range_max
                     ]
-                    if len(neighbours) < w:  # too few valid neighbours — keep as-is
+                    if len(neighbours) < w:                                         
                         continue
                     neighbours.sort()
                     median = neighbours[len(neighbours) // 2]
@@ -236,9 +235,6 @@ class ScanTimestampFix(Node):
                         f"(mismatches={self.size_mismatch_count})"
                     )
 
-            # Keep angle metadata consistent with output range length.
-            # slam_toolbox derives expected beam count from angle_min/max/increment,
-            # so range resizing must update angle_max to match.
             if len(ranges) > 0:
                 fixed.angle_max = fixed.angle_min + (len(ranges) - 1) * fixed.angle_increment
 
@@ -248,14 +244,6 @@ class ScanTimestampFix(Node):
             self.pub.publish(fixed)
             self.output_count += 1
             self.last_output_time = self.get_clock().now()
-            self._log_timing_debug(now_ns, msg_stamp_ns, stamp_ns, False, 'published')
-            # Log periodically (every 100 messages)
-            if self.output_count % 100 == 0:
-                elapsed = (self.get_clock().now() - self.last_input_time).nanoseconds / 1e9
-                self.get_logger().debug(
-                    f"📊 Scan fix stats: in={self.input_count}, out={self.output_count}, "
-                    f"proc_time={elapsed*1000:.1f}ms, ranges={len(msg.ranges)}"
-                )
                 
         except Exception as e:
             self.get_logger().error(f"❌ Error processing scan: {e}")
@@ -279,8 +267,7 @@ def main(args=None):
     rclpy.init(args=args)
     node = ScanTimestampFix()
     
-    # Add diagnostics timer
-    timer = node.create_timer(5.0, node._timer_cb)
+    node.create_timer(5.0, node._timer_cb)
     
     try:
         rclpy.spin(node)

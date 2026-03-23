@@ -25,9 +25,10 @@ setup(
     license='MIT',
     entry_points={
         'console_scripts': [
-            'arduino_motor_bridge_simple = localization.arduino_motor_bridge_simple:main',
+            'arduino_motor_bridge = localization.arduino_motor_bridge:main',
+            'tilt_safety_controller = localization.tilt_safety_controller:main',
             'frontier_detector = localization.frontier_detector:main',
-            'exploration_coordinator_simple = localization.exploration_coordinator_simple:main',
+            'exploration_coordinator = localization.exploration_coordinator:main',
             'lidar_explorer = localization.lidar_explorer:main',
             'map_odom_fallback = localization.map_odom_fallback:main',
             'scan_timestamp_fix = localization.scan_timestamp_fix:main',

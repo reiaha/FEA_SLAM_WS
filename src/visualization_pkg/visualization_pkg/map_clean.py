@@ -29,9 +29,6 @@ class MapCleanNode(Node):
         out = OccupancyGrid()
         out.header = msg.header
         out.info = msg.info
-        # bytes(msg.data) uses the buffer protocol: signed int8 -1 → 0xFF (255)
-        # regardless of whether rclpy returns array.array('b') or bytes.
-        # Iterating the resulting bytes object gives unsigned 0-255 values.
         raw = bytes(msg.data)
         out.data = bytes(0 if b == 255 else b for b in raw)
         self.pub.publish(out)

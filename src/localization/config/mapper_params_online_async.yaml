@@ -27,4 +27,3 @@ slam_toolbox:
     publish_occupancy_grid: true
     
     # Debug
-    debug_logging: false

@@ -27,7 +27,6 @@ class MapVisualizer(Node):
         self.get_logger().info('Map Visualizer initialized successfully')
 
     def map_callback(self, msg: OccupancyGrid):
-        self.get_logger().debug('Map callback triggered')
         self.map_info = msg.info
         self.data = msg.data
         
@@ -46,8 +45,7 @@ class MapVisualizer(Node):
         if not self.data or not self.map_info:
             self.get_logger().warn('Cannot publish markers: map data not available')
             return
-        
-        self.get_logger().debug('Creating marker visualization...')
+
         marker = Marker()
         marker.header = Header()
         marker.header.stamp = self.get_clock().now().to_msg()
@@ -77,7 +75,6 @@ class MapVisualizer(Node):
         num_points = len(marker.points)
         self.get_logger().info(f'Publishing {num_points} marker points to /map_marker')
         self.marker_pub.publish(marker)
-        self.get_logger().debug('Marker published successfully')
 
 def main(args=None):
     rclpy.init(args=args)

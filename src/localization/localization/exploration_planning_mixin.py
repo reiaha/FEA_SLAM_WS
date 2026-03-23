@@ -1,0 +1,1002 @@
+#!/usr/bin/env python3
+
+import math
+import time
+
+import rclpy
+from lifecycle_msgs.srv import GetState
+from nav2_msgs.action import NavigateToPose
+from nav2_msgs.srv import ClearEntireCostmap
+from rclpy.duration import Duration
+
+class ExplorationPlanningMixin:
+    def _frontier_is_already_scanned(self, robot_x: float, robot_y: float, fx: float, fy: float) -> bool:
+        """Return True when frontier is already within effective lidar scan coverage."""
+        if not bool(getattr(self, 'frontier_skip_if_within_scan_range', True)):
+            return False
+
+        lidar_range = max(0.3, float(getattr(self, 'frontier_lidar_range_m', 8.0)))
+        lidar_margin = max(0.05, float(getattr(self, 'frontier_lidar_range_margin_m', 0.6)))
+        effective_scan_range = max(0.2, lidar_range - lidar_margin)
+        dist = math.hypot(fx - robot_x, fy - robot_y)
+        if dist > effective_scan_range:
+            return False
+
+        # If map around this frontier has little unknown, treat it as already scanned.
+        stats = self._frontier_unknown_stats(
+            fx,
+            fy,
+            float(getattr(self, 'frontier_unknown_check_radius_m', 0.45))
+        )
+        if stats is None:
+            return True
+
+        max_unknown_ratio = float(getattr(self, 'frontier_scanned_max_unknown_ratio', 0.08))
+        max_unknown_cells = int(getattr(self, 'frontier_scanned_max_unknown_cells', 8))
+        return (
+            stats['unknown_ratio'] <= max(0.0, max_unknown_ratio) or
+            stats['unknown_cells'] <= max(0, max_unknown_cells)
+        )
+
+    def _compute_lidar_standoff_goal(self, robot_x: float, robot_y: float, fx: float, fy: float, goal_x: float, goal_y: float):
+        """Keep goal away from frontier while guaranteeing frontier remains inside lidar scan range."""
+        if not bool(getattr(self, 'frontier_use_lidar_standoff_goal', True)):
+            return (goal_x, goal_y)
+
+        dist_rf = math.hypot(fx - robot_x, fy - robot_y)
+        if dist_rf <= 0.10:
+            return None
+
+        ux = (fx - robot_x) / dist_rf
+        uy = (fy - robot_y) / dist_rf
+
+        lidar_range = max(0.3, float(getattr(self, 'frontier_lidar_range_m', 8.0)))
+        lidar_margin = max(0.05, float(getattr(self, 'frontier_lidar_range_margin_m', 0.6)))
+        max_frontier_goal = max(0.20, lidar_range - lidar_margin)
+
+        standoff_min = max(0.20, float(getattr(self, 'frontier_goal_standoff_min_m', 1.0)))
+        standoff_max = max(standoff_min, float(getattr(self, 'frontier_goal_standoff_max_m', 2.5)))
+
+        current_standoff = math.hypot(fx - goal_x, fy - goal_y)
+        desired_standoff = max(standoff_min, current_standoff)
+        desired_standoff = min(desired_standoff, standoff_max)
+        desired_standoff = min(desired_standoff, max_frontier_goal)
+
+        max_possible = max(0.05, dist_rf - 0.10)
+        standoff = min(desired_standoff, max_possible)
+        if standoff <= 0.05:
+            return None
+
+        gx = fx - (ux * standoff)
+        gy = fy - (uy * standoff)
+        return (gx, gy)
+
+    def _frontier_unknown_stats(self, x: float, y: float, radius_m: float):
+        """Return unknown-cell ratio around a frontier from the SLAM map."""
+        slam_map = getattr(self, 'last_slam_map', None)
+        if slam_map is None:
+            return None
+
+        try:
+            info = slam_map.info
+            resolution = float(info.resolution)
+            if resolution <= 0.0:
+                return None
+
+            origin_x = float(info.origin.position.x)
+            origin_y = float(info.origin.position.y)
+            width = int(info.width)
+            height = int(info.height)
+            data = slam_map.data
+            if width <= 0 or height <= 0 or not data:
+                return None
+
+            cx = int((x - origin_x) / resolution)
+            cy = int((y - origin_y) / resolution)
+            if cx < 0 or cy < 0 or cx >= width or cy >= height:
+                return None
+
+            radius_cells = max(1, int(max(0.05, radius_m) / resolution))
+            r2 = radius_cells * radius_cells
+
+            unknown = 0
+            known = 0
+            for dy in range(-radius_cells, radius_cells + 1):
+                ny = cy + dy
+                if ny < 0 or ny >= height:
+                    continue
+                for dx in range(-radius_cells, radius_cells + 1):
+                    if (dx * dx + dy * dy) > r2:
+                        continue
+                    nx = cx + dx
+                    if nx < 0 or nx >= width:
+                        continue
+                    idx = ny * width + nx
+                    val = data[idx]
+                    if val == -1:
+                        unknown += 1
+                    elif 0 <= val <= 100:
+                        known += 1
+
+            total = unknown + known
+            if total <= 0:
+                return None
+
+            return {
+                'unknown_ratio': float(unknown) / float(total),
+                'unknown_cells': unknown,
+                'known_cells': known,
+                'total_cells': total,
+            }
+        except Exception:
+            return None
+
+    def _frontier_needs_exploration(self, fx: float, fy: float, robot_x: float, robot_y: float) -> bool:
+        """Reject frontiers that are already mapped inside effective lidar range."""
+        if not bool(getattr(self, 'prune_mapped_frontiers', True)):
+            return True
+
+        lidar_range = float(getattr(self, 'frontier_lidar_range_m', 8.0))
+        dist = math.hypot(fx - robot_x, fy - robot_y)
+        if dist > max(0.1, lidar_range):
+            return True
+
+        radius_m = float(getattr(self, 'frontier_unknown_check_radius_m', 0.45))
+        min_unknown_ratio = float(getattr(self, 'frontier_min_unknown_ratio', 0.10))
+        min_unknown_cells = int(getattr(self, 'frontier_min_unknown_cells', 6))
+        if getattr(self, 'last_slam_map', None) is None:
+            return True
+        stats = self._frontier_unknown_stats(fx, fy, radius_m)
+        if stats is None:
+            return False
+
+        if stats['unknown_cells'] < max(1, min_unknown_cells):
+            return False
+        if stats['unknown_ratio'] < max(0.0, min_unknown_ratio):
+            return False
+        return True
+
+    def pick_best_frontier(self):
+        if not self.current_frontiers:
+            self.last_frontier_skip_reason = "no_frontiers"
+            return None
+
+        self.update_pose()
+        
+        if not self.pose_valid:
+            self.last_frontier_skip_reason = "pose_invalid"
+            return None
+            
+        if self.pose_stale:
+            now = time.time()
+            if (now - self.last_origin_warn_time) >= self.origin_warn_interval:
+                self.last_origin_warn_time = now
+                self.get_logger().warn(
+                    f"⚠️ Skipping frontier selection: TF pose stale (age > {self.pose_stale_timeout}s)."
+                )
+            self.last_frontier_skip_reason = "pose_stale"
+            return None
+
+        robot_x, robot_y, _ = self.robot_pose
+        now = time.time()
+
+        frontier_pool = []
+        pruned_mapped_count = 0
+        pruned_scanned_count = 0
+        for fx, fy in self.current_frontiers:
+            if self._frontier_is_already_scanned(robot_x, robot_y, fx, fy):
+                pruned_scanned_count += 1
+                continue
+            if self._frontier_needs_exploration(fx, fy, robot_x, robot_y):
+                frontier_pool.append((fx, fy))
+            else:
+                pruned_mapped_count += 1
+
+        if (pruned_mapped_count > 0) or (pruned_scanned_count > 0):
+            self.current_frontiers = frontier_pool
+            log_interval = float(getattr(self, 'frontier_prune_log_interval', 2.0))
+            last_log_time = float(getattr(self, 'last_frontier_prune_log_time', 0.0))
+            if (now - last_log_time) >= max(0.2, log_interval):
+                self.last_frontier_prune_log_time = now
+                self.get_logger().info(
+                    f"🧹 Pruned mapped={pruned_mapped_count}, scanned={pruned_scanned_count} frontier(s); selecting only not-yet-scanned frontiers"
+                )
+
+        if not frontier_pool:
+            self.last_frontier_skip_reason = "no_unexplored_frontiers"
+            return None
+
+        if self.blacklisted_goals:
+            expired = [k for k, v in self.blacklisted_goals.items() if v <= now]
+            for k in expired:
+                self.blacklisted_goals.pop(k, None)
+
+        if self.recent_goals:
+            self.recent_goals = [g for g in self.recent_goals if g[2] > now]
+
+        def select_frontier(min_dist, goal_offset, use_costmap_filter):
+            best = None
+            best_dist = -float('inf') if self.frontier_pick_farthest else float('inf')
+            candidates = []
+
+            rejection_counts = {
+                'too_close': 0,
+                'already_mapped': 0,
+                'already_scanned': 0,
+                'strict_revisit': 0,
+                'strict_attempted': 0,
+                'costmap_or_free_space': 0,
+                'out_of_map': 0,
+                'no_free_neighbor': 0,
+                'blacklisted': 0,
+                'visited_goal': 0,
+                'near_last_success': 0,
+                'near_last_goal': 0,
+                'recent_goal': 0,
+            }
+
+            def build_candidates(costmap_filter: bool):
+                built = []
+                for fx, fy in frontier_pool:
+                    dist = math.sqrt((fx - robot_x)**2 + (fy - robot_y)**2)
+                    if dist < min_dist:
+                        rejection_counts['too_close'] += 1
+                        continue
+
+                    if self.force_frontier_goal:
+                        goal_x = fx
+                        goal_y = fy
+                    elif goal_offset > 0.0:
+                        if dist <= (goal_offset + 0.05):
+                            continue
+                        ux = (fx - robot_x) / dist
+                        uy = (fy - robot_y) / dist
+                        goal_x = fx - (ux * goal_offset)
+                        goal_y = fy - (uy * goal_offset)
+                    else:
+                        goal_x = fx
+                        goal_y = fy
+
+                    standoff_goal = self._compute_lidar_standoff_goal(robot_x, robot_y, fx, fy, goal_x, goal_y)
+                    if standoff_goal is None:
+                        continue
+                    goal_x, goal_y = standoff_goal
+
+                    if self.strict_no_revisit and self.strict_avoid_goals:
+                        strict_radius = max(
+                            self.visited_goal_radius,
+                            self.recent_goal_radius,
+                            self.avoid_return_radius,
+                            self.avoid_last_goal_radius,
+                            self.known_frontier_avoid_radius,
+                        )
+                        if any(math.hypot(goal_x - sx, goal_y - sy) <= strict_radius
+                               for sx, sy in self.strict_avoid_goals):
+                            rejection_counts['strict_revisit'] += 1
+                            continue
+                    if self.strict_no_revisit and self.attempted_frontiers:
+                        strict_radius = max(
+                            self.visited_goal_radius,
+                            self.recent_goal_radius,
+                            self.avoid_return_radius,
+                            self.avoid_last_goal_radius,
+                            self.known_frontier_avoid_radius,
+                        )
+                        if any(math.hypot(fx - sx, fy - sy) <= strict_radius
+                               for sx, sy in self.attempted_frontiers):
+                            rejection_counts['strict_attempted'] += 1
+                            continue
+
+                    if not self._goal_in_free_space(goal_x, goal_y, costmap_filter):
+                        rejection_counts['costmap_or_free_space'] += 1
+                        continue
+
+                    if costmap_filter and self.costmap is not None:
+                        costmap_info = self._get_costmap_info()
+                        if costmap_info is not None:
+                            gc = self._world_to_costmap(goal_x, goal_y, costmap_info)
+                            if gc is None:
+                                rejection_counts['out_of_map'] += 1
+                                continue
+                            _, _, _, width, height, _ = costmap_info
+                            gx_c, gy_c = gc
+                            has_free_neighbor = False
+                            for ddx, ddy in ((1,0),(-1,0),(0,1),(0,-1)):
+                                nx2, ny2 = gx_c + ddx, gy_c + ddy
+                                if 0 <= nx2 < width and 0 <= ny2 < height:
+                                    if self._is_costmap_free(nx2, ny2, costmap_info):
+                                        has_free_neighbor = True
+                                        break
+                            if not has_free_neighbor:
+                                rejection_counts['no_free_neighbor'] += 1
+                                continue
+
+                    if self.blacklisted_goals:
+                        skip = any(math.hypot(goal_x - bx, goal_y - by) <= self.blacklist_radius
+                                  for (bx, by), _ in self.blacklisted_goals.items())
+                        if skip:
+                            rejection_counts['blacklisted'] += 1
+                            continue
+
+                    if self.avoid_revisit and self.visited_goals:
+                        skip = any(math.hypot(goal_x - vx, goal_y - vy) <= self.visited_goal_radius
+                                  for vx, vy in self.visited_goals)
+                        if skip:
+                            rejection_counts['visited_goal'] += 1
+                            continue
+
+                    if self.avoid_revisit and self.last_successful_goal_pos is not None:
+                        if math.hypot(goal_x - self.last_successful_goal_pos[0], goal_y - self.last_successful_goal_pos[1]) <= self.avoid_return_radius:
+                            rejection_counts['near_last_success'] += 1
+                            continue
+
+                    if self.avoid_revisit and self.last_goal_target is not None:
+                        if math.hypot(goal_x - self.last_goal_target[0], goal_y - self.last_goal_target[1]) <= self.avoid_last_goal_radius:
+                            rejection_counts['near_last_goal'] += 1
+                            continue
+
+                    if self.recent_goals:
+                        skip = any(math.hypot(goal_x - rx, goal_y - ry) <= self.recent_goal_radius
+                                  for rx, ry, _ in self.recent_goals)
+                        if skip:
+                            rejection_counts['recent_goal'] += 1
+                            continue
+
+                    built.append({
+                        'frontier': (fx, fy),
+                        'goal': (goal_x, goal_y),
+                        'dist': dist,
+                        'costmap_filtered': costmap_filter
+                    })
+                return built
+
+            candidates = build_candidates(use_costmap_filter)
+            if not candidates and use_costmap_filter and self.allow_costmapless_replan_candidates:
+                candidates = build_candidates(False)
+                if candidates:
+                    now = time.time()
+                    if (now - self.last_frontier_relax_log_time) >= self.frontier_relax_log_interval:
+                        self.last_frontier_relax_log_time = now
+                        self.get_logger().warn("No candidates after costmap filter; retrying without costmap filter.")
+
+            if not candidates:
+                return None
+
+            if self.frontier_selection_method == 'astar':
+                candidates.sort(key=lambda c: c['dist'])
+                candidates = candidates[:max(1, self.astar_max_candidates)]
+                best_cost = None
+                astar_found = False
+                astar_attempts = 0
+                for candidate in candidates:
+                    astar_attempts += 1
+                    path_cost = self._astar_path_length((robot_x, robot_y), candidate['goal'])
+                    if path_cost is None:
+                        continue
+                    astar_found = True
+                    if best_cost is None:
+                        best_cost = path_cost
+                        best = candidate
+                        best['dist'] = path_cost
+                        continue
+                    if self.frontier_pick_farthest:
+                        if path_cost > best_cost:
+                            best_cost = path_cost
+                            best = candidate
+                            best['dist'] = path_cost
+                    else:
+                        if path_cost < best_cost:
+                            best_cost = path_cost
+                            best = candidate
+                            best['dist'] = path_cost
+                if astar_found:
+                    self.get_logger().info(f"✅ A* selected best frontier from {astar_attempts} candidates (path cost: {best_cost:.2f}m)")
+                    return best
+                now = time.time()
+                if (now - self.last_frontier_relax_log_time) >= self.frontier_relax_log_interval:
+                    self.last_frontier_relax_log_time = now
+                    self.get_logger().warn(f"⚠️ A* failed for all {astar_attempts} candidates (check debug logs); falling back to distance selection.")
+
+            for candidate in candidates:
+                dist = candidate['dist']
+                if self.frontier_pick_farthest:
+                    if dist <= best_dist:
+                        continue
+                else:
+                    if dist >= best_dist:
+                        continue
+                best_dist = dist
+                best = candidate
+
+            return best
+
+        best_frontier = select_frontier(
+            self.min_frontier_distance,
+            self.frontier_goal_offset,
+            self.use_costmap_goal_filter
+        )
+
+        if best_frontier is None and self.no_frontier_cycles >= self.relaxed_frontier_after_cycles:
+            best_frontier = select_frontier(
+                self.relaxed_min_frontier_distance,
+                self.relaxed_frontier_goal_offset,
+                self.relaxed_use_costmap_filter
+            )
+            if best_frontier:
+                self.get_logger().info("⚠️ Relaxed frontier filter enabled for this goal")
+
+        if (
+            best_frontier is None and
+            frontier_pool and
+            self.goals_reached < self.min_goals_for_complete and
+            bool(getattr(self, 'enable_bootstrap_frontier_fallback', True))
+        ):
+            fallback = None
+            fallback_dist = float('inf')
+            for fx, fy in frontier_pool:
+                dist = math.hypot(fx - robot_x, fy - robot_y)
+                if dist < max(self.bootstrap_fallback_min_distance, self.relaxed_min_frontier_distance):
+                    continue
+                goal_x = fx
+                goal_y = fy
+                standoff_goal = self._compute_lidar_standoff_goal(robot_x, robot_y, fx, fy, goal_x, goal_y)
+                if standoff_goal is None:
+                    continue
+                goal_x, goal_y = standoff_goal
+                if self.strict_no_revisit and self.strict_avoid_goals:
+                    strict_radius = max(
+                        self.visited_goal_radius,
+                        self.recent_goal_radius,
+                        self.avoid_return_radius,
+                        self.avoid_last_goal_radius,
+                        self.known_frontier_avoid_radius,
+                    )
+                    if any(math.hypot(fx - sx, fy - sy) <= strict_radius for sx, sy in self.strict_avoid_goals):
+                        continue
+                if self.strict_no_revisit and self.attempted_frontiers:
+                    strict_radius = max(
+                        self.visited_goal_radius,
+                        self.recent_goal_radius,
+                        self.avoid_return_radius,
+                        self.avoid_last_goal_radius,
+                        self.known_frontier_avoid_radius,
+                    )
+                    if any(math.hypot(fx - sx, fy - sy) <= strict_radius for sx, sy in self.attempted_frontiers):
+                        continue
+                if self.blacklisted_goals:
+                    skip = any(
+                        math.hypot(goal_x - bx, goal_y - by) <= self.blacklist_radius
+                        for (bx, by), _ in self.blacklisted_goals.items()
+                    )
+                    if skip:
+                        continue
+                if self.avoid_revisit and self.last_successful_goal_pos is not None:
+                    if math.hypot(goal_x - self.last_successful_goal_pos[0], goal_y - self.last_successful_goal_pos[1]) <= self.avoid_return_radius:
+                        continue
+                if self.avoid_revisit and self.last_goal_target is not None:
+                    if math.hypot(goal_x - self.last_goal_target[0], goal_y - self.last_goal_target[1]) <= self.avoid_last_goal_radius:
+                        continue
+                if self.recent_goals:
+                    skip = any(
+                        math.hypot(goal_x - rx, goal_y - ry) <= self.recent_goal_radius
+                        for rx, ry, _ in self.recent_goals
+                    )
+                    if skip:
+                        continue
+                if not self._goal_in_free_space(goal_x, goal_y, self.use_costmap_goal_filter):
+                    continue
+                goal_dist = math.hypot(goal_x - robot_x, goal_y - robot_y)
+                if goal_dist < fallback_dist:
+                    fallback_dist = goal_dist
+                    fallback = {
+                        'frontier': (fx, fy),
+                        'goal': (goal_x, goal_y),
+                        'dist': goal_dist,
+                        'costmap_filtered': False
+                    }
+            if fallback is not None:
+                best_frontier = fallback
+                now = time.time()
+                if (now - self.last_frontier_relax_log_time) >= self.frontier_relax_log_interval:
+                    self.last_frontier_relax_log_time = now
+                    self.get_logger().warn(
+                        "⚠️ Using bootstrap frontier fallback (strict filters rejected all candidates)."
+                    )
+
+        if best_frontier:
+            fx, fy = best_frontier['frontier']
+            gx, gy = best_frontier['goal']
+            self.get_logger().info(f"🎯 Nearest frontier: ({fx:.2f}, {fy:.2f}) -> goal ({gx:.2f}, {gy:.2f}), dist: {best_frontier['dist']:.2f}m")
+            return best_frontier
+
+        self.last_frontier_skip_reason = "no_valid_frontiers"
+        return None
+
+    def _refresh_pending_goal_from_frontiers(self, reason: str):
+        if not self.replan_on_frontier_update:
+            return
+        if self.last_frontier_update_time <= self.last_replan_time:
+            return
+        now = time.time()
+        if (now - self.last_replan_time) < self.replan_hard_min_interval:
+            return
+        if not self.always_replan_on_frontier_update and (now - self.last_replan_time) < self.replan_interval:
+            return
+        self.update_pose()
+        if not self.pose_valid:
+            return
+
+        goal_info = self.pick_best_frontier()
+        if goal_info is None:
+            return
+
+        best_goal_x, best_goal_y = goal_info['goal']
+        if self.last_goal_target is not None:
+            current_goal_x, current_goal_y = self.last_goal_target
+            goal_delta = math.hypot(best_goal_x - current_goal_x, best_goal_y - current_goal_y)
+            if goal_delta < max(0.05, self.replan_goal_change_distance):
+                return
+
+        self.pending_replan_goal = (best_goal_x, best_goal_y)
+        self.last_replan_time = now
+        self.get_logger().info(f"🔁 Replan pending ({reason}): new goal ({best_goal_x:.2f}, {best_goal_y:.2f})")
+    
+    def send_goal_to_nav2(self, goal_x, goal_y, use_costmap_filter: bool | None = None, frontier_xy=None):
+        """Send goal to Nav2 navigate_to_pose with proper TF timeout handling"""
+        now = time.time()
+        timeout = Duration(seconds=0.1)                                   
+        if use_costmap_filter is None:
+            use_costmap_filter = self.use_costmap_goal_filter
+
+        if self.obstacle_detected or self.front_obstacle_detected:
+            self.get_logger().warn("⚠️ Skipping goal send: obstacle currently detected")
+            return False
+
+        scan_age = now - self.last_scan_time
+        if scan_age > self.lidar_stale_timeout:
+            self.get_logger().warn(
+                f"⚠️ Skipping goal send: scan stale ({scan_age:.2f}s > {self.lidar_stale_timeout:.2f}s)"
+            )
+            return False
+
+        front_clearance = self.last_lidar_front_distance
+        if front_clearance is not None and front_clearance <= (self.lidar_obstacle_distance + 0.04):
+            self.get_logger().warn(
+                f"⚠️ Skipping goal send: front clearance too small ({front_clearance:.2f}m)"
+            )
+            return False
+        
+        try:
+            can_map_base = self.tf_buffer.can_transform('map', self.base_frame, rclpy.time.Time(), timeout=timeout)
+            if not can_map_base:
+                self.get_logger().warn("⚠️ Skipping goal send: map->base TF not available")
+                return False
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ Skipping goal send: TF check failed: {e}")
+            return False
+
+        if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter):
+            self.get_logger().warn(f"⚠️ Goal ({goal_x:.2f}, {goal_y:.2f}) no longer in free space - skipping")
+            self._blacklist_goal((goal_x, goal_y))
+            return False
+
+        # If the robot currently sits in a lethal/occupied start cell, planner will repeatedly abort.
+        if use_costmap_filter:
+            self.update_pose()
+            if self.pose_valid:
+                costmap_info = self._get_costmap_info()
+                if costmap_info is not None:
+                    robot_cell = self._world_to_costmap(self.robot_pose[0], self.robot_pose[1], costmap_info)
+                    robot_cell_free = False
+                    if robot_cell is not None:
+                        robot_cell_free = self._is_costmap_free(robot_cell[0], robot_cell[1], costmap_info)
+                    if not robot_cell_free:
+                        self.get_logger().warn(
+                            "⚠️ Skipping goal send: robot start cell is lethal in global costmap; triggering escape/clear"
+                        )
+                        self._clear_costmaps('start_cell_lethal', clear_global=True)
+                        self._maybe_lethal_escape(self.robot_pose[0], self.robot_pose[1])
+                        return False
+
+        nav2_server_ready = self.nav_client.wait_for_server(timeout_sec=0.1)
+        nav2_services_ready = self._nav2_services_ready()
+        nav2_lifecycle_active = self._nav2_active(require_active=self.require_nav2_active, services_ready=nav2_services_ready)
+        nav2_ready = nav2_server_ready and (nav2_lifecycle_active if self.require_nav2_active else True)
+        if self.require_nav2_active and not nav2_ready:
+            self.get_logger().warn("⚠️ Skipping goal send: Nav2 not active")
+            return False
+
+        try:
+            can_map_base = self.tf_buffer.can_transform('map', 'base_footprint', rclpy.time.Time(), timeout=timeout)
+            can_map_odom = self.tf_buffer.can_transform('map', 'odom', rclpy.time.Time(), timeout=timeout)
+        except Exception as tf_err:
+            if (now - self.last_tf_check_log_time) > self.tf_check_log_interval:
+                self.last_tf_check_log_time = now
+                self.get_logger().warn(f"⚠️ TF availability check failed: {tf_err}. Goal send skipped.")
+            return False
+            
+        if not can_map_base or not can_map_odom:
+            if (now - self.last_tf_check_log_time) > self.tf_check_log_interval:
+                self.last_tf_check_log_time = now
+                self.get_logger().warn(
+                    f"⚠️ Missing TF: map->base_footprint={can_map_base}, map->odom={can_map_odom}. Goal send skipped."
+                )
+            return False
+
+        self._nav2_active()
+
+        if not self.nav_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("❌ Nav2 server not ready")
+            return False
+
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = goal_x
+        goal_msg.pose.pose.position.y = goal_y
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.w = 1.0
+
+        self.last_goal_target = (goal_x, goal_y)
+        _elapsed = time.time() - self.startup_time
+        _fx, _fy = frontier_xy if frontier_xy is not None else (goal_x, goal_y)
+        self.nav_goals_series.append((_elapsed, goal_x, goal_y, _fx, _fy))
+        self.recent_goals.append((goal_x, goal_y, time.time() + self.recent_goal_hold_time))
+
+        self.goal_in_progress = True                                                   
+        
+        self.update_pose()
+        robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
+        if frontier_xy is not None:
+            fx, fy = frontier_xy
+            heading = math.atan2(fy - robot_y, fx - robot_x)
+            heading_deg = math.degrees(heading)
+            self.get_logger().info(
+                f"🚀 Sending Nav2 goal: Robot ({robot_x:.2f}, {robot_y:.2f}) → Frontier ({fx:.2f}, {fy:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f}) | Heading: {heading_deg:.1f}°"
+            )
+        else:
+            heading = math.atan2(goal_y - robot_y, goal_x - robot_x)
+            heading_deg = math.degrees(heading)
+            self.get_logger().info(
+                f"🚀 Sending Nav2 goal: Robot ({robot_x:.2f}, {robot_y:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f}) | Heading: {heading_deg:.1f}°"
+            )
+        
+        send_goal_future = self.nav_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self.goal_response_cb)
+        self.last_goal_dispatch_time = time.time()
+        self.goal_dispatch_pose = (robot_x, robot_y)
+        self._publish_goal_arrow(robot_x, robot_y, goal_x, goal_y)
+
+        return True
+
+    def _nav2_services_ready(self) -> bool:
+        now = time.time()
+        missing = []
+        if not self.bt_state_client.service_is_ready():
+            missing.append('bt_navigator')
+        if not self.controller_state_client.service_is_ready():
+            missing.append('controller_server')
+        if not self.planner_state_client.service_is_ready():
+            missing.append('planner_server')
+        if missing and (now - self.last_tf_check_log_time) > self.tf_check_log_interval:
+            self.last_tf_check_log_time = now
+            self.get_logger().warn(f"⚠️ Nav2 lifecycle services not ready: {', '.join(missing)}")
+        return len(missing) == 0
+
+    def _nav2_active(self, require_active: bool = False, services_ready: bool | None = None):
+        now = time.time()
+        if services_ready is None:
+            services_ready = self._nav2_services_ready()
+        if not services_ready:
+            if require_active and self.nav2_active_fallback_on_action:
+                return self.nav_client.wait_for_server(timeout_sec=0.05)
+            return False
+
+        bt_state = self._get_lifecycle_state(self.bt_state_client, 'bt_navigator')
+        controller_state = self._get_lifecycle_state(self.controller_state_client, 'controller_server')
+        planner_state = self._get_lifecycle_state(self.planner_state_client, 'planner_server')
+
+        active = (bt_state == 'active' and controller_state == 'active' and planner_state == 'active')
+        fallback_states = {'unknown', 'error'}
+        all_states_uncertain = (
+            bt_state in fallback_states and
+            controller_state in fallback_states and
+            planner_state in fallback_states
+        )
+        bt_only_uncertain = (
+            bt_state in fallback_states and
+            controller_state == 'active' and
+            planner_state == 'active'
+        )
+        mixed_uncertain_with_active = (
+            (bt_state in fallback_states or controller_state in fallback_states or planner_state in fallback_states) and
+            (bt_state == 'active' or controller_state == 'active' or planner_state == 'active')
+        )
+        if require_active and (not active) and self.nav2_active_fallback_on_action and (
+            all_states_uncertain or bt_only_uncertain or mixed_uncertain_with_active
+        ):
+            if (now - self.startup_time) >= self.nav2_active_grace_sec:
+                if self.nav_client.wait_for_server(timeout_sec=0.05):
+                    if (now - self.last_tf_check_log_time) > self.tf_check_log_interval:
+                        self.last_tf_check_log_time = now
+                        if bt_only_uncertain:
+                            self.get_logger().warn(
+                                "⚠️ bt_navigator lifecycle state uncertain while planner/controller are active; using action-server readiness fallback"
+                            )
+                        elif mixed_uncertain_with_active:
+                            self.get_logger().warn(
+                                f"⚠️ Nav2 mixed lifecycle states (bt={bt_state}, controller={controller_state}, planner={planner_state}); using action-server readiness fallback"
+                            )
+                        else:
+                            self.get_logger().warn(
+                                "⚠️ Nav2 lifecycle states uncertain; using action-server readiness fallback"
+                            )
+                    return True
+        if require_active and not active:
+            if (now - self.last_tf_check_log_time) > self.tf_check_log_interval:
+                self.last_tf_check_log_time = now
+                self.get_logger().warn(
+                    f"⚠️ Nav2 not active: bt={bt_state}, controller={controller_state}, planner={planner_state}"
+                )
+        return active if require_active else True
+
+    def _get_lifecycle_state(self, client, key: str = 'unknown'):
+        """Non-blocking lifecycle state poll safe to call from timer callbacks."""
+        try:
+            cache = getattr(self, '_nav2_lifecycle_state_cache', {})
+            futures = getattr(self, '_nav2_lifecycle_state_futures', {})
+            last_req = getattr(self, '_nav2_lifecycle_state_last_req', {})
+            now = time.time()
+
+            fut = futures.get(key)
+            if fut is not None and fut.done():
+                try:
+                    res = fut.result()
+                    if res is None or res.current_state is None:
+                        cache[key] = 'unknown'
+                    else:
+                        cache[key] = str(res.current_state.label).lower()
+                except Exception:
+                    cache[key] = 'error'
+                futures[key] = None
+
+            if futures.get(key) is None and client.service_is_ready():
+                if (now - float(last_req.get(key, 0.0))) >= 0.25:
+                    try:
+                        futures[key] = client.call_async(GetState.Request())
+                        last_req[key] = now
+                    except Exception:
+                        cache[key] = 'error'
+
+            self._nav2_lifecycle_state_cache = cache
+            self._nav2_lifecycle_state_futures = futures
+            self._nav2_lifecycle_state_last_req = last_req
+            return str(cache.get(key, 'unknown')).lower()
+        except Exception:
+            return 'error'
+    
+    def goal_response_cb(self, future):
+        """Handle Nav2 goal response"""
+        Phase = self.current_phase.__class__
+        self.goal_handle = future.result()
+        if self.goal_handle.accepted:
+            self.get_logger().info("✅ Goal accepted by Nav2")
+            self.nav2_ready = True
+            result_future = self.goal_handle.get_result_async()
+            result_future.add_done_callback(self.goal_result_cb)
+        else:
+            self.get_logger().warn("❌ Goal rejected by Nav2")
+            self.goal_handle = None
+            self.goal_in_progress = False
+            self.frontiers_dirty = True
+            self.last_goal_time = time.time()
+            self.consecutive_failures += 1
+
+            if self.last_goal_target is not None:
+                self._blacklist_goal(self.last_goal_target)
+                if self.strict_no_revisit:
+                    self.strict_avoid_goals.append(self.last_goal_target)
+
+            self.get_logger().warn(
+                f"🔁 Goal REJECTED — treating as planning failure #{self.consecutive_failures}/{self.max_consecutive_failures}"
+            )
+
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                self.get_logger().error(
+                    f"🚨 STUCK DETECTED! {self.consecutive_failures} consecutive failures — entering RECOVERY mode"
+                )
+                self.current_phase = Phase.RECOVERY
+                self.stuck_recovery_in_progress = True
+                self.recovery_start_time = time.time()
+            else:
+                self._clear_costmaps('goal_rejected', clear_global=True)
+                self.update_pose()
+                if self.pose_valid:
+                    self._maybe_lethal_escape(self.robot_pose[0], self.robot_pose[1])
+
+    def _maintain_active_goal(self, now: float) -> bool:
+        """Return True when a goal is still active or still being processed."""
+        if not (self.goal_handle is not None or self.goal_in_progress):
+            return False
+
+        if self.goal_in_progress and self.goal_handle is None:
+            if self.last_goal_dispatch_time > 0.0 and (now - self.last_goal_dispatch_time) >= self.goal_ack_timeout:
+                self.goal_in_progress = False
+                self.frontiers_dirty = True
+                self.last_goal_time = 0.0
+                self.get_logger().warn(
+                    f"⚠️ Nav2 goal ack timeout ({self.goal_ack_timeout:.1f}s); retrying frontier dispatch"
+                )
+                return False
+            return True
+
+        if self.goal_handle is None:
+            return self.goal_in_progress
+
+        nav2_services_ready = self._nav2_services_ready()
+        nav2_healthy = self._nav2_active(
+            require_active=self.require_nav2_active,
+            services_ready=nav2_services_ready
+        )
+        if self.require_nav2_active and not nav2_healthy:
+            return True
+
+        if self.goal_watchdog_timeout <= 0.0:
+            return True
+
+        if self.last_goal_dispatch_time <= 0.0:
+            self.last_goal_dispatch_time = now
+            return True
+
+        if (now - self.last_goal_dispatch_time) < self.goal_watchdog_timeout:
+            return True
+
+        self.update_pose()
+        if self.pose_valid and self.goal_dispatch_pose is not None:
+            moved = math.hypot(
+                self.robot_pose[0] - self.goal_dispatch_pose[0],
+                self.robot_pose[1] - self.goal_dispatch_pose[1]
+            )
+            if moved >= self.goal_watchdog_min_motion:
+                self.goal_dispatch_pose = (self.robot_pose[0], self.robot_pose[1])
+                self.last_goal_dispatch_time = now
+                return True
+
+        if self.last_goal_target is not None:
+            self._blacklist_goal(self.last_goal_target)
+        try:
+            self.goal_handle.cancel_goal_async()
+        except Exception as e:
+            if (now - self.last_goal_watchdog_log_time) >= 2.0:
+                self.last_goal_watchdog_log_time = now
+                self.get_logger().warn(f"⚠️ Goal watchdog cancel failed: {e}")
+            return True
+
+        self.goal_handle = None
+        self.goal_in_progress = False
+        self.frontiers_dirty = True
+        self.last_goal_time = 0.0
+        if (now - self.last_goal_watchdog_log_time) >= 2.0:
+            self.last_goal_watchdog_log_time = now
+            self.get_logger().warn(
+                f"🔁 Goal watchdog: preempted stale goal after {self.goal_watchdog_timeout:.1f}s without motion"
+            )
+        return False
+    
+    def goal_result_cb(self, future):
+        """Handle Nav2 goal completion"""
+        Phase = self.current_phase.__class__
+        result = future.result()
+        self.goal_handle = None                                                
+        self.frontiers_dirty = True                                                          
+        self.goal_in_progress = False                                 
+        self._clear_goal_arrow()
+        
+        self.update_pose()
+        robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
+        
+        if self.replan_cancel_pending and (time.time() - self.last_goal_cancel_time) < 2.0:
+            if result.status in (5, 6):
+                status_name = 'ABORTED' if result.status == 5 else 'CANCELED'
+                self.get_logger().info(
+                    f"🔁 Ignoring {status_name} result from intentional replan cancel at ({robot_x:.2f}, {robot_y:.2f})"
+                )
+                self.replan_cancel_pending = False
+                self.last_goal_time = 0.0
+                return
+        self.replan_cancel_pending = False
+
+        if result.status == 4:             
+            self.get_logger().info(f"✅ Reached frontier goal! Robot at ({robot_x:.2f}, {robot_y:.2f})")
+            self.consecutive_failures = 0                                    
+            self.last_successful_goal_pos = (robot_x, robot_y)
+            self.goals_reached += 1                                               
+            self.get_logger().info(f"📊 Goals reached: {self.goals_reached}/{self.min_goals_for_complete}")
+            if self.avoid_revisit:
+                self.visited_goals.append((robot_x, robot_y))
+            if self.strict_no_revisit and self.last_goal_target is not None:
+                self.strict_avoid_goals.append(self.last_goal_target)
+        elif result.status == 5:           
+            self.consecutive_failures += 1
+            self.get_logger().error(f"❌ Goal ABORTED! Failure #{self.consecutive_failures}/{self.max_consecutive_failures} at pos ({robot_x:.2f}, {robot_y:.2f})")
+            self.get_logger().error(f"   Likely cause: No valid path found by Nav2 planner")
+
+            if self.last_goal_target is not None:
+                self._blacklist_goal(self.last_goal_target)
+                if self.strict_no_revisit:
+                    self.strict_avoid_goals.append(self.last_goal_target)
+            
+            if self.obstacle_detected:
+                self.get_logger().warn(f"🚧 Goal aborted AND obstacle detected at {self.obstacle_distance_m:.3f}m - entering OBSTACLE handling")
+                self.current_phase = Phase.OBSTACLE
+                self.phase_start_time = time.time()
+            else:
+                self.get_logger().warn(f"🔄 Goal aborted but path clear - will try new frontier immediately")
+                self.last_goal_time = 0.0                                     
+            
+            if self.consecutive_failures >= self.max_consecutive_failures:
+                self.get_logger().error(f"🚨 STUCK DETECTED! {self.consecutive_failures} consecutive failures - entering RECOVERY mode")
+                self.current_phase = Phase.RECOVERY
+                self.stuck_recovery_in_progress = True
+                self.recovery_start_time = time.time()
+            else:
+                self._clear_costmaps('aborted_planning_failure', clear_global=True)
+                self._maybe_lethal_escape(robot_x, robot_y)
+        elif result.status == 6:            
+            self.get_logger().warn(f"⚠️ Navigation canceled at ({robot_x:.2f}, {robot_y:.2f})")
+            if self.last_goal_target is not None and self.strict_no_revisit:
+                self.strict_avoid_goals.append(self.last_goal_target)
+            if self.obstacle_detected:
+                self.get_logger().warn(f"🚧 Goal canceled with obstacle present - will wait for obstacle handling")
+            else:
+                self.consecutive_failures += 1
+                self.get_logger().warn(
+                    f"🔄 Goal canceled (no obstacle) — treating as planning failure "
+                    f"#{self.consecutive_failures}/{self.max_consecutive_failures}"
+                )
+                if self.last_goal_target is not None:
+                    self._blacklist_goal(self.last_goal_target)
+                self.last_goal_time = 0.0
+
+                if self.consecutive_failures >= self.max_consecutive_failures:
+                    self.get_logger().error(
+                        f"🚨 STUCK DETECTED! {self.consecutive_failures} consecutive planning failures — entering RECOVERY mode"
+                    )
+                    self.current_phase = Phase.RECOVERY
+                    self.stuck_recovery_in_progress = True
+                    self.recovery_start_time = time.time()
+                else:
+                    self._clear_costmaps('canceled_planning_failure', clear_global=True)
+                    self._maybe_lethal_escape(robot_x, robot_y)
+        else:
+            self.get_logger().warn(f"⚠️ Navigation ended with status: {result.status} at ({robot_x:.2f}, {robot_y:.2f})")
+
+    def _blacklist_goal(self, goal_xy):
+        now = time.time()
+        self.blacklisted_goals[goal_xy] = now + self.blacklist_duration
+        self.get_logger().warn(
+            f"⚠️ Blacklisting failed goal ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) for {self.blacklist_duration:.0f}s"
+        )
+
+    def _clear_costmaps(self, reason: str, clear_global: bool = False):
+        if not self.clear_costmap_on_obstacle:
+            return
+        now = time.time()
+        if (now - self.last_costmap_clear_time) < self.costmap_clear_cooldown:
+            return
+        self.last_costmap_clear_time = now
+
+        req = ClearEntireCostmap.Request()
+        if self.clear_local_costmap_client.service_is_ready():
+            try:
+                self.clear_local_costmap_client.call_async(req)
+                self.get_logger().warn(f"🧹 Requested local costmap clear ({reason})")
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ Local costmap clear failed ({reason}): {e}")
+        if clear_global and self.clear_global_costmap_client.service_is_ready():
+            try:
+                self.clear_global_costmap_client.call_async(req)
+                self.get_logger().warn(f"🧹 Requested global costmap clear ({reason})")
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ Global costmap clear failed ({reason}): {e}")
+

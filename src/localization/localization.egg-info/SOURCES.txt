@@ -8,9 +8,9 @@ config/motor_speeds.yaml
 config/rtabmap_params.yaml
 config/rviz_fusion.rviz
 localization/__init__.py
-localization/arduino_motor_bridge_simple.py
+localization/arduino_motor_bridge.py
 localization/dynamic_obstacle_tracker.py
-localization/exploration_coordinator_simple.py
+localization/exploration_coordinator.py
 localization/frontier_detector.py
 localization/lidar_explorer.py
 localization/map_odom_fallback.py

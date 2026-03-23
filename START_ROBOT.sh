@@ -7,6 +7,13 @@ set -eo pipefail
 
 cd /home/pi/FEA_SLAM_WS
 
+# Clear stale FastDDS profile env if the referenced file no longer exists.
+if [[ -n "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" && ! -f "${FASTRTPS_DEFAULT_PROFILES_FILE}" ]]; then
+	echo "[INFO] FASTRTPS_DEFAULT_PROFILES_FILE points to missing file: ${FASTRTPS_DEFAULT_PROFILES_FILE}"
+	echo "[INFO] Unsetting stale FastDDS profile env for this session"
+	unset FASTRTPS_DEFAULT_PROFILES_FILE
+fi
+
 
 # --- Source the workspace after build ---
 echo "[SOURCE] Sourcing ROS and workspace setup files..."
@@ -75,7 +82,7 @@ cleanup_stop() {
 
 cleanup_done=0
 stop_requested=0
-LAUNCH_MATCH='exploration_coordinator_simple|arduino_motor_bridge_simple|frontier_detector|scan_timestamp_fix|ydlidar_ros2_driver_node|async_slam_toolbox_node|sync_slam_toolbox_node|controller_server|planner_server|bt_navigator|behavior_server|waypoint_follower|velocity_smoother|lifecycle_manager_navigation|lifecycle_manager_navigation_override|rviz2|joint_state_publisher|robot_state_publisher|static_transform_publisher|ekf_node|ros2 launch fea_slam robot_full.launch.py'
+LAUNCH_MATCH='exploration_coordinator|arduino_motor_bridge|frontier_detector|scan_timestamp_fix|ydlidar_ros2_driver_node|async_slam_toolbox_node|sync_slam_toolbox_node|controller_server|planner_server|bt_navigator|behavior_server|waypoint_follower|velocity_smoother|lifecycle_manager_navigation|lifecycle_manager_navigation_override|rviz2|joint_state_publisher|robot_state_publisher|static_transform_publisher|ekf_node|ros2 launch fea_slam robot_full.launch.py'
 
 cleanup_all() {
 	if [[ "$cleanup_done" -eq 1 ]]; then
@@ -240,7 +247,7 @@ post_launch_healthcheck() {
 				local child parent
 				child="${tf%% *}"
 				parent="${tf##* }"
-				if ros2 run tf2_ros tf2_echo "$parent" "$child" --timeout 0.5 2>/dev/null | grep -q 'Translation:'; then
+				if timeout 0.7 ros2 run tf2_ros tf2_echo "$parent" "$child" 2>/dev/null | grep -q 'Translation:'; then
 					tf_ok[$tf]=1
 					echo "[CHECK] ✓ tf       $child → $parent"
 				fi
@@ -308,31 +315,42 @@ if [[ "$ENV_MODE" != "static" && "$ENV_MODE" != "dynamic" ]]; then
 fi
 echo "[MODE] env=${ENV_MODE}"
 
-# Default OFF here: exploration_coordinator handles auto initial pose itself.
-# Set AUTO_INITIAL_POSE=true only for explicit one-shot script-level (0,0,0) publish.
-AUTO_INITIAL_POSE="${AUTO_INITIAL_POSE:-false}"
+# Single startup profile: autonomous exploration stack enabled.
+USE_EXPLORATION="true"
+USE_NAV2="true"
+RVIZ_CONFIG="${RVIZ_CONFIG:-/home/pi/FEA_SLAM_WS/src/fea_slam/rviz/robot_autonomous_lite.rviz}"
+USE_SLAM="${USE_SLAM:-true}"
+
+# In SLAM mode, do not auto-load a previously saved map.
+# In localization mode (USE_SLAM=false), load latest saved map by default.
+if [[ -n "${MAP_YAML:-}" ]]; then
+	MAP_FILE="${MAP_YAML}"
+elif [[ "${USE_SLAM}" == "true" ]]; then
+	MAP_FILE="/home/pi/FEA_SLAM_WS/src/fea_slam/config/empty_map.yaml"
+else
+	LATEST_SAVED_MAP="$(ls -1t /home/pi/FEA_SLAM_WS/saved_maps/map_*.yaml 2>/dev/null | head -n 1 || true)"
+	if [[ -n "${LATEST_SAVED_MAP}" ]]; then
+		MAP_FILE="${LATEST_SAVED_MAP}"
+	else
+		MAP_FILE="/home/pi/FEA_SLAM_WS/src/fea_slam/config/empty_map.yaml"
+	fi
+fi
+
+echo "[MODE] exploration=${USE_EXPLORATION}"
+echo "[MODE] nav2=${USE_NAV2}"
+echo "[MODE] slam=${USE_SLAM}"
+echo "[MODE] map=${MAP_FILE}"
+echo "[MODE] rviz_config=${RVIZ_CONFIG}"
+
+# Fixed ON: always publish script-level initial pose.
+AUTO_INITIAL_POSE="true"
 echo "[MODE] auto_initial_pose=${AUTO_INITIAL_POSE}"
 
 SYSTEM_READY=0
 READY_FLAG_FILE="/tmp/fea_slam_ready_$$"
 
-# Run health check in background so launch remains foreground and interruptible
-
-SMALL_TEST_MODE="${SMALL_TEST_MODE:-false}"
-echo "[MODE] small_test_mode=${SMALL_TEST_MODE}"
-
-# ENV_MODE: set to 'dynamic' for environments with chairs/containers (slower speed, wider safety margins)
-#   Usage: ENV_MODE=dynamic ./START_ROBOT.sh
-#   Default: static (open room, normal speed)
-ENV_MODE="${ENV_MODE:-static}"
-if [[ "$ENV_MODE" != "static" && "$ENV_MODE" != "dynamic" ]]; then
-        echo "[ERROR] ENV_MODE must be 'static' or 'dynamic' (got: '$ENV_MODE')"
-        exit 1
-fi
-echo "[MODE] env=${ENV_MODE}"
-
 # Run launch in a dedicated session/process-group so Ctrl+C handler can reliably terminate it
-setsid ros2 launch fea_slam robot_full.launch.py slam:=true exploration:=true rviz:=true map_odom_fallback:=false nav2_lifecycle_override:=false small_test_mode:=${SMALL_TEST_MODE} env:=${ENV_MODE} &
+setsid ros2 launch fea_slam robot_full.launch.py slam:=${USE_SLAM} map:=${MAP_FILE} nav2:=${USE_NAV2} exploration:=${USE_EXPLORATION} rviz:=true rviz_config:=${RVIZ_CONFIG} map_odom_fallback:=false nav2_lifecycle_override:=false small_test_mode:=${SMALL_TEST_MODE} env:=${ENV_MODE} &
 LAUNCH_PID=$!
 LAUNCH_PGID="$(ps -o pgid= -p "$LAUNCH_PID" 2>/dev/null | tr -d '[:space:]' || true)"
 
@@ -345,6 +363,7 @@ HEALTHCHECK_PID=$!
 echo "[POSE] Waiting for system readiness check to complete..."
 wait_ready_timeout=100
 wait_ready_elapsed=0
+wait_ready_timed_out=0
 while [[ "$wait_ready_elapsed" -lt "$wait_ready_timeout" ]]; do
 	if [[ "${stop_requested:-0}" -eq 1 ]]; then
 		echo "[STOP] Interrupted while waiting for system ready"
@@ -367,12 +386,7 @@ while [[ "$wait_ready_elapsed" -lt "$wait_ready_timeout" ]]; do
 done
 if [[ "$wait_ready_elapsed" -ge "$wait_ready_timeout" ]]; then
 	echo "[POSE][WARN] Timed out waiting for system ready — attempting pose publish anyway"
-fi
-
-if [[ "${AUTO_INITIAL_POSE}" == "true" ]]; then
-	echo "[POSE][WARN] Script-level /initialpose publish is disabled to avoid mid-run map re-anchoring."
-	echo "[POSE][STATUS] initialized=deferred reason=handled_by_exploration_coordinator"
-	AUTO_INITIAL_POSE="false"
+	wait_ready_timed_out=1
 fi
 
 if [[ "${AUTO_INITIAL_POSE}" == "true" ]]; then
@@ -427,7 +441,7 @@ if [[ "${AUTO_INITIAL_POSE}" == "true" ]]; then
 		fi
 	fi
 else
-	echo "[POSE] AUTO_INITIAL_POSE=false: script-level pose publish disabled (exploration_coordinator auto-init handles initial pose)."
+	echo "[POSE] AUTO_INITIAL_POSE=false: script-level initial pose publish disabled."
 fi
 
 wait $LAUNCH_PID || true
