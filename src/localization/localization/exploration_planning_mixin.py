@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+
 import math
 import time
+from .phase_enum import Phase
 
 import rclpy
 from lifecycle_msgs.srv import GetState
@@ -542,46 +544,74 @@ class ExplorationPlanningMixin:
         self.get_logger().info(f"🔁 Replan pending ({reason}): new goal ({best_goal_x:.2f}, {best_goal_y:.2f})")
     
     def send_goal_to_nav2(self, goal_x, goal_y, use_costmap_filter: bool | None = None, frontier_xy=None):
-        """Send goal to Nav2 navigate_to_pose with proper TF timeout handling"""
+        """Send goal to Nav2 navigate_to_pose with proper TF timeout handling and fallback logic"""
         now = time.time()
         timeout = Duration(seconds=0.1)                                   
         if use_costmap_filter is None:
             use_costmap_filter = self.use_costmap_goal_filter
 
-        if self.obstacle_detected or self.front_obstacle_detected:
+        # Force-send mode: if > 5 consecutive failures, bypass some strict checks
+        force_send_mode = (self.consecutive_failures >= 5 and len(self.current_frontiers) > 0)
+        if force_send_mode and not hasattr(self, '_force_send_log_time'):
+            self._force_send_log_time = now
+        if force_send_mode and (now - getattr(self, '_force_send_log_time', 0)) > 10.0:
+            self.get_logger().warn(
+                f"⚠️ Force-send mode: {self.consecutive_failures} failures — bypassing strict checks to keep exploring"
+            )
+            self._force_send_log_time = now
+
+        # In force-send mode, skip immediate obstacle check
+        if (self.obstacle_detected or self.front_obstacle_detected) and not force_send_mode:
             self.get_logger().warn("⚠️ Skipping goal send: obstacle currently detected")
             return False
 
         scan_age = now - self.last_scan_time
-        if scan_age > self.lidar_stale_timeout:
-            self.get_logger().warn(
-                f"⚠️ Skipping goal send: scan stale ({scan_age:.2f}s > {self.lidar_stale_timeout:.2f}s)"
-            )
+        current_phase = getattr(self, 'current_phase', None)
+        is_init_phase = (current_phase is not None and current_phase.__class__.__name__ == 'Phase' and 
+                         str(current_phase).split('.')[-1] == 'INIT')
+        
+        # During INIT, warn about stale scan but don't block goal sending (startup costmap may be settling)
+        # In force-send mode, also skip stale scan check
+        if scan_age > self.lidar_stale_timeout and not is_init_phase and not force_send_mode:
+            if (now - self.last_scan_stale_warn_time) > 5.0:
+                self.get_logger().warn(
+                    f"⚠️ Scan stale ({scan_age:.2f}s > {self.lidar_stale_timeout:.2f}s) — may affect path planning"
+                )
+                self.last_scan_stale_warn_time = now
             return False
+        elif scan_age > self.lidar_stale_timeout and is_init_phase:
+            if (now - self.last_scan_stale_warn_time) > 5.0:
+                self.get_logger().warn(
+                    f"⚠️ Startup: scan stale ({scan_age:.2f}s); proceeding with first frontier anyway"
+                )
+                self.last_scan_stale_warn_time = now
 
+        # Front clearance check: during INIT allow goal send even if slightly close
+        # In force-send mode, also skip front clearance check
         front_clearance = self.last_lidar_front_distance
-        if front_clearance is not None and front_clearance <= (self.lidar_obstacle_distance + 0.04):
-            self.get_logger().warn(
-                f"⚠️ Skipping goal send: front clearance too small ({front_clearance:.2f}m)"
-            )
+        if front_clearance is not None and front_clearance <= (self.lidar_obstacle_distance + 0.04) and not is_init_phase and not force_send_mode:
+            if (now - self.last_front_clearance_warn_time) > 5.0:
+                self.get_logger().warn(
+                    f"⚠️ Front clearance low ({front_clearance:.2f}m); waiting for clearer path"
+                )
+                self.last_front_clearance_warn_time = now
             return False
         
         try:
-            can_map_base = self.tf_buffer.can_transform('map', self.base_frame, rclpy.time.Time(), timeout=timeout)
+            can_map_base = self.tf_buffer.can_transform('map', self.base_frame, rclpy.time.Time(), timeout=Duration(seconds=0.05))
             if not can_map_base:
-                self.get_logger().warn("⚠️ Skipping goal send: map->base TF not available")
                 return False
-        except Exception as e:
-            self.get_logger().warn(f"⚠️ Skipping goal send: TF check failed: {e}")
-            return False
+        except Exception:
+            return False  # Silent fail for speed
 
         if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter):
             self.get_logger().warn(f"⚠️ Goal ({goal_x:.2f}, {goal_y:.2f}) no longer in free space - skipping")
             self._blacklist_goal((goal_x, goal_y))
             return False
 
-        # If the robot currently sits in a lethal/occupied start cell, planner will repeatedly abort.
-        if use_costmap_filter:
+        # Skip lethal cell check during INIT phase (startup costmap may be settling)
+        # After startup, warn but don't strictly block if robot is in questionable costmap state
+        if use_costmap_filter and not is_init_phase:
             self.update_pose()
             if self.pose_valid:
                 costmap_info = self._get_costmap_info()
@@ -591,11 +621,12 @@ class ExplorationPlanningMixin:
                     if robot_cell is not None:
                         robot_cell_free = self._is_costmap_free(robot_cell[0], robot_cell[1], costmap_info)
                     if not robot_cell_free:
-                        self.get_logger().warn(
-                            "⚠️ Skipping goal send: robot start cell is lethal in global costmap; triggering escape/clear"
-                        )
+                        if (now - self.last_lethal_cell_warn_time) > 5.0:
+                            self.get_logger().warn(
+                                f"⚠️ Robot in lethal/occupied costmap cell at ({self.robot_pose[0]:.2f}, {self.robot_pose[1]:.2f}); clearing costmap"
+                            )
+                            self.last_lethal_cell_warn_time = now
                         self._clear_costmaps('start_cell_lethal', clear_global=True)
-                        self._maybe_lethal_escape(self.robot_pose[0], self.robot_pose[1])
                         return False
 
         nav2_server_ready = self.nav_client.wait_for_server(timeout_sec=0.1)
@@ -635,7 +666,18 @@ class ExplorationPlanningMixin:
         goal_msg.pose.pose.position.x = goal_x
         goal_msg.pose.pose.position.y = goal_y
         goal_msg.pose.pose.position.z = 0.0
-        goal_msg.pose.pose.orientation.w = 1.0
+
+        # Set orientation to face the goal from the robot's current position
+        if hasattr(self, 'robot_pose') and self.robot_pose is not None:
+            dx = goal_x - self.robot_pose[0]
+            dy = goal_y - self.robot_pose[1]
+            yaw = math.atan2(dy, dx)
+            qz = math.sin(yaw / 2.0)
+            qw = math.cos(yaw / 2.0)
+            goal_msg.pose.pose.orientation.z = qz
+            goal_msg.pose.pose.orientation.w = qw
+        else:
+            goal_msg.pose.pose.orientation.w = 1.0
 
         self.last_goal_target = (goal_x, goal_y)
         _elapsed = time.time() - self.startup_time
@@ -811,8 +853,8 @@ class ExplorationPlanningMixin:
             else:
                 self._clear_costmaps('goal_rejected', clear_global=True)
                 self.update_pose()
-                if self.pose_valid:
-                    self._maybe_lethal_escape(self.robot_pose[0], self.robot_pose[1])
+                if self.pose_valid and getattr(self, 'current_phase', None) != Phase.INIT:
+                    pass
 
     def _maintain_active_goal(self, now: float) -> bool:
         """Return True when a goal is still active or still being processed."""
@@ -921,6 +963,13 @@ class ExplorationPlanningMixin:
             self.get_logger().error(f"❌ Goal ABORTED! Failure #{self.consecutive_failures}/{self.max_consecutive_failures} at pos ({robot_x:.2f}, {robot_y:.2f})")
             self.get_logger().error(f"   Likely cause: No valid path found by Nav2 planner")
 
+            # Check for lethal-space planner failures and trigger immediate escape if needed
+            if hasattr(self, '_maybe_lethal_escape'):
+                escaped = self._maybe_lethal_escape(robot_x, robot_y)
+                if escaped:
+                    self.get_logger().error("⚠️ LETHAL SPACE DETECTED — executing immediate escape sequence")
+                    return  # Skip normal failure handling, let lethal escape take control
+
             if self.last_goal_target is not None:
                 self._blacklist_goal(self.last_goal_target)
                 if self.strict_no_revisit:
@@ -949,7 +998,8 @@ class ExplorationPlanningMixin:
                 self.recovery_start_time = time.time()
             else:
                 self._clear_costmaps('aborted_planning_failure', clear_global=True)
-                self._maybe_lethal_escape(robot_x, robot_y)
+                if getattr(self, 'current_phase', None) != Phase.INIT:
+                    pass
         elif result.status == 6:            
             self.get_logger().warn(f"⚠️ Navigation canceled at ({robot_x:.2f}, {robot_y:.2f})")
             if self.last_goal_target is not None and self.strict_no_revisit:
@@ -975,7 +1025,8 @@ class ExplorationPlanningMixin:
                     self.recovery_start_time = time.time()
                 else:
                     self._clear_costmaps('canceled_planning_failure', clear_global=True)
-                    self._maybe_lethal_escape(robot_x, robot_y)
+                    if getattr(self, 'current_phase', None) != Phase.INIT:
+                        pass
         else:
             self.get_logger().warn(f"⚠️ Navigation ended with status: {result.status} at ({robot_x:.2f}, {robot_y:.2f})")
 
@@ -1009,4 +1060,34 @@ class ExplorationPlanningMixin:
                 self.get_logger().warn(f"🧹 Requested global costmap clear ({reason})")
             except Exception as e:
                 self.get_logger().warn(f"⚠️ Global costmap clear failed ({reason}): {e}")
+
+    def _send_fallback_goal(self) -> bool:
+        """Send a fallback goal when no frontiers are available.
+        Tries to send goal 1-2m ahead in direction robot is facing."""
+        if not self.pose_valid:
+            self.update_pose()
+        if not self.pose_valid:
+            return False
+        
+        robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
+        # Try to move forward 1.5m in the robot's general forward direction
+        fallback_goal_x = robot_x + 1.5
+        fallback_goal_y = robot_y
+        
+        # Check if goal is in free space
+        if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True):
+            # Try left diagonal
+            fallback_goal_x = robot_x + 1.0
+            fallback_goal_y = robot_y + 1.0
+            if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True):
+                # Try right diagonal
+                fallback_goal_x = robot_x + 1.0
+                fallback_goal_y = robot_y - 1.0
+                if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True):
+                    return False
+        
+        self.get_logger().warn(
+            f"📍 No frontiers available; sending fallback goal at ({fallback_goal_x:.2f}, {fallback_goal_y:.2f})"
+        )
+        return self.send_goal_to_nav2(fallback_goal_x, fallback_goal_y, use_costmap_filter=True, frontier_xy=None)
 

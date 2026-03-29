@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+
 import math
 import time
+import threading
 
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
@@ -9,6 +11,79 @@ from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.duration import Duration
 
 class ExplorationExecutionMixin:
+    lethal_escape_enabled: bool = True
+
+    def enable_lethal_escape(self):
+        self.lethal_escape_enabled = True
+
+    def disable_lethal_escape(self):
+        self.lethal_escape_enabled = False
+
+    def _maybe_lethal_escape(self, robot_x: float, robot_y: float):
+        if not getattr(self, 'lethal_escape_enabled', True):
+            return
+        if self._lethal_fail_pos is not None:
+            dx = robot_x - self._lethal_fail_pos[0]
+            dy = robot_y - self._lethal_fail_pos[1]
+            distance_moved = math.sqrt(dx * dx + dy * dy)
+            if distance_moved < 0.15:  # REDUCED: tighter threshold (was 0.25m)
+                self._lethal_fail_count += 1
+            else:
+                self._lethal_fail_count = 1
+        else:
+            self._lethal_fail_count = 1
+        self._lethal_fail_pos = (robot_x, robot_y)
+        if self._lethal_fail_count >= 1:  # AGGRESSIVE: trigger on FIRST failure (was 2)
+            self._fire_lethal_escape()
+            return True  # Signal that escape was triggered
+        return False
+
+    def _fire_lethal_escape(self):
+        import threading
+        self.get_logger().error(
+            f"🏃 LETHAL ESCAPE TRIGGERED: {self._lethal_fail_count} consecutive failures "
+            f"at ({self._lethal_fail_pos[0]:.2f}, {self._lethal_fail_pos[1]:.2f}) "
+            f"— backing up & clearing costmaps immediately"
+        )
+        self._lethal_fail_count = 0
+        self._lethal_fail_pos = None
+        self.last_goal_time = time.time() + 2.0  # REDUCED: only 2s hold (was 4) — faster recovery
+        
+        # Clear BOTH costmaps immediately (local + global)
+        try:
+            self.clear_local_costmap_client.call_async(ClearEntireCostmap.Request())
+            self.get_logger().warn("🧹 LOCAL costmap cleared (lethal escape)")
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ Local costmap clear failed: {e}")
+        
+        if self.clear_global_costmap_client.service_is_ready():
+            try:
+                self.clear_global_costmap_client.call_async(ClearEntireCostmap.Request())
+                self.get_logger().warn("🧹 GLOBAL costmap cleared (lethal escape)")
+            except Exception as e:
+                self.get_logger().warn(f"⚠️ Global costmap clear in lethal escape failed: {e}")
+        
+        # Force aggressive backup for 2s to physically move away from lethal obstacle
+        backup_msg = Twist()
+        backup_msg.linear.x = -0.15  # Backward at moderate speed
+        self.cmd_vel_pub.publish(backup_msg)
+        self.get_logger().warn("⏮️ Executing emergency backup move...")
+
+        def _backup_thread():
+            try:
+                msg = Twist()
+                msg.linear.x = -0.12
+                end_t = time.time() + 0.8
+                while time.time() < end_t:
+                    self.cmd_vel_pub.publish(msg)
+                    time.sleep(0.05)  # Reduced from 0.1 for faster reaction
+                stop = Twist()
+                self.cmd_vel_pub.publish(stop)
+            except Exception:
+                pass  # Silent fail to avoid logging delays
+
+        threading.Thread(target=_backup_thread, daemon=True).start()
+
     def _maybe_clear_ghost_obstacles(self):
         """Clear costmaps if obstacles disappear quickly (ghost obstacles)."""
         # If an obstacle was detected but is now gone within a short time, clear costmaps
@@ -42,58 +117,11 @@ class ExplorationExecutionMixin:
         msg = Twist()
         self.recovery_turn_dir = self._clear_turn_dir()
         msg.angular.z = self.recovery_turn_dir * self.corner_recovery_turn_speed * max(0.2, turn_scale)
-        if not (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
-            msg.linear.x = self.backup_speed
+        # Only move backward if a close front obstacle is detected and rear is clear
+        if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
+            if not (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
+                msg.linear.x = self.backup_speed
         self.cmd_vel_pub.publish(msg)
-
-    def _maybe_lethal_escape(self, robot_x: float, robot_y: float):
-        """Track same-position failures; fire a physical backup escape when stuck in lethal space."""
-        if self._lethal_fail_pos is not None:
-            dx = robot_x - self._lethal_fail_pos[0]
-            dy = robot_y - self._lethal_fail_pos[1]
-            if math.sqrt(dx * dx + dy * dy) < 0.25:
-                self._lethal_fail_count += 1
-            else:
-                self._lethal_fail_count = 1
-        else:
-            self._lethal_fail_count = 1
-        self._lethal_fail_pos = (robot_x, robot_y)
-        if self._lethal_fail_count >= 2:
-            self._fire_lethal_escape()
-
-    def _fire_lethal_escape(self):
-        """Physically back up the robot to move out of lethal space on the global costmap."""
-        import threading
-        self.get_logger().warn(
-            f"🏃 Lethal-space escape: {self._lethal_fail_count} consecutive failures "
-            f"at same position ({self._lethal_fail_pos[0]:.2f}, {self._lethal_fail_pos[1]:.2f}) "
-            f"— backing up to escape lethal costmap cell"
-        )
-        self._lethal_fail_count = 0
-        self._lethal_fail_pos = None
-        self.last_goal_time = time.time() + 4.0
-        if self.clear_global_costmap_client.service_is_ready():
-            try:
-                self.clear_global_costmap_client.call_async(ClearEntireCostmap.Request())
-                self.get_logger().warn("🧹 Clearing global costmap for lethal-space escape")
-            except Exception as e:
-                self.get_logger().warn(f"⚠️ Global costmap clear in lethal escape failed: {e}")
-
-        def _backup_thread():
-            try:
-                msg = Twist()
-                msg.linear.x = -0.15
-                end_t = time.time() + 2.0
-                while time.time() < end_t:
-                    self.cmd_vel_pub.publish(msg)
-                    time.sleep(0.1)
-                stop = Twist()
-                self.cmd_vel_pub.publish(stop)
-                self.get_logger().info("✅ Lethal-space backup complete")
-            except Exception as exc:
-                self.get_logger().warn(f"⚠️ Lethal escape thread error: {exc}")
-
-        threading.Thread(target=_backup_thread, daemon=True).start()
 
     def emergency_backup(self):
         """Obstacle detected - move backward while scanning for clear path"""
@@ -126,23 +154,27 @@ class ExplorationExecutionMixin:
         if not self.scan_in_progress:
             return False                   
         
-        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
+        if self.rear_obstacle_detected:
             self.scan_in_progress = False
-            self.get_logger().error(
-                "🛑 Rear obstacle too close; stopping backward scan and holding position."
-            )
-            stop_msg = Twist()
-            self.cmd_vel_pub.publish(stop_msg)
-            return False
-        elif self.rear_obstacle_detected:
-            rotate_msg = Twist()
-            rotate_msg.angular.z = 0.4
-            self.cmd_vel_pub.publish(rotate_msg)
-            self.scan_step += 1
-            if self.scan_step >= self.scan_steps_per_angle:
-                self.scan_step = 0
-                self.scan_segment_index += 1
-            return True
+            if self.last_rear_distance <= self.rear_emergency_distance:
+                self.get_logger().error(
+                    "🛑 Rear obstacle too close; stopping all backward motion and holding position."
+                )
+                stop_msg = Twist()
+                self.cmd_vel_pub.publish(stop_msg)
+                return False
+            else:
+                self.get_logger().warn(
+                    f"↩️ Rear obstacle detected at {self.last_rear_distance:.2f}m, rotating away."
+                )
+                rotate_msg = Twist()
+                rotate_msg.angular.z = 0.5
+                self.cmd_vel_pub.publish(rotate_msg)
+                self.scan_step += 1
+                if self.scan_step >= self.scan_steps_per_angle:
+                    self.scan_step = 0
+                    self.scan_segment_index += 1
+                return True
         
         if self.scan_segment_index >= self.scan_segments:
             stop_msg = Twist()
@@ -274,15 +306,22 @@ class ExplorationExecutionMixin:
 
         if self.strict_obstacle_handling or not self.nav2_handles_obstacles:
             if time.time() < self.ultrasonic_emergency_until:
-                if self.rear_obstacle_detected or (
-                    self.front_obstacle_detected and
-                    self.obstacle_distance_m <= self.front_emergency_rotate_distance
-                ):
+                if self.rear_obstacle_detected:
+                    self.get_logger().error("🛑 Rear obstacle detected during backup: stopping and rotating away.")
+                    stop_msg = Twist()
+                    self.cmd_vel_pub.publish(stop_msg)
+                    rotate_msg = Twist()
+                    rotate_msg.angular.z = 0.5
+                    self.cmd_vel_pub.publish(rotate_msg)
+                    return
+                if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
                     self._publish_front_escape(turn_scale=1.0)
                     return
-                backup_msg = Twist()
-                backup_msg.linear.x = self.backup_speed
-                self.cmd_vel_pub.publish(backup_msg)
+                # Only back up if a close obstacle is detected
+                if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
+                    backup_msg = Twist()
+                    backup_msg.linear.x = self.backup_speed
+                    self.cmd_vel_pub.publish(backup_msg)
                 return
             if time.time() < self.lidar_backup_until:
                 if not self.front_obstacle_detected:
@@ -291,9 +330,11 @@ class ExplorationExecutionMixin:
                 if self.rear_obstacle_detected or self.obstacle_distance_m <= self.front_emergency_rotate_distance:
                     self._publish_front_escape(turn_scale=1.0)
                     return
-                backup_msg = Twist()
-                backup_msg.linear.x = self.backup_speed
-                self.cmd_vel_pub.publish(backup_msg)
+                # Only back up if a close obstacle is detected
+                if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
+                    backup_msg = Twist()
+                    backup_msg.linear.x = self.backup_speed
+                    self.cmd_vel_pub.publish(backup_msg)
                 return
         if ((self.strict_obstacle_handling or not self.nav2_handles_obstacles) and self.obstacle_detected and
                 self.current_phase not in (Phase.OBSTACLE, Phase.RESCAN)):
@@ -450,12 +491,37 @@ class ExplorationExecutionMixin:
                     else:
                         self.get_logger().warn("Waiting for initial pose to be set via RViz 2D Pose Estimate before starting exploration.")
                         return
-                self.exploration_start_time = time.time()                                         
+                self.exploration_start_time = time.time()
                 self.update_pose()
-                self.home_pose = self.robot_pose                                  
+                self.home_pose = self.robot_pose
                 self.get_logger().info(
                     f"🏠 Home pose recorded: ({self.home_pose[0]:.2f}, {self.home_pose[1]:.2f})")
                 self.get_logger().info("✅ Startup complete! Starting exploration")
+                # Immediately pick and send the first frontier goal
+                goal_info = self.pick_best_frontier() if hasattr(self, 'pick_best_frontier') else None
+                if goal_info is not None:
+                    goal_x, goal_y = goal_info['goal']
+                    frontier_x, frontier_y = goal_info['frontier']
+                    total_frontiers = len(self.current_frontiers)
+                    self.update_pose()
+                    robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
+                    distance_to_goal = goal_info['dist']
+                    self.get_logger().info(
+                        f"🎯 New frontier detected: Robot at ({robot_x:.2f}, {robot_y:.2f}) → Frontier ({frontier_x:.2f}, {frontier_y:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f})"
+                    )
+                    self.get_logger().info(
+                        f"📏 Distance to goal: {distance_to_goal:.2f}m | Available frontiers: {total_frontiers}"
+                    )
+                    self.ever_sent_goal = True
+                    sent = self.send_goal_to_nav2(
+                        goal_x, goal_y, goal_info.get('costmap_filtered'), frontier_xy=(frontier_x, frontier_y)
+                    )
+                    if sent:
+                        self.last_goal_time = time.time()
+                    else:
+                        self.get_logger().warn(f"⚠️ Failed to send first frontier goal at startup ({goal_x:.2f}, {goal_y:.2f}); will retry on next cycle")
+                        self.last_goal_time = 0.0
+                        self.frontiers_dirty = True
                 self.current_phase = Phase.EXPLORE
                 self.phase_start_time = time.time()
         
@@ -474,20 +540,10 @@ class ExplorationExecutionMixin:
 
             now = time.time()
 
-            # Dynamic mode: static_stuck_trigger_time logic removed
+            # Only blacklist the previous goal target, NOT robot's own position (prevents exploration paralysis)
             if self.last_goal_target is not None:
                 self._blacklist_goal(self.last_goal_target)
             self.update_pose()
-            if self.pose_valid:
-                stuck_key = (round(self.robot_pose[0], 2), round(self.robot_pose[1], 2))
-                self._blacklist_goal(stuck_key)
-                now = time.time()
-                if not hasattr(self, '_last_blacklist_stuck_warn') or (now - getattr(self, '_last_blacklist_stuck_warn', 0)) > 10.0:
-                    self.get_logger().warn(
-                        f"⚠️ Blacklisting stuck position ({stuck_key[0]:.2f}, {stuck_key[1]:.2f}) "
-                        f"for {self.blacklist_duration:.0f}s"
-                    )
-                    self._last_blacklist_stuck_warn = now
             try:
                 if self.goal_handle is not None:
                     self.goal_handle.cancel_goal_async()
@@ -501,8 +557,14 @@ class ExplorationExecutionMixin:
                 step_elapsed = now - self.static_stuck_escape_step_start
                 escape_msg = Twist()
                 if self.static_stuck_escape_step == 0:
-                    if step_elapsed < self.static_stuck_escape_backup_dur:
-                        escape_msg.linear.x = self.backup_speed                       
+                    # Prevent backup if rear is too close to an obstacle
+                    if (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
+                        self.get_logger().error("🛑 Rear obstacle too close during stuck escape; skipping backup step.")
+                        self.static_stuck_escape_step = 1
+                        self.static_stuck_escape_step_start = now
+                        step_elapsed = 0.0
+                    elif step_elapsed < self.static_stuck_escape_backup_dur:
+                        escape_msg.linear.x = self.backup_speed
                         self.cmd_vel_pub.publish(escape_msg)
                         return
                     else:
@@ -528,6 +590,36 @@ class ExplorationExecutionMixin:
                 return                   
             self.last_explore_check = now
 
+            # Auto-retry: If no goal is in progress and last goal was too old, try sending new frontier
+            if self.goal_handle is None and not self.goal_in_progress:
+                time_since_last_goal = now - self.last_goal_time
+                has_pending_goal_retry = (time_since_last_goal > self.goal_cooldown and 
+                                         time_since_last_goal < 10.0 and
+                                         len(self.current_frontiers) > 0)
+                
+                if has_pending_goal_retry and self.frontiers_dirty:
+                    self.get_logger().info("🔄 Auto-retry: Attempting new frontier after goal send failure")
+                    goal_info = self.pick_best_frontier() if hasattr(self, 'pick_best_frontier') else None
+                    if goal_info is not None:
+                        goal_x, goal_y = goal_info['goal']
+                        frontier_x, frontier_y = goal_info['frontier']
+                        sent = self.send_goal_to_nav2(
+                            goal_x, goal_y, goal_info.get('costmap_filtered'), frontier_xy=(frontier_x, frontier_y)
+                        )
+                        if sent:
+                            self.last_goal_time = time.time()
+                        else:
+                            self.frontiers_dirty = True
+                    return
+                
+                # Fallback: if no frontiers available but goal hasn't been sent recently, try fallback goal
+                if len(self.current_frontiers) == 0 and time_since_last_goal > 2.0:
+                    if hasattr(self, '_send_fallback_goal'):
+                        self.get_logger().info("📍 No frontiers detected; attempting fallback goal")
+                        if self._send_fallback_goal():
+                            self.last_goal_time = time.time()
+                    return
+
             if self.corner_recovery_until > 0.0:
                 if now >= self.corner_recovery_until:
                     self.corner_recovery_until = 0.0
@@ -536,10 +628,13 @@ class ExplorationExecutionMixin:
                     recovery_msg = Twist()
                     turn_dir = 1.0 if (self.no_frontier_cycles % 2 == 0) else -1.0
                     if self.corner_recovery_mode == "backup":
-                        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
-                            recovery_msg.angular.z = turn_dir * self.corner_recovery_turn_speed
+                        # Only back up if a close front obstacle is detected and rear is clear
+                        if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
+                            if not (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
+                                recovery_msg.linear.x = self.backup_speed
                         else:
-                            recovery_msg.linear.x = self.backup_speed
+                            # If no close obstacle, just rotate
+                            recovery_msg.angular.z = turn_dir * self.corner_recovery_turn_speed
                     else:
                         recovery_msg.angular.z = turn_dir * self.corner_recovery_turn_speed
                     self.cmd_vel_pub.publish(recovery_msg)
@@ -592,6 +687,21 @@ class ExplorationExecutionMixin:
             
             need_frontier_eval = self.frontiers_dirty or ((now - self.last_frontier_goal_eval_time) >= self.frontier_goal_refresh_min_interval)
             if not need_frontier_eval:
+                # If goal sending has been failing for >3 cycles, do emergency search rotation
+                if (self.goal_handle is None and not self.goal_in_progress and 
+                    (now - self.last_goal_time) > 3.0 and self.consecutive_failures >= 3):
+                    if not hasattr(self, '_emergency_search_active'):
+                        self._emergency_search_active = True
+                        self._emergency_search_start = now
+                        self.get_logger().warn("🔄 Emergency search: rotating to find goals...")
+                    
+                    if (now - self._emergency_search_start) < 4.0:
+                        search_msg = Twist()
+                        search_msg.angular.z = 0.8  # Rotate to map new areas
+                        self.cmd_vel_pub.publish(search_msg)
+                        return
+                    else:
+                        self._emergency_search_active = False
                 return
             self.last_frontier_goal_eval_time = now
             goal_info = self.pick_best_frontier()
@@ -625,13 +735,15 @@ class ExplorationExecutionMixin:
                     self.simple_exploration_active = False
 
                 if self.stop_when_no_frontiers and self.last_frontier_skip_reason == "no_frontiers":
-                    if self.rear_obstacle_detected:
+                    # Only back up if a close obstacle is detected
+                    if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
+                        if not self.rear_obstacle_detected:
+                            backup_msg = Twist()
+                            backup_msg.linear.x = self.backup_speed
+                            self.cmd_vel_pub.publish(backup_msg)
+                    else:
                         stop_msg = Twist()
                         self.cmd_vel_pub.publish(stop_msg)
-                    else:
-                        backup_msg = Twist()
-                        backup_msg.linear.x = self.backup_speed
-                        self.cmd_vel_pub.publish(backup_msg)
                 if self.last_frontier_skip_reason in ("pose_invalid", "pose_stale"):
                     return
 

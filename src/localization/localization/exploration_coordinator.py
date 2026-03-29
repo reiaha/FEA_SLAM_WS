@@ -15,6 +15,7 @@ from nav_msgs.msg import Odometry, OccupancyGrid
 from lifecycle_msgs.srv import GetState
 from std_msgs.msg import Float32
 from tf2_ros import TransformListener, Buffer
+
 from enum import Enum
 import math
 import time
@@ -23,14 +24,23 @@ from .exploration_sensing_mixin import ExplorationSensingMixin
 from .exploration_planning_mixin import ExplorationPlanningMixin
 from .exploration_execution_mixin import ExplorationExecutionMixin
 from .exploration_persistence_mixin import ExplorationPersistenceMixin
+from .phase_enum import Phase
 
-class Phase(Enum):
-    INIT = 1
-    EXPLORE = 2           
-    OBSTACLE = 3          
-    RESCAN = 4            
-    RECOVERY = 5          
-    DONE = 6              
+# --- Graceful shutdown handler for guaranteed completion logging ---
+import signal
+import sys
+def _graceful_shutdown_handler(signalnum, frame):
+    try:
+        node = ExplorationCoordinator._active_instance if hasattr(ExplorationCoordinator, '_active_instance') else None
+        if node is not None and hasattr(node, '_on_exploration_complete'):
+            node.get_logger().warn('🛑 Signal received: running graceful shutdown handler.')
+            node._on_exploration_complete()
+    except Exception as e:
+        print(f"[GracefulShutdown] Exception: {e}")
+    sys.exit(0)
+signal.signal(signal.SIGINT, _graceful_shutdown_handler)
+signal.signal(signal.SIGTERM, _graceful_shutdown_handler)
+
 
 class ExplorationCoordinator(
     ExplorationSensingMixin,
@@ -39,6 +49,12 @@ class ExplorationCoordinator(
     ExplorationPersistenceMixin,
     Node,
 ):
+    # Track the active instance for signal handler
+    _active_instance = None
+
+    def __init__(self, *args, **kwargs):
+        ExplorationCoordinator._active_instance = self
+        super().__init__(*args, **kwargs)
 
     def _declare_params(self, defaults):
         """Declare all node parameters from a single defaults map."""
@@ -73,6 +89,9 @@ class ExplorationCoordinator(
         self.initial_pose_set = True
         if self.lock_initial_pose_after_set:
             self.initial_pose_locked = True
+        # Disable lethal escape after initial pose
+        if hasattr(self, 'disable_lethal_escape'):
+            self.disable_lethal_escape()
         self.get_logger().info("✅ Initial pose received. Exploration can begin.")
 
     def __init__(self):
@@ -90,9 +109,9 @@ class ExplorationCoordinator(
         self.max_known_cells = 0                                                    
         defaults = {
             'nav2_timeout': 12.0,
-            'obstacle_distance': 0.35,
-            'backup_speed': -0.45,
-            'backup_time': 2.0,
+            'obstacle_distance': 0.25,
+            'backup_speed': -0.18,
+            'backup_time': 0.8,
             'use_lidar_obstacle': True,
             'strict_obstacle_handling': True,
             'use_ultrasonic_backup': True,
@@ -119,30 +138,30 @@ class ExplorationCoordinator(
             'rear_emergency_distance': 0.25,
             'front_emergency_rotate_distance': 0.30,
             'frontier_goal_offset': 0.35,
-            'min_frontier_distance': 0.8,
-            'relaxed_frontier_after_cycles': 4,
-            'relaxed_min_frontier_distance': 0.15,
+            'min_frontier_distance': 0.3,
+            'relaxed_frontier_after_cycles': 2,
+            'relaxed_min_frontier_distance': 0.1,
             'relaxed_frontier_goal_offset': 0.05,
             'relaxed_use_costmap_filter': False,
-            'blacklist_duration': 30.0,
-            'blacklist_radius': 0.4,
+            'blacklist_duration': 3.0,
+            'blacklist_radius': 0.25,
             'avoid_revisit': False,
             'strict_no_revisit': False,
             'force_frontier_goal': False,
             'visited_goal_radius': 0.6,
             'known_frontier_avoid_radius': 1.2,
             'prune_mapped_frontiers': True,
-            'frontier_lidar_range_m': 8.0,
-            'frontier_lidar_range_margin_m': 0.6,
+            'frontier_lidar_range_m': 3.5,
+            'frontier_lidar_range_margin_m': 0.2,
             'frontier_skip_if_within_scan_range': True,
-            'frontier_scanned_max_unknown_ratio': 0.08,
-            'frontier_scanned_max_unknown_cells': 8,
+            'frontier_scanned_max_unknown_ratio': 0.03,
+            'frontier_scanned_max_unknown_cells': 2,
             'frontier_use_lidar_standoff_goal': True,
             'frontier_goal_standoff_min_m': 1.0,
             'frontier_goal_standoff_max_m': 2.5,
             'frontier_unknown_check_radius_m': 0.45,
-            'frontier_min_unknown_ratio': 0.10,
-            'frontier_min_unknown_cells': 6,
+            'frontier_min_unknown_ratio': 0.15,
+            'frontier_min_unknown_cells': 10,
             'frontier_prune_log_interval': 2.0,
             'recent_goal_radius': 0.8,
             'recent_goal_hold_time': 90.0,
@@ -165,8 +184,8 @@ class ExplorationCoordinator(
             'nav2_active_grace_sec': 8.0,
             'nav2_active_fallback_on_action': True,
             'enable_simple_exploration': True,
-            'stop_when_no_frontiers': True,
-            'no_frontier_recovery_cycles': 2,
+            'stop_when_no_frontiers': True,  # Stop if there are no frontiers
+            'no_frontier_recovery_cycles': 1,
             'no_frontier_complete_cycles': 3,
             'corner_recovery_time': 1.5,
             'corner_recovery_turn_speed': 0.65,
@@ -174,7 +193,7 @@ class ExplorationCoordinator(
             'zero_frontier_complete_percent': 80.0,
             'min_goals_for_complete': 3,
             'small_test_mode': False,
-            'complete_on_zero_frontiers': False,
+            'complete_on_zero_frontiers': False,  # Only stop when coverage and min_goals are met
             'auto_save_on_complete': True,
             'map_topic': '/map',
             'map_save_dir': '/home/pi/FEA_SLAM_WS/saved_maps',
@@ -185,20 +204,20 @@ class ExplorationCoordinator(
             'frontier_history_file': 'auto_explore_frontiers.csv',
             'path_record_min_dist': 0.2,
             'replan_on_frontier_update': True,
-            'replan_interval': 6.0,
-            'replan_goal_change_distance': 1.0,
-            'replan_min_improvement': 0.3,
-            'always_replan_on_frontier_update': False,
-            'replan_hard_min_interval': 8.0,
-            'replan_cancel_cooldown': 1.0,
-            'cancel_active_goal_for_replan': False,
-            'goal_commit_before_replan_cancel': 10.0,
-            'allow_costmapless_replan_candidates': False,
+            'replan_interval': 2.0,  # More frequent replanning
+            'replan_goal_change_distance': 0.5,  # More sensitive to new/better goals
+            'replan_min_improvement': 0.1,  # Accept smaller improvements
+            'always_replan_on_frontier_update': True,  # Always replan on new frontiers
+            'replan_hard_min_interval': 3.0,  # Lower minimum interval
+            'replan_cancel_cooldown': 0.5,  # Allow faster cancel/replan
+            'cancel_active_goal_for_replan': True,  # Cancel current goal for better one
+            'goal_commit_before_replan_cancel': 2.0,  # Shorter commit time before cancel
+            'allow_costmapless_replan_candidates': True,  # Consider more candidates
             'enable_bootstrap_frontier_fallback': True,
             'bootstrap_fallback_min_distance': 0.75,
             'avoid_return_radius': 1.0,
             'avoid_last_goal_radius': 0.8,
-            'frontier_pick_farthest': True,
+            'frontier_pick_farthest': False,
             'frontier_selection_method': 'astar',
             'astar_max_candidates': 30,
             'astar_max_expansions': 12000,
@@ -219,9 +238,9 @@ class ExplorationCoordinator(
             'initial_pose_wait_timeout': 30.0,
             'lock_initial_pose_after_set': True,
             'allow_initial_pose_updates_after_init': False,
-            'startup_health_window_sec': 2.0,
-            'startup_require_scan_recent': True,
-            'startup_require_odom_recent': True,
+            'startup_health_window_sec': 4.0,
+            'startup_require_scan_recent': False,
+            'startup_require_odom_recent': False,
             'startup_require_fresh_pose': True,
             'startup_max_tf_age_sec': 1.0,
         }
@@ -309,6 +328,10 @@ class ExplorationCoordinator(
         self.goal_cooldown = 0.5                                           
         self.ever_had_frontiers = False
         self.ever_sent_goal = False
+        # Warning tracking for goal send predicate checks
+        self.last_scan_stale_warn_time = 0.0
+        self.last_front_clearance_warn_time = 0.0
+        self.last_lethal_cell_warn_time = 0.0
         self.last_done_log_time = 0.0
         self.done_log_interval = 5.0
         self.simple_exploration_active = False                                    
@@ -383,7 +406,7 @@ class ExplorationCoordinator(
         self.scan_steps_per_angle = 10                                         
         self.scan_total_time = 0.0
         self.last_explore_check = 0.0
-        self.explore_check_interval = 0.5                                      
+        self.explore_check_interval = 0.1
         
         self.last_phase_log_time = 0.0
         self.phase_log_interval = 5.0                                   

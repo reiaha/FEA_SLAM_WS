@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
+
 import math
 import time
+
+# Import Phase enum from new module to avoid circular import
+from .phase_enum import Phase
 
 import rclpy
 from geometry_msgs.msg import Twist

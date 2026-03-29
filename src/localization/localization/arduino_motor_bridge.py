@@ -511,6 +511,24 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.tilt_emergency_active = bool(msg.data)
 
     def _handle_cmd_vel(self, msg: Twist, source: str):
+        # ...existing code...
+        self.cmd_vel_override_until = time.time() + self.cmd_vel_override_duration
+        linear = msg.linear.x
+        angular = msg.angular.z
+        # ...existing code...
+        now = time.time()
+        scan_stale = False
+        scan_age = now - self.last_scan_time if self.last_scan_time > 0.0 else float('inf')
+        if self.last_scan_time > 0.0 and scan_age > self.scan_stale_timeout:
+            scan_stale = True
+            linear = 0.0
+            angular = 0.0
+            if now - self.last_scan_stale_log_time >= self.scan_stale_log_interval:
+                self.last_scan_stale_log_time = now
+                self.get_logger().warn(
+                    f"🛑 Scan stale ({scan_age:.2f}s); suppressing {source}"
+                )
+        # HARD SAFETY: Log backward attempts only at error level (fast path - no detailed logging)
         if self.require_nav2_active and not self.nav2_ready:
             now = time.time()
             if now - self.last_nav2_block_log_time >= self.nav2_block_log_interval:
@@ -702,15 +720,36 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
                     f"🛑 Rear blocked at {self.last_rear_distance:.2f}m; suppressing backward cmd_vel"
                 )
 
-        if linear < 0.0 and self.last_rear_distance <= self.rear_backup_min_distance:
-            linear = 0.0
-            angular = 0.0
-            if now - self.last_rear_block_log_time >= self.rear_block_log_interval:
-                self.last_rear_block_log_time = now
-                self.get_logger().warn(
-                    f"🛑 Rear distance {self.last_rear_distance:.2f}m <= backup min "
-                    f"{self.rear_backup_min_distance:.2f}m; suppressing backward cmd_vel"
-                )
+        # HARD SAFETY: Never allow forward if front is too close, never allow backward if rear is too close
+        # Only allow rotation if both are blocked
+        if linear > 0.0:
+            if not math.isfinite(self.last_front_distance) or self.last_front_distance <= self.front_stop_distance:
+                linear = 0.0
+                if abs(angular) < self.angular_deadband:
+                    angular = 0.0
+                if (not math.isfinite(self.last_rear_distance) or self.last_rear_distance <= self.rear_backup_min_distance):
+                    # Both front and rear blocked: only allow rotation
+                    if abs(angular) < self.angular_deadband:
+                        angular = self.turn_pwm_limit / 255.0  # force a small turn
+                    self.get_logger().error(
+                        f"🛑 HARD SAFETY: Both front ({self.last_front_distance:.2f}m) and rear ({self.last_rear_distance:.2f}m) blocked; allowing only rotation."
+                    )
+                else:
+                    self.get_logger().error(
+                        f"🛑 HARD SAFETY: Front distance {self.last_front_distance:.2f}m <= stop {self.front_stop_distance:.2f}m; suppressing ALL forward cmd_vel (source: {source})"
+                    )
+
+        # HARD SAFETY: Never allow backward motion if rear is too close, regardless of command source
+        if linear < 0.0:
+            if not math.isfinite(self.last_rear_distance) or self.last_rear_distance <= self.rear_backup_min_distance:
+                linear = 0.0
+                angular = 0.0
+                if now - self.last_rear_block_log_time >= self.rear_block_log_interval:
+                    self.last_rear_block_log_time = now
+                    self.get_logger().error(
+                        f"🛑 HARD SAFETY: Rear distance {self.last_rear_distance:.2f}m <= backup min "
+                        f"{self.rear_backup_min_distance:.2f}m; suppressing ALL backward cmd_vel (source: {source})"
+                    )
 
         if self.publish_odom:
             self.last_cmd_linear = linear

@@ -523,17 +523,9 @@ class ArduinoMotorBridgeRuntimeMixin:
             action = action_override or self._get_action_name(pwm_left, pwm_right)
             msg = f'🚀 {action} | MOTOR:{pwm_left},{pwm_right} | SRC:{source}'
             now = time.time()
-            should_log_info = (now - self.last_motor_log_time) >= self.motor_log_interval
-            if log_level == 'warn':
-                self.get_logger().warn(msg)
-            elif log_level == 'error':
-                self.get_logger().error(msg)
-            elif log_level == 'none':
-                pass
-            else:
-                if should_log_info:
-                    self.get_logger().info(msg)
-                    self.last_motor_log_time = now
+            # Always log motor output as warn for visibility
+            self.get_logger().warn(msg)
+            self.last_motor_log_time = now
         except Exception as e:
             self.get_logger().error(f'Serial write error: {e}')
 
