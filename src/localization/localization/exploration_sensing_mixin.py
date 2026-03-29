@@ -274,12 +274,7 @@ class ExplorationSensingMixin:
             self.obstacle_detected = True
             if self.lidar_backup_on_obstacle:
                 self.lidar_backup_until = now + self.backup_time
-            if obstacle_type == "static":
-                if self.static_stuck_start == 0.0:
-                    self.static_stuck_start = now
-            else:
-                self.static_stuck_start = 0.0
-                self.static_stuck_escape_active = False
+            # static obstacle_type logic removed
         elif self.use_lidar_obstacle:
             if min_front_distance < float('inf'):
                 self.last_lidar_front_distance = min_front_distance

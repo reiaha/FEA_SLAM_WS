@@ -11,3 +11,6 @@ node-v20.10.0-linux-armv7l.tar.xz
 *.pyc
 frames_*.gv
 frames_*.pdf
+
+# Ignore all saved map files and sessions
+saved_maps/*

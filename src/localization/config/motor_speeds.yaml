@@ -5,8 +5,8 @@
 lidar_explorer:
   forward_speed: 0.15        # m/s (0.1=slow, 0.2=medium, 0.3=fast)
   turn_speed: 0.5            # rad/s (0.3=slow, 0.5=medium, 0.8=fast)
-  obstacle_distance: 0.5     # meters - stop distance
-  safe_distance: 0.8         # meters - slow down distance
+  obstacle_distance: 0.7     # meters - stop distance (increased for more caution)
+  safe_distance: 1.2         # meters - slow down distance (increased for more caution)
 
 # Arduino Motor Bridge PWM limits
 # (affects max speed of all /cmd_vel commands)

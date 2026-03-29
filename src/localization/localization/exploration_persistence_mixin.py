@@ -23,7 +23,9 @@ class ExplorationPersistenceMixin:
             f"elapsed {self.completion_elapsed_s:.1f}s | "
             f"completed at {self.completion_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
         )
+        self.get_logger().info("✅ EXPLORATION COMPLETE - Saving map and outputs...")
         self._flush_csv_data()
+        self._archive_exploration_outputs()
         self._save_and_shutdown()
 
     def _save_and_shutdown(self):
@@ -271,4 +273,37 @@ class ExplorationPersistenceMixin:
                 self.get_logger().warn('⚠️ Map save failed')
         except Exception as e:
             self.get_logger().error(f'❌ Map save error: {e}')
+
+    def _archive_exploration_outputs(self):
+        import shutil
+        import datetime as _dt
+        # Gather all output files for this session
+        files_to_copy = []
+        map_dir = getattr(self, 'map_save_dir', 'saved_maps')
+        # List of known output files
+        file_attrs = [
+            'mapped_area_file', 'robot_path_file', 'nav_goals_file', 'frontier_history_file', 'session_summary_file'
+        ]
+        for attr in file_attrs:
+            fname = getattr(self, attr, None)
+            if fname:
+                fpath = os.path.join(map_dir, fname)
+                if os.path.exists(fpath):
+                    files_to_copy.append(fpath)
+        # Add map files if present
+        for ext in ('.pgm', '.yaml', '.png'):
+            for f in os.listdir(map_dir):
+                if f.endswith(ext):
+                    files_to_copy.append(os.path.join(map_dir, f))
+        # Archive folder name with timestamp
+        now = _dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        archive_dir = os.path.join(map_dir, f'exploration_results_{now}')
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+            for f in files_to_copy:
+                shutil.copy2(f, archive_dir)
+            self.get_logger().info(f'📦 All session outputs saved in one folder: {archive_dir}')
+            self.session_archive_dir = archive_dir
+        except Exception as e:
+            self.get_logger().error(f'❌ Failed to copy exploration outputs: {e}')
 

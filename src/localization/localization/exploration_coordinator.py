@@ -243,6 +243,7 @@ class ExplorationCoordinator(
         self.init_start_time = self.startup_time
         import datetime as _dt_csv
         _session_ts = _dt_csv.datetime.fromtimestamp(self.startup_time).strftime('%Y-%m-%d_%H-%M-%S')
+        self.map_save_dir = f'/home/pi/FEA_SLAM_WS/saved_maps/session_{_session_ts}'
         self.mapped_area_file = f'explore_area_{_session_ts}.csv'
         self.robot_path_file = f'explore_path_{_session_ts}.csv'
         self.nav_goals_file = f'explore_nav_goals_{_session_ts}.csv'
@@ -303,15 +304,7 @@ class ExplorationCoordinator(
         self.last_goal_watchdog_log_time = 0.0
         self._lethal_fail_pos = None                                             
         self._lethal_fail_count = 0                                                       
-        self.static_stuck_start = 0.0                                                 
-        self.static_stuck_escape_active = False
-        self.static_stuck_escape_step = 0                        
-        self.static_stuck_escape_step_start = 0.0
-        self.static_stuck_escape_backup_dur = 1.5                       
-        self.static_stuck_escape_turn_dur = 2.5                                     
-        self.static_stuck_escape_turn_dir = 1.0
-        self.static_stuck_escape_attempts = 0                                       
-        self.static_stuck_trigger_time = 8.0                                               
+        # static environment logic removed
         self.last_costmap_clear_time = 0.0
         self.goal_cooldown = 0.5                                           
         self.ever_had_frontiers = False

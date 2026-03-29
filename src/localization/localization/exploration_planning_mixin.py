@@ -927,12 +927,20 @@ class ExplorationPlanningMixin:
                     self.strict_avoid_goals.append(self.last_goal_target)
             
             if self.obstacle_detected:
-                self.get_logger().warn(f"🚧 Goal aborted AND obstacle detected at {self.obstacle_distance_m:.3f}m - entering OBSTACLE handling")
+                # Only log obstacle warning if not recently logged
+                now = time.time()
+                if not hasattr(self, '_last_obstacle_abort_warn') or (now - getattr(self, '_last_obstacle_abort_warn', 0)) > 10.0:
+                    self.get_logger().warn(f"🚧 Goal aborted AND obstacle detected at {self.obstacle_distance_m:.3f}m - entering OBSTACLE handling")
+                    self._last_obstacle_abort_warn = now
                 self.current_phase = Phase.OBSTACLE
                 self.phase_start_time = time.time()
             else:
-                self.get_logger().warn(f"🔄 Goal aborted but path clear - will try new frontier immediately")
-                self.last_goal_time = 0.0                                     
+                # Suppress repeated path-clear abort warnings
+                now = time.time()
+                if not hasattr(self, '_last_path_clear_abort_warn') or (now - getattr(self, '_last_path_clear_abort_warn', 0)) > 10.0:
+                    self.get_logger().warn(f"🔄 Goal aborted but path clear - will try new frontier immediately")
+                    self._last_path_clear_abort_warn = now
+                self.last_goal_time = 0.0
             
             if self.consecutive_failures >= self.max_consecutive_failures:
                 self.get_logger().error(f"🚨 STUCK DETECTED! {self.consecutive_failures} consecutive failures - entering RECOVERY mode")
@@ -974,9 +982,11 @@ class ExplorationPlanningMixin:
     def _blacklist_goal(self, goal_xy):
         now = time.time()
         self.blacklisted_goals[goal_xy] = now + self.blacklist_duration
-        self.get_logger().warn(
-            f"⚠️ Blacklisting failed goal ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) for {self.blacklist_duration:.0f}s"
-        )
+        if not hasattr(self, '_last_blacklist_goal_warn') or (now - getattr(self, '_last_blacklist_goal_warn', 0)) > 10.0:
+            self.get_logger().warn(
+                f"⚠️ Blacklisting failed goal ({goal_xy[0]:.2f}, {goal_xy[1]:.2f}) for {self.blacklist_duration:.0f}s"
+            )
+            self._last_blacklist_goal_warn = now
 
     def _clear_costmaps(self, reason: str, clear_global: bool = False):
         if not self.clear_costmap_on_obstacle:

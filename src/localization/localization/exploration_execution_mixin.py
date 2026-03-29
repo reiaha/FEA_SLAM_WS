@@ -9,6 +9,20 @@ from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.duration import Duration
 
 class ExplorationExecutionMixin:
+    def _maybe_clear_ghost_obstacles(self):
+        """Clear costmaps if obstacles disappear quickly (ghost obstacles)."""
+        # If an obstacle was detected but is now gone within a short time, clear costmaps
+        now = time.time()
+        if hasattr(self, 'last_obstacle_time') and hasattr(self, 'obstacle_detected'):
+            if self.obstacle_detected:
+                self._last_ghost_obstacle_time = now
+            elif hasattr(self, '_last_ghost_obstacle_time'):
+                # If obstacle disappeared within 2s, treat as ghost and clear
+                if (now - self._last_ghost_obstacle_time) < 2.0:
+                    self.get_logger().warn("👻 Ghost obstacle detected: clearing costmaps!")
+                    self._clear_costmaps("ghost_obstacle")
+                self._last_ghost_obstacle_time = 0
+
     def _clear_turn_dir(self) -> float:
         """Choose turn direction using side clearances (left:+, right:-)."""
         left = self.last_lidar_left_distance
@@ -460,39 +474,28 @@ class ExplorationExecutionMixin:
 
             now = time.time()
 
-            static_stuck_duration = (now - self.static_stuck_start) if self.static_stuck_start > 0.0 else 0.0
-            if static_stuck_duration >= self.static_stuck_trigger_time:
-                if not self.static_stuck_escape_active:
-                    self.static_stuck_escape_active = True
-                    self.static_stuck_escape_step = 0
-                    self.static_stuck_escape_step_start = now
-                    self.static_stuck_escape_attempts += 1
-                    self.static_stuck_escape_turn_dir = (
-                        1.0 if (self.static_stuck_escape_attempts % 2 == 1) else -1.0
+            # Dynamic mode: static_stuck_trigger_time logic removed
+            if self.last_goal_target is not None:
+                self._blacklist_goal(self.last_goal_target)
+            self.update_pose()
+            if self.pose_valid:
+                stuck_key = (round(self.robot_pose[0], 2), round(self.robot_pose[1], 2))
+                self._blacklist_goal(stuck_key)
+                now = time.time()
+                if not hasattr(self, '_last_blacklist_stuck_warn') or (now - getattr(self, '_last_blacklist_stuck_warn', 0)) > 10.0:
+                    self.get_logger().warn(
+                        f"⚠️ Blacklisting stuck position ({stuck_key[0]:.2f}, {stuck_key[1]:.2f}) "
+                        f"for {self.blacklist_duration:.0f}s"
                     )
-                    self.get_logger().error(
-                        f"🆘 Static obstacle stuck {static_stuck_duration:.1f}s — "
-                        f"deep escape #{self.static_stuck_escape_attempts} "
-                        f"({'LEFT' if self.static_stuck_escape_turn_dir > 0 else 'RIGHT'})"
-                    )
-                    if self.last_goal_target is not None:
-                        self._blacklist_goal(self.last_goal_target)
-                    self.update_pose()
-                    if self.pose_valid:
-                        stuck_key = (round(self.robot_pose[0], 2), round(self.robot_pose[1], 2))
-                        self._blacklist_goal(stuck_key)
-                        self.get_logger().warn(
-                            f"⚠️ Blacklisting stuck position ({stuck_key[0]:.2f}, {stuck_key[1]:.2f}) "
-                            f"for {self.blacklist_duration:.0f}s"
-                        )
-                    try:
-                        if self.goal_handle is not None:
-                            self.goal_handle.cancel_goal_async()
-                            self.goal_handle = None
-                            self.goal_in_progress = False
-                    except Exception:
-                        pass
-                    self.corner_recovery_until = 0.0
+                    self._last_blacklist_stuck_warn = now
+            try:
+                if self.goal_handle is not None:
+                    self.goal_handle.cancel_goal_async()
+                    self.goal_handle = None
+                    self.goal_in_progress = False
+            except Exception:
+                pass
+            self.corner_recovery_until = 0.0
 
             if self.static_stuck_escape_active:
                 step_elapsed = now - self.static_stuck_escape_step_start
@@ -541,6 +544,9 @@ class ExplorationExecutionMixin:
                         recovery_msg.angular.z = turn_dir * self.corner_recovery_turn_speed
                     self.cmd_vel_pub.publish(recovery_msg)
                     return
+
+            # Ghost obstacle suppression
+            self._maybe_clear_ghost_obstacles()
 
             if self.pending_replan_goal and not (self.goal_handle or self.goal_in_progress):
                 if (now - self.last_goal_cancel_time) >= self.replan_cancel_cooldown:
