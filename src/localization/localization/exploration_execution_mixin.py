@@ -609,6 +609,7 @@ class ExplorationExecutionMixin:
                         if sent:
                             self.last_goal_time = time.time()
                         else:
+                            self.last_goal_time = time.time()
                             self.frontiers_dirty = True
                     return
                 

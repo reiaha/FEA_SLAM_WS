@@ -318,7 +318,12 @@ echo "[MODE] env=${ENV_MODE}"
 # Single startup profile: autonomous exploration stack enabled.
 USE_EXPLORATION="true"
 USE_NAV2="true"
-RVIZ_CONFIG="${RVIZ_CONFIG:-/home/pi/FEA_SLAM_WS/src/fea_slam/rviz/robot_autonomous_lite.rviz}"
+DEFAULT_RVIZ_CONFIG="/home/pi/FEA_SLAM_WS/src/fea_slam/rviz/robot_autonomous_lite.rviz"
+if [[ -n "${RVIZ_CONFIG:-}" ]]; then
+        echo "[RVIZ] External override detected: ${RVIZ_CONFIG}"
+else
+        RVIZ_CONFIG="${DEFAULT_RVIZ_CONFIG}"
+fi
 USE_SLAM="${USE_SLAM:-true}"
 
 # In SLAM mode, do not auto-load a previously saved map.

@@ -609,9 +609,10 @@ class ExplorationPlanningMixin:
             self._blacklist_goal((goal_x, goal_y))
             return False
 
-        # Skip lethal cell check during INIT phase (startup costmap may be settling)
-        # After startup, warn but don't strictly block if robot is in questionable costmap state
-        if use_costmap_filter and not is_init_phase:
+        # Keep lethal start-cell blocking disabled until the first successful goal.
+        # After first success, enforce this check to avoid repeatedly planning from lethal cells.
+        lethal_logic_enabled = (self.goals_reached >= 1)
+        if use_costmap_filter and not is_init_phase and lethal_logic_enabled:
             self.update_pose()
             if self.pose_valid:
                 costmap_info = self._get_costmap_info()
@@ -628,6 +629,10 @@ class ExplorationPlanningMixin:
                             self.last_lethal_cell_warn_time = now
                         self._clear_costmaps('start_cell_lethal', clear_global=True)
                         return False
+        elif use_costmap_filter and not is_init_phase and (not lethal_logic_enabled):
+            if (now - self.last_lethal_cell_warn_time) > 5.0:
+                self.last_lethal_cell_warn_time = now
+                self.get_logger().info("🟡 Lethal-cell blocking is disabled until first goal is reached")
 
         nav2_server_ready = self.nav_client.wait_for_server(timeout_sec=0.1)
         nav2_services_ready = self._nav2_services_ready()
@@ -954,6 +959,9 @@ class ExplorationPlanningMixin:
             self.last_successful_goal_pos = (robot_x, robot_y)
             self.goals_reached += 1                                               
             self.get_logger().info(f"📊 Goals reached: {self.goals_reached}/{self.min_goals_for_complete}")
+            if self.goals_reached == 1 and hasattr(self, 'enable_lethal_escape'):
+                self.enable_lethal_escape()
+                self.get_logger().info("✅ First goal completed: lethal logic is now enabled")
             if self.avoid_revisit:
                 self.visited_goals.append((robot_x, robot_y))
             if self.strict_no_revisit and self.last_goal_target is not None:
@@ -963,8 +971,9 @@ class ExplorationPlanningMixin:
             self.get_logger().error(f"❌ Goal ABORTED! Failure #{self.consecutive_failures}/{self.max_consecutive_failures} at pos ({robot_x:.2f}, {robot_y:.2f})")
             self.get_logger().error(f"   Likely cause: No valid path found by Nav2 planner")
 
-            # Check for lethal-space planner failures and trigger immediate escape if needed
-            if hasattr(self, '_maybe_lethal_escape'):
+            # Check for lethal-space planner failures only after at least one successful goal.
+            # Before first goal, this escape can overreact to startup/planner transients.
+            if self.goals_reached >= 1 and hasattr(self, '_maybe_lethal_escape'):
                 escaped = self._maybe_lethal_escape(robot_x, robot_y)
                 if escaped:
                     self.get_logger().error("⚠️ LETHAL SPACE DETECTED — executing immediate escape sequence")

@@ -100,7 +100,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('nav2_state_check_interval', 1.0)
         self.declare_parameter('nav2_state_response_timeout', 2.5)
         self.declare_parameter('nav2_inactive_confirm_sec', 6.0)
-        self.declare_parameter('nav2_allow_goal_override', True)
+        self.declare_parameter('nav2_allow_goal_override', False)
         self.declare_parameter('serial_reconnect_interval', 1.0)
         self.declare_parameter('serial_max_error_streak', 5)
         self.declare_parameter('serial_error_log_interval', 2.0)
