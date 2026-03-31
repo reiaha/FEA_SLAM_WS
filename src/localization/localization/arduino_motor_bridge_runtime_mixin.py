@@ -253,61 +253,89 @@ class ArduinoMotorBridgeRuntimeMixin:
         for name, client in self.nav2_clients.items():
             if not client.service_is_ready():
                 continue
+            pending_future = self.nav2_state_futures.get(name)
+            if pending_future is not None:
+                request_time = self.nav2_state_request_time.get(name, 0.0)
+                if (now - request_time) > self.nav2_state_response_timeout:
+                    self.nav2_state_futures[name] = None
+                else:
+                    continue
             if self.nav2_state_futures.get(name) is None:
                 try:
                     future = client.call_async(GetState.Request())
                     self.nav2_state_futures[name] = future
+                    self.nav2_state_request_time[name] = now
                     future.add_done_callback(lambda f, n=name: self._handle_nav2_state_result(n, f))
                 except Exception as e:
                     self.get_logger().error(f"🧭 Error sending {name} state request: {e}")
 
-        all_active = True
         active_count = 0
         status_lines = []
-        explicit_non_active = False
+        active_nodes = set()
+        explicit_non_active_nodes = set()
+        required_nodes = {'controller_server', 'planner_server'}
 
         for name in self.nav2_clients.keys():
             if not self.nav2_clients[name].service_is_ready():
-                all_active = False
                 status_lines.append(f"{name}: service_not_ready")
                 continue
 
             if name not in self.nav2_state_cache:
-                all_active = False
-                status_lines.append(f"{name}: pending")
+                if name == 'bt_navigator' and self.nav2_tolerate_bt_pending:
+                    status_lines.append(f"{name}: pending(tolerated)")
+                else:
+                    status_lines.append(f"{name}: pending")
                 continue
 
             last_update = self.nav2_state_update_time.get(name, 0.0)
             if now - last_update > self.nav2_state_response_timeout:
-                all_active = False
-                status_lines.append(f"{name}: timeout")
+                if name == 'bt_navigator' and self.nav2_tolerate_bt_pending:
+                    status_lines.append(f"{name}: timeout(tolerated)")
+                else:
+                    status_lines.append(f"{name}: timeout")
                 continue
 
             state_id = self.nav2_state_cache.get(name)
             if state_id == 3:
                 active_count += 1
+                active_nodes.add(name)
+            elif state_id in (0, None):
+                status_lines.append(f"{name}: {state_map.get(state_id, str(state_id))}")
             else:
-                all_active = False
-                explicit_non_active = True
+                explicit_non_active_nodes.add(name)
                 status_lines.append(f"{name}: {state_map.get(state_id, str(state_id))}")
 
-        instant_ready = all_active
+        required_active = required_nodes.issubset(active_nodes)
+        explicit_non_active_required = any(n in required_nodes for n in explicit_non_active_nodes)
+        explicit_non_active_bt = 'bt_navigator' in explicit_non_active_nodes
+        explicit_non_active_for_ready = explicit_non_active_required or (
+            explicit_non_active_bt and not self.nav2_tolerate_bt_pending
+        )
+        enough_active_nodes = active_count >= max(1, self.nav2_min_active_nodes)
+        instant_ready = required_active and enough_active_nodes and not explicit_non_active_for_ready
 
-        if self.nav2_allow_goal_override and self.has_active_goal and (not explicit_non_active):
+        if self.nav2_allow_goal_override and self.has_active_goal and (
+            (not explicit_non_active_for_ready) or active_count >= 1):
             instant_ready = True
 
         if instant_ready:
             self.nav2_not_ready_since = 0.0
             self.nav2_ready = True
+            self.last_nav2_ready_true_at = now
         else:
             if self.nav2_not_ready_since <= 0.0:
                 self.nav2_not_ready_since = now
             self.nav2_ready = (now - self.nav2_not_ready_since) < self.nav2_inactive_confirm_sec
 
+        self.nav2_explicitly_inactive = explicit_non_active_for_ready
+
         if self.nav2_ready != self.last_nav2_ready:
             self.last_nav2_ready = self.nav2_ready
             state = 'ACTIVE' if self.nav2_ready else 'INACTIVE'
-            self.get_logger().info(f"🧭 Nav2 state changed: {state} ({active_count}/3 nodes active)")
+            self.get_logger().info(
+                f"🧭 Nav2 state changed: {state} ({active_count}/3 nodes active, "
+                f"required={sorted(required_nodes)})"
+            )
 
         if not self.nav2_ready:
             if now - self.last_nav2_state_log_time >= self.nav2_state_log_interval:
@@ -332,6 +360,7 @@ class ArduinoMotorBridgeRuntimeMixin:
             self.nav2_state_update_time[name] = time.time()
         finally:
             self.nav2_state_futures[name] = None
+            self.nav2_state_request_time[name] = 0.0
 
     def _publish_odom(self):
         if not self.publish_odom:
@@ -523,6 +552,9 @@ class ArduinoMotorBridgeRuntimeMixin:
             action = action_override or self._get_action_name(pwm_left, pwm_right)
             msg = f'🚀 {action} | MOTOR:{pwm_left},{pwm_right} | SRC:{source}'
             now = time.time()
+            self.last_cmd_pwm_left = pwm_left
+            self.last_cmd_pwm_right = pwm_right
+            self.last_cmd_time = now
             # Always log motor output as warn for visibility
             self.get_logger().warn(msg)
             self.last_motor_log_time = now
@@ -805,9 +837,22 @@ class ArduinoMotorBridgeRuntimeMixin:
             return
 
         if self.require_nav2_active and not self.nav2_ready:
+            now = time.time()
+            uncertain_state = not self.nav2_explicitly_inactive
+            within_uncertain_grace = (now - self.last_nav2_ready_true_at) <= self.nav2_uncertain_grace_sec
+            allow_hold = uncertain_state and (within_uncertain_grace or self.has_active_goal)
+            if allow_hold:
+                return
+
             self.safety_override_active = False
             self.safety_override_until = 0.0
-            self._send_stop(action_override='🛑 STOPPED (NAV2 INACTIVE)', log_level='none', source='nav2_inactive')
+            if (
+                self.last_cmd_pwm_left != 0 or
+                self.last_cmd_pwm_right != 0 or
+                (now - self.last_nav2_inactive_stop_time) >= self.nav2_inactive_stop_repeat_sec
+            ):
+                self.last_nav2_inactive_stop_time = now
+                self._send_stop(action_override='🛑 STOPPED (NAV2 INACTIVE)', log_level='none', source='nav2_inactive')
             return
 
         if not self.enable_safety_override:

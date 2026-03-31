@@ -179,6 +179,20 @@ class ExplorationPlanningMixin:
             self.last_frontier_skip_reason = "pose_stale"
             return None
 
+        tf_recovery_hold = max(0.0, float(getattr(self, 'tf_recovery_hold_sec', 0.0)))
+        tf_fresh_since = float(getattr(self, 'tf_fresh_since', 0.0))
+        if tf_recovery_hold > 0.0 and tf_fresh_since > 0.0:
+            since_fresh = time.time() - tf_fresh_since
+            if since_fresh < tf_recovery_hold:
+                now = time.time()
+                if (now - getattr(self, 'last_tf_recovery_log_time', 0.0)) >= 2.0:
+                    self.last_tf_recovery_log_time = now
+                    self.get_logger().warn(
+                        f"⏳ TF recovered; waiting {tf_recovery_hold - since_fresh:.2f}s before selecting next frontier."
+                    )
+                self.last_frontier_skip_reason = "pose_recovering"
+                return None
+
         robot_x, robot_y, _ = self.robot_pose
         now = time.time()
 
@@ -609,9 +623,11 @@ class ExplorationPlanningMixin:
             self._blacklist_goal((goal_x, goal_y))
             return False
 
-        # Keep lethal start-cell blocking disabled until the first successful goal.
-        # After first success, enforce this check to avoid repeatedly planning from lethal cells.
-        lethal_logic_enabled = (self.goals_reached >= 1)
+        # Optionally defer lethal start-cell checks until first success.
+        # On jittery systems this can hide persistent start-cell blockage and create goal abort loops,
+        # so make this behavior configurable from launch.
+        defer_lethal = bool(getattr(self, 'defer_lethal_block_until_first_goal', False))
+        lethal_logic_enabled = (self.goals_reached >= 1) if defer_lethal else True
         if use_costmap_filter and not is_init_phase and lethal_logic_enabled:
             self.update_pose()
             if self.pose_valid:
@@ -955,6 +971,7 @@ class ExplorationPlanningMixin:
 
         if result.status == 4:             
             self.get_logger().info(f"✅ Reached frontier goal! Robot at ({robot_x:.2f}, {robot_y:.2f})")
+            self.post_abort_cooldown_until = 0.0
             self.consecutive_failures = 0                                    
             self.last_successful_goal_pos = (robot_x, robot_y)
             self.goals_reached += 1                                               
@@ -967,6 +984,10 @@ class ExplorationPlanningMixin:
             if self.strict_no_revisit and self.last_goal_target is not None:
                 self.strict_avoid_goals.append(self.last_goal_target)
         elif result.status == 5:           
+            self.post_abort_cooldown_until = max(
+                getattr(self, 'post_abort_cooldown_until', 0.0),
+                time.time() + max(0.0, float(getattr(self, 'post_abort_goal_cooldown_sec', 0.0)))
+            )
             self.consecutive_failures += 1
             self.get_logger().error(f"❌ Goal ABORTED! Failure #{self.consecutive_failures}/{self.max_consecutive_failures} at pos ({robot_x:.2f}, {robot_y:.2f})")
             self.get_logger().error(f"   Likely cause: No valid path found by Nav2 planner")
@@ -1011,6 +1032,10 @@ class ExplorationPlanningMixin:
                     pass
         elif result.status == 6:            
             self.get_logger().warn(f"⚠️ Navigation canceled at ({robot_x:.2f}, {robot_y:.2f})")
+            self.post_abort_cooldown_until = max(
+                getattr(self, 'post_abort_cooldown_until', 0.0),
+                time.time() + max(0.0, float(getattr(self, 'post_abort_goal_cooldown_sec', 0.0)))
+            )
             if self.last_goal_target is not None and self.strict_no_revisit:
                 self.strict_avoid_goals.append(self.last_goal_target)
             if self.obstacle_detected:

@@ -168,7 +168,7 @@ class ExplorationExecutionMixin:
                     f"↩️ Rear obstacle detected at {self.last_rear_distance:.2f}m, rotating away."
                 )
                 rotate_msg = Twist()
-                rotate_msg.angular.z = 0.5
+                rotate_msg.angular.z = self.corner_recovery_turn_speed
                 self.cmd_vel_pub.publish(rotate_msg)
                 self.scan_step += 1
                 if self.scan_step >= self.scan_steps_per_angle:
@@ -311,7 +311,7 @@ class ExplorationExecutionMixin:
                     stop_msg = Twist()
                     self.cmd_vel_pub.publish(stop_msg)
                     rotate_msg = Twist()
-                    rotate_msg.angular.z = 0.5
+                    rotate_msg.angular.z = self.corner_recovery_turn_speed
                     self.cmd_vel_pub.publish(rotate_msg)
                     return
                 if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
@@ -540,18 +540,9 @@ class ExplorationExecutionMixin:
 
             now = time.time()
 
-            # Only blacklist the previous goal target, NOT robot's own position (prevents exploration paralysis)
-            if self.last_goal_target is not None:
-                self._blacklist_goal(self.last_goal_target)
+            # Keep active Nav2 goals running in EXPLORE; cancel/blacklist is handled in explicit
+            # failure/recovery paths to avoid self-inflicted abort loops.
             self.update_pose()
-            try:
-                if self.goal_handle is not None:
-                    self.goal_handle.cancel_goal_async()
-                    self.goal_handle = None
-                    self.goal_in_progress = False
-            except Exception:
-                pass
-            self.corner_recovery_until = 0.0
 
             if self.static_stuck_escape_active:
                 step_elapsed = now - self.static_stuck_escape_step_start
@@ -589,6 +580,16 @@ class ExplorationExecutionMixin:
             if now - self.last_explore_check < self.explore_check_interval:
                 return                   
             self.last_explore_check = now
+
+            if (self.goal_handle is None and not self.goal_in_progress and
+                    now < getattr(self, 'post_abort_cooldown_until', 0.0)):
+                if (now - getattr(self, 'last_abort_cooldown_log_time', 0.0)) >= 1.5:
+                    self.last_abort_cooldown_log_time = now
+                    wait_left = self.post_abort_cooldown_until - now
+                    self.get_logger().warn(
+                        f"⏳ Post-abort cooldown active ({wait_left:.2f}s left); delaying new goal send."
+                    )
+                return
 
             # Auto-retry: If no goal is in progress and last goal was too old, try sending new frontier
             if self.goal_handle is None and not self.goal_in_progress:
@@ -698,7 +699,7 @@ class ExplorationExecutionMixin:
                     
                     if (now - self._emergency_search_start) < 4.0:
                         search_msg = Twist()
-                        search_msg.angular.z = 0.8  # Rotate to map new areas
+                        search_msg.angular.z = self.corner_recovery_turn_speed  # Rotate at configured recovery speed
                         self.cmd_vel_pub.publish(search_msg)
                         return
                     else:
@@ -860,7 +861,8 @@ class ExplorationExecutionMixin:
                         self._on_exploration_complete()
                         return
 
-                    if self.last_percent_known >= self.coverage_complete_percent:
+                    if (self.last_percent_known >= self.coverage_complete_percent and
+                            self.goals_reached >= self.min_goals_for_complete):
                         self.get_logger().info(
                             f"🎉 EXPLORATION COMPLETE! Coverage {self.last_percent_known:.1f}% "
                             f">= target {self.coverage_complete_percent:.1f}%."
@@ -885,6 +887,16 @@ class ExplorationExecutionMixin:
                             self.get_logger().warn(f"⚠️ Could not publish stop command: {e}")
                         self.current_phase = Phase.DONE
                         self._on_exploration_complete()
+                        return
+
+                    if (self.last_percent_known >= self.coverage_complete_percent and
+                            self.goals_reached < self.min_goals_for_complete):
+                        self.get_logger().warn(
+                            f"⚠️ Coverage target met ({self.last_percent_known:.1f}% >= "
+                            f"{self.coverage_complete_percent:.1f}%) but goals reached "
+                            f"{self.goals_reached}/{self.min_goals_for_complete}; continuing exploration."
+                        )
+                        self.no_frontier_cycles = 0
                         return
 
                     self.get_logger().warn(
@@ -986,7 +998,7 @@ class ExplorationExecutionMixin:
             
             if elapsed < self.recovery_rotation_duration:
                 rotate_msg = Twist()
-                rotate_msg.angular.z = 0.75                        
+                rotate_msg.angular.z = self.corner_recovery_turn_speed
                 self.cmd_vel_pub.publish(rotate_msg)
                 if int(elapsed * 2) % 2 == 0:                         
                     self.get_logger().info(f"🔄 RECOVERY: Rotating in place ({elapsed:.1f}s/{self.recovery_rotation_duration}s)")

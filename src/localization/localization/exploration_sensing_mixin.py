@@ -473,12 +473,16 @@ class ExplorationSensingMixin:
         now = time.time()
         self.last_tf_stamp = stamp
         tf_age = (self.get_clock().now() - rclpy.time.Time.from_msg(stamp)).nanoseconds / 1e9
+        was_stale = bool(getattr(self, 'pose_stale', False))
         self.pose_stale = tf_age > self.pose_stale_timeout
         if self.pose_stale and (now - self.last_pose_stale_log_time) > self.pose_stale_log_interval:
             self.last_pose_stale_log_time = now
             self.get_logger().warn(
                 f"⚠️ TF data stale (age {tf_age:.2f}s). Waiting for odom/TF to update."
             )
+            self.tf_fresh_since = 0.0
+        elif not self.pose_stale and (was_stale or getattr(self, 'tf_fresh_since', 0.0) <= 0.0):
+            self.tf_fresh_since = now
 
         if self.last_pose is None:
             self.last_pose = (x, y)

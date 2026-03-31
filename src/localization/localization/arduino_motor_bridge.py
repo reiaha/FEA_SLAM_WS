@@ -101,6 +101,10 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('nav2_state_response_timeout', 2.5)
         self.declare_parameter('nav2_inactive_confirm_sec', 6.0)
         self.declare_parameter('nav2_allow_goal_override', False)
+        self.declare_parameter('nav2_min_active_nodes', 2)
+        self.declare_parameter('nav2_tolerate_bt_pending', True)
+        self.declare_parameter('nav2_uncertain_grace_sec', 10.0)
+        self.declare_parameter('nav2_inactive_stop_repeat_sec', 0.5)
         self.declare_parameter('serial_reconnect_interval', 1.0)
         self.declare_parameter('serial_max_error_streak', 5)
         self.declare_parameter('serial_error_log_interval', 2.0)
@@ -215,6 +219,10 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.nav2_state_response_timeout = float(self.get_parameter('nav2_state_response_timeout').value)
         self.nav2_inactive_confirm_sec = float(self.get_parameter('nav2_inactive_confirm_sec').value)
         self.nav2_allow_goal_override = bool(self.get_parameter('nav2_allow_goal_override').value)
+        self.nav2_min_active_nodes = int(self.get_parameter('nav2_min_active_nodes').value)
+        self.nav2_tolerate_bt_pending = bool(self.get_parameter('nav2_tolerate_bt_pending').value)
+        self.nav2_uncertain_grace_sec = float(self.get_parameter('nav2_uncertain_grace_sec').value)
+        self.nav2_inactive_stop_repeat_sec = float(self.get_parameter('nav2_inactive_stop_repeat_sec').value)
         self.serial_reconnect_interval = float(self.get_parameter('serial_reconnect_interval').value)
         self.serial_max_error_streak = int(self.get_parameter('serial_max_error_streak').value)
         self.serial_error_log_interval = float(self.get_parameter('serial_error_log_interval').value)
@@ -253,6 +261,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
 
         self.nav2_ready = not self.require_nav2_active
         self.has_active_goal = False
+        self.last_goal_active_at = 0.0
         self.goal_cleared_at = 0.0                                              
         self.goal_cleared_grace = 1.5                                                                 
         self.last_goal_block_log_time = 0.0
@@ -261,12 +270,16 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.last_nav2_state_log_time = 0.0
         self.last_nav2_ready = self.nav2_ready
         self.nav2_not_ready_since = 0.0
+        self.nav2_explicitly_inactive = False
+        self.last_nav2_ready_true_at = time.time()
+        self.last_nav2_inactive_stop_time = 0.0
         self.nav2_clients = {
             'controller_server': self.create_client(GetState, '/controller_server/get_state'),
             'planner_server': self.create_client(GetState, '/planner_server/get_state'),
             'bt_navigator': self.create_client(GetState, '/bt_navigator/get_state')
         }
         self.nav2_state_futures = {}
+        self.nav2_state_request_time = {}
         self.nav2_state_cache = {}
         self.nav2_state_update_time = {}
         if self.require_nav2_active:
@@ -478,16 +491,28 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
     
     def _nav2_goal_status_cb(self, msg):
         from action_msgs.msg import GoalStatus
+        now = time.time()
         was_active = self.has_active_goal
-        self.has_active_goal = any(
+        has_active_from_status = any(
             gs.status in (GoalStatus.STATUS_ACCEPTED, GoalStatus.STATUS_EXECUTING)
             for gs in msg.status_list
         )
+
+        if has_active_from_status:
+            self.has_active_goal = True
+            self.last_goal_active_at = now
+        else:
+            # Debounce transient status-list dropouts under CPU spikes.
+            if (now - self.last_goal_active_at) <= self.goal_cleared_grace:
+                self.has_active_goal = True
+            else:
+                self.has_active_goal = False
+
         if self.has_active_goal != was_active:
             state = 'ACTIVE' if self.has_active_goal else 'NONE'
             self.get_logger().info(f'🎯 Nav2 goal state changed: {state}')
             if not self.has_active_goal:
-                self.goal_cleared_at = time.time()
+                self.goal_cleared_at = now
 
     def cmd_vel_cb(self, msg: Twist):
         if self.prefer_nav_cmd_with_active_goal and self.has_active_goal and self.nav2_ready:

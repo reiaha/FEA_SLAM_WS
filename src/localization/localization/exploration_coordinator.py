@@ -177,6 +177,10 @@ class ExplorationCoordinator(
             'costmap_free_threshold': 90,
             'use_costmap_goal_filter': True,
             'pose_movement_threshold': 0.05,
+            'pose_stale_timeout': 3.0,
+            'tf_recovery_hold_sec': 1.2,
+            'defer_lethal_block_until_first_goal': False,
+            'post_abort_goal_cooldown_sec': 2.0,
             'require_costmap': True,
             'costmap_wait_timeout': 10.0,
             'require_nav2_active': False,
@@ -321,6 +325,8 @@ class ExplorationCoordinator(
         self.last_goal_dispatch_time = 0.0
         self.goal_dispatch_pose = None
         self.last_goal_watchdog_log_time = 0.0
+        self.post_abort_cooldown_until = 0.0
+        self.last_abort_cooldown_log_time = 0.0
         self._lethal_fail_pos = None                                             
         self._lethal_fail_count = 0                                                       
         # static environment logic removed
@@ -420,11 +426,13 @@ class ExplorationCoordinator(
         self.last_pose = None
         self.last_pose_change_time = time.time()
         self.pose_change_threshold = 0.02          
-        self.pose_stale_timeout = 2.0                                    
+        self.pose_stale_timeout = max(1.0, float(getattr(self, 'pose_stale_timeout', 3.0)))
         self.pose_stale = False
         self.last_pose_stale_log_time = 0.0
         self.pose_stale_log_interval = 5.0
+        self.last_tf_recovery_log_time = 0.0
         self.last_tf_stamp = None
+        self.tf_fresh_since = 0.0
         self.origin_warn_interval = 5.0
         self.last_origin_warn_time = 0.0
         self.last_frontier_skip_reason = None
