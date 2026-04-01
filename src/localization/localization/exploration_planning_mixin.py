@@ -12,6 +12,86 @@ from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.duration import Duration
 
 class ExplorationPlanningMixin:
+    def _dynamic_obstacle_pruning_active(self) -> bool:
+        """Return True only when pruning should react to moving obstacles."""
+        if not bool(getattr(self, 'prune_only_moving_obstacles', False)):
+            return True
+
+        if not bool(getattr(self, 'obstacle_detected', False)):
+            return False
+
+        obstacle_type = str(getattr(self, 'current_lidar_obstacle_type', 'unknown')).lower()
+        if obstacle_type != 'dynamic':
+            return False
+
+        hold_sec = max(0.0, float(getattr(self, 'dynamic_obstacle_prune_hold_sec', 1.5)))
+        last_obs = float(getattr(self, 'last_obstacle_time', 0.0))
+        return (time.time() - last_obs) <= hold_sec
+
+    def _frontier_is_valid(self, fx: float, fy: float) -> bool:
+        """Return True only for finite, in-map, traversable frontier points near unknown space."""
+        if not math.isfinite(fx) or not math.isfinite(fy):
+            return False
+
+        if not bool(getattr(self, 'exclude_invalid_frontiers', True)):
+            return True
+
+        slam_map = getattr(self, 'last_slam_map', None)
+        if slam_map is None:
+            return True
+
+        try:
+            info = slam_map.info
+            resolution = float(info.resolution)
+            if resolution <= 0.0:
+                return False
+
+            origin_x = float(info.origin.position.x)
+            origin_y = float(info.origin.position.y)
+            width = int(info.width)
+            height = int(info.height)
+            data = slam_map.data
+            if width <= 0 or height <= 0 or not data:
+                return False
+
+            mx = int((fx - origin_x) / resolution)
+            my = int((fy - origin_y) / resolution)
+            if mx < 0 or my < 0 or mx >= width or my >= height:
+                return False
+
+            idx = my * width + mx
+            cell = int(data[idx])
+            if cell < 0:
+                return False
+
+            max_occ = int(getattr(self, 'invalid_frontier_max_occupancy', 70))
+            if cell >= max_occ:
+                return False
+
+            unknown_neighbors = 0
+            traversable_neighbors = 0
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    nx = mx + dx
+                    ny = my + dy
+                    if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                        continue
+                    nval = int(data[ny * width + nx])
+                    if nval == -1:
+                        unknown_neighbors += 1
+                    elif 0 <= nval < max_occ:
+                        traversable_neighbors += 1
+
+            if unknown_neighbors <= 0:
+                return False
+            if traversable_neighbors <= 0:
+                return False
+            return True
+        except Exception:
+            return False
+
     def _frontier_is_already_scanned(self, robot_x: float, robot_y: float, fx: float, fy: float) -> bool:
         """Return True when frontier is already within effective lidar scan coverage."""
         if not bool(getattr(self, 'frontier_skip_if_within_scan_range', True)):
@@ -195,18 +275,31 @@ class ExplorationPlanningMixin:
 
         robot_x, robot_y, _ = self.robot_pose
         now = time.time()
+        prune_active = self._dynamic_obstacle_pruning_active()
 
         frontier_pool = []
+        invalid_frontier_count = 0
         pruned_mapped_count = 0
         pruned_scanned_count = 0
         for fx, fy in self.current_frontiers:
-            if self._frontier_is_already_scanned(robot_x, robot_y, fx, fy):
+            if not self._frontier_is_valid(fx, fy):
+                invalid_frontier_count += 1
+                continue
+            if prune_active and self._frontier_is_already_scanned(robot_x, robot_y, fx, fy):
                 pruned_scanned_count += 1
                 continue
-            if self._frontier_needs_exploration(fx, fy, robot_x, robot_y):
+            if (not prune_active) or self._frontier_needs_exploration(fx, fy, robot_x, robot_y):
                 frontier_pool.append((fx, fy))
             else:
                 pruned_mapped_count += 1
+
+        if invalid_frontier_count > 0:
+            log_interval = max(0.2, float(getattr(self, 'invalid_frontier_log_interval', 2.0)))
+            if (now - float(getattr(self, 'last_invalid_frontier_log_time', 0.0))) >= log_interval:
+                self.last_invalid_frontier_log_time = now
+                self.get_logger().warn(
+                    f"🚫 Excluded {invalid_frontier_count} invalid frontier(s) before goal selection"
+                )
 
         if (pruned_mapped_count > 0) or (pruned_scanned_count > 0):
             self.current_frontiers = frontier_pool
@@ -214,9 +307,14 @@ class ExplorationPlanningMixin:
             last_log_time = float(getattr(self, 'last_frontier_prune_log_time', 0.0))
             if (now - last_log_time) >= max(0.2, log_interval):
                 self.last_frontier_prune_log_time = now
-                self.get_logger().info(
-                    f"🧹 Pruned mapped={pruned_mapped_count}, scanned={pruned_scanned_count} frontier(s); selecting only not-yet-scanned frontiers"
-                )
+                if prune_active:
+                    self.get_logger().info(
+                        f"🧹 Pruned mapped={pruned_mapped_count}, scanned={pruned_scanned_count} frontier(s); selecting only not-yet-scanned frontiers"
+                    )
+                else:
+                    self.get_logger().info(
+                        "🧹 Frontier pruning paused (dynamic obstacle not active); keeping static frontiers"
+                    )
 
         if not frontier_pool:
             self.last_frontier_skip_reason = "no_unexplored_frontiers"

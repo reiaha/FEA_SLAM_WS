@@ -151,6 +151,11 @@ class ExplorationCoordinator(
             'visited_goal_radius': 0.6,
             'known_frontier_avoid_radius': 1.2,
             'prune_mapped_frontiers': True,
+            'prune_only_moving_obstacles': True,
+            'dynamic_obstacle_prune_hold_sec': 1.5,
+            'exclude_invalid_frontiers': True,
+            'invalid_frontier_max_occupancy': 70,
+            'invalid_frontier_log_interval': 2.0,
             'frontier_lidar_range_m': 3.5,
             'frontier_lidar_range_margin_m': 0.2,
             'frontier_skip_if_within_scan_range': True,
@@ -196,6 +201,9 @@ class ExplorationCoordinator(
             'coverage_complete_percent': 90.0,
             'zero_frontier_complete_percent': 80.0,
             'min_goals_for_complete': 3,
+            'require_motion_and_map_growth_for_completion': True,
+            'completion_min_displacement_m': 0.30,
+            'completion_min_known_cell_gain': 40,
             'small_test_mode': False,
             'complete_on_zero_frontiers': False,  # Only stop when coverage and min_goals are met
             'auto_save_on_complete': True,
@@ -277,6 +285,8 @@ class ExplorationCoordinator(
         self.phase_start_time = None                                        
         self.robot_pose = (0.0, 0.0, 0.0)               
         self.home_pose = None                                                 
+        self.exploration_start_known_cells = 0
+        self.last_completion_guard_log_time = 0.0
         self.current_frontiers = []
         self.obstacle_detected = False
         self.obstacle_distance_m = float('inf')
@@ -368,6 +378,7 @@ class ExplorationCoordinator(
         self.goals_reached = 0                                                     
         self.last_frontier_check_time = 0.0                                       
         self.last_frontier_prune_log_time = 0.0
+        self.last_invalid_frontier_log_time = 0.0
         self.frontier_stable_count = 0                                                    
         self.min_frontier_stable_time = 5.0                                                                
         self.exploration_start_time = 0.0                                      
@@ -412,7 +423,7 @@ class ExplorationCoordinator(
         self.scan_steps_per_angle = 10                                         
         self.scan_total_time = 0.0
         self.last_explore_check = 0.0
-        self.explore_check_interval = 0.1
+        self.explore_check_interval = 0.05
         
         self.last_phase_log_time = 0.0
         self.phase_log_interval = 5.0                                   

@@ -36,12 +36,22 @@ class ExplorationSensingMixin:
     def frontiers_cb(self, msg: MarkerArray):
         """Store frontier positions"""
         self.current_frontiers = []
+        invalid_count = 0
         for marker in msg.markers:
             x = marker.pose.position.x
             y = marker.pose.position.y
+            if hasattr(self, '_frontier_is_valid') and not self._frontier_is_valid(x, y):
+                invalid_count += 1
+                continue
             self.current_frontiers.append((x, y))
 
         now = time.time()
+        if invalid_count > 0:
+            log_interval = max(0.2, float(getattr(self, 'invalid_frontier_log_interval', 2.0)))
+            if (now - float(getattr(self, 'last_invalid_frontier_log_time', 0.0))) >= log_interval:
+                self.last_invalid_frontier_log_time = now
+                self.get_logger().warn(f"🚫 Dropped {invalid_count} invalid frontier marker(s)")
+
         new_signature = self._compute_frontier_signature(self.current_frontiers)
         if new_signature != self.frontier_signature:
             self.frontier_signature = new_signature

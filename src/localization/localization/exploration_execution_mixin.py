@@ -13,6 +13,53 @@ from rclpy.duration import Duration
 class ExplorationExecutionMixin:
     lethal_escape_enabled: bool = True
 
+    def _completion_guard_satisfied(self) -> bool:
+        """Require real robot movement and map growth before allowing completion."""
+        if not bool(getattr(self, 'require_motion_and_map_growth_for_completion', False)):
+            return True
+
+        home_pose = getattr(self, 'home_pose', None)
+        robot_pose = getattr(self, 'robot_pose', None)
+        if home_pose is None or robot_pose is None:
+            return False
+
+        moved_m = math.hypot(
+            float(robot_pose[0]) - float(home_pose[0]),
+            float(robot_pose[1]) - float(home_pose[1]),
+        )
+        min_disp_m = max(0.0, float(getattr(self, 'completion_min_displacement_m', 0.30)))
+
+        start_known = int(getattr(self, 'exploration_start_known_cells', 0))
+        now_known = int(getattr(self, 'max_known_cells', 0))
+        known_gain = max(0, now_known - start_known)
+        min_known_gain = max(0, int(getattr(self, 'completion_min_known_cell_gain', 40)))
+
+        ok = (moved_m >= min_disp_m) and (known_gain >= min_known_gain)
+        if not ok:
+            now_t = time.time()
+            if (now_t - float(getattr(self, 'last_completion_guard_log_time', 0.0))) >= 2.0:
+                self.last_completion_guard_log_time = now_t
+                self.get_logger().warn(
+                    f"⛔ Completion gate blocked: moved={moved_m:.2f}/{min_disp_m:.2f}m, "
+                    f"known_gain={known_gain}/{min_known_gain} cells"
+                )
+        return ok
+
+    def _reverse_recovery_allowed(self) -> bool:
+        """Allow autonomous reverse maneuvers only after exploration has actually started with real movement."""
+        if not bool(getattr(self, 'ever_sent_goal', False) or getattr(self, 'goals_reached', 0) > 0):
+            return False
+
+        home_pose = getattr(self, 'home_pose', None)
+        robot_pose = getattr(self, 'robot_pose', None)
+        if home_pose is None or robot_pose is None:
+            return False
+
+        moved = math.hypot(float(robot_pose[0]) - float(home_pose[0]), float(robot_pose[1]) - float(home_pose[1]))
+        # First tiny/instant goal can be accepted at origin; don't enable reverse recoveries until
+        # robot has physically displaced from home.
+        return moved >= 0.10
+
     def enable_lethal_escape(self):
         self.lethal_escape_enabled = True
 
@@ -33,7 +80,7 @@ class ExplorationExecutionMixin:
         else:
             self._lethal_fail_count = 1
         self._lethal_fail_pos = (robot_x, robot_y)
-        if self._lethal_fail_count >= 1:  # AGGRESSIVE: trigger on FIRST failure (was 2)
+        if self._lethal_fail_count >= 2:
             self._fire_lethal_escape()
             return True  # Signal that escape was triggered
         return False
@@ -154,6 +201,8 @@ class ExplorationExecutionMixin:
         if not self.scan_in_progress:
             return False                   
         
+        reverse_allowed = self._reverse_recovery_allowed()
+
         if self.rear_obstacle_detected:
             self.scan_in_progress = False
             if self.last_rear_distance <= self.rear_emergency_distance:
@@ -187,7 +236,11 @@ class ExplorationExecutionMixin:
             self._publish_front_escape(turn_scale=0.9)
         else:
             backup_msg = Twist()
-            backup_msg.linear.x = -0.12                                   
+            # Before first real nav goal, never command reverse from RESCAN.
+            if reverse_allowed:
+                backup_msg.linear.x = -0.12
+            else:
+                backup_msg.angular.z = self.corner_recovery_turn_speed
             self.cmd_vel_pub.publish(backup_msg)
         
         self.scan_step += 1
@@ -248,61 +301,7 @@ class ExplorationExecutionMixin:
             self.cmd_vel_pub.publish(stop)
             return
 
-        if (self.current_phase not in (Phase.INIT,) and
-                self.goals_reached >= self.min_goals_for_complete and
-                self.frontier_stagnation_timeout > 0 and
-                hasattr(self, 'current_frontiers') and len(self.current_frontiers) > 0):
-            _front_count = len(self.current_frontiers)
-            now_t = time.time()
-            if self._frontier_stagnation_baseline is None:
-                self._frontier_stagnation_baseline = _front_count
-                self._frontier_stagnation_start = now_t
-            else:
-                _drop_pct = (self._frontier_stagnation_baseline - _front_count) / max(1, self._frontier_stagnation_baseline) * 100.0
-                if _drop_pct >= self.frontier_stagnation_drop_pct:
-                    self._frontier_stagnation_baseline = _front_count
-                    self._frontier_stagnation_start = now_t
-                elif (now_t - self._frontier_stagnation_start) >= self.frontier_stagnation_timeout:
-                    self.get_logger().warn(
-                        f"🎉 EXPLORATION COMPLETE (frontier stagnation): {_front_count} frontiers unchanged "
-                        f"for {self.frontier_stagnation_timeout:.0f}s. Map coverage: {self.last_percent_known:.1f}%"
-                    )
-                    try:
-                        if hasattr(self, 'goal_handle') and self.goal_handle is not None:
-                            self.goal_handle.cancel_goal_async()
-                            self.goal_handle = None
-                            self.goal_in_progress = False
-                    except Exception:
-                        pass
-                    stop = Twist()
-                    self.cmd_vel_pub.publish(stop)
-                    self.current_phase = Phase.DONE
-                    self._on_exploration_complete()
-                    return
-        elif self.goals_reached < self.min_goals_for_complete:
-            self._frontier_stagnation_baseline = None
-            self._frontier_stagnation_start = None
-
-        if (self.current_phase not in (Phase.INIT,) and
-                self.goals_reached >= self.min_goals_for_complete and
-                self.last_percent_known >= self.zero_frontier_complete_percent):
-            self.get_logger().info(
-                f"🎉 EXPLORATION COMPLETE! Coverage {self.last_percent_known:.1f}% "
-                f">= {self.zero_frontier_complete_percent:.1f}% threshold "
-                f"(goals reached: {self.goals_reached}/{self.min_goals_for_complete})."
-            )
-            try:
-                if hasattr(self, 'goal_handle') and self.goal_handle is not None:
-                    self.goal_handle.cancel_goal_async()
-                    self.goal_handle = None
-                    self.goal_in_progress = False
-            except Exception:
-                pass
-            stop = Twist()
-            self.cmd_vel_pub.publish(stop)
-            self.current_phase = Phase.DONE
-            self._on_exploration_complete()
-            return
+        # Remove all completion logic based on goals_reached and min_goals_for_complete. Only complete on no valid frontiers or stagnation.
 
         if self.strict_obstacle_handling or not self.nav2_handles_obstacles:
             if time.time() < self.ultrasonic_emergency_until:
@@ -494,6 +493,7 @@ class ExplorationExecutionMixin:
                 self.exploration_start_time = time.time()
                 self.update_pose()
                 self.home_pose = self.robot_pose
+                self.exploration_start_known_cells = int(getattr(self, 'max_known_cells', 0))
                 self.get_logger().info(
                     f"🏠 Home pose recorded: ({self.home_pose[0]:.2f}, {self.home_pose[1]:.2f})")
                 self.get_logger().info("✅ Startup complete! Starting exploration")
@@ -614,8 +614,13 @@ class ExplorationExecutionMixin:
                             self.frontiers_dirty = True
                     return
                 
-                # Fallback: if no frontiers available but goal hasn't been sent recently, try fallback goal
-                if len(self.current_frontiers) == 0 and time_since_last_goal > 2.0:
+                # Fallback: if no frontiers are available, only keep probing when zero-frontier
+                # completion mode is disabled.
+                if (
+                    len(self.current_frontiers) == 0 and
+                    time_since_last_goal > 2.0 and
+                    (not bool(getattr(self, 'complete_on_zero_frontiers', False)))
+                ):
                     if hasattr(self, '_send_fallback_goal'):
                         self.get_logger().info("📍 No frontiers detected; attempting fallback goal")
                         if self._send_fallback_goal():
@@ -627,11 +632,12 @@ class ExplorationExecutionMixin:
                     self.corner_recovery_until = 0.0
                     self.corner_recovery_mode = None
                 else:
+                    reverse_allowed = self._reverse_recovery_allowed()
                     recovery_msg = Twist()
                     turn_dir = 1.0 if (self.no_frontier_cycles % 2 == 0) else -1.0
                     if self.corner_recovery_mode == "backup":
                         # Only back up if a close front obstacle is detected and rear is clear
-                        if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
+                        if reverse_allowed and self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
                             if not (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
                                 recovery_msg.linear.x = self.backup_speed
                         else:
@@ -737,8 +743,9 @@ class ExplorationExecutionMixin:
                     self.simple_exploration_active = False
 
                 if self.stop_when_no_frontiers and self.last_frontier_skip_reason == "no_frontiers":
+                    reverse_allowed = self._reverse_recovery_allowed()
                     # Only back up if a close obstacle is detected
-                    if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
+                    if reverse_allowed and self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
                         if not self.rear_obstacle_detected:
                             backup_msg = Twist()
                             backup_msg.linear.x = self.backup_speed
@@ -752,13 +759,8 @@ class ExplorationExecutionMixin:
                 self.no_frontier_cycles += 1
 
                 _imm_frontiers = len(self.current_frontiers)
-                if (_imm_frontiers == 0 and
-                        self.goals_reached >= self.min_goals_for_complete and
-                        self.last_percent_known >= self.zero_frontier_complete_percent):
-                    self.get_logger().info(
-                        f"🎉 EXPLORATION COMPLETE! 0 frontiers + coverage "
-                        f"{self.last_percent_known:.1f}% >= {self.zero_frontier_complete_percent:.1f}%"
-                    )
+                if _imm_frontiers == 0 and bool(getattr(self, 'complete_on_zero_frontiers', False)):
+                    self.get_logger().info("🎉 EXPLORATION COMPLETE! 0 valid frontiers detected.")
                     self.get_logger().info(f"🗺️ Final map coverage: {self.last_percent_known:.2f}%")
                     try:
                         if hasattr(self, 'goal_handle') and self.goal_handle is not None:
@@ -778,13 +780,16 @@ class ExplorationExecutionMixin:
                     self._on_exploration_complete()
                     return
 
+                # Remove coverage/goal-based completion: rely only on frontiers
+
                 if (
                     self.no_frontier_cycles >= self.no_frontier_recovery_cycles and
                     self.no_frontier_cycles < self.no_frontier_complete_cycles and
                     (self.no_frontier_cycles % self.no_frontier_recovery_cycles) == 0
                 ):
+                    reverse_allowed = self._reverse_recovery_allowed()
                     if self.corner_recovery_until <= 0.0:
-                        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
+                        if (not reverse_allowed) or (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
                             self.corner_recovery_mode = "rotate"
                         else:
                             self.corner_recovery_mode = "backup"
@@ -795,7 +800,7 @@ class ExplorationExecutionMixin:
                     recovery_msg = Twist()
                     turn_dir = 1.0 if (self.no_frontier_cycles % 2 == 0) else -1.0
                     if self.corner_recovery_mode == "backup":
-                        if self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance:
+                        if (not reverse_allowed) or (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
                             recovery_msg.angular.z = turn_dir * self.corner_recovery_turn_speed
                         else:
                             recovery_msg.linear.x = self.backup_speed
@@ -807,12 +812,11 @@ class ExplorationExecutionMixin:
                 if self.no_frontier_cycles >= self.no_frontier_complete_cycles:
                     total_frontiers = len(self.current_frontiers)
 
-                    if total_frontiers == 0:
+                    if total_frontiers == 0 and self._completion_guard_satisfied():
                         self.get_logger().info(
                             f"🎉 EXPLORATION COMPLETE! 0 frontiers detected. "
                             f"Final coverage: {self.last_percent_known:.1f}%"
                         )
-                        self.get_logger().info(f"   Goals reached: {self.goals_reached}")
                         self.get_logger().info(f"🗺️ Map completion: {self.last_percent_known:.2f}% of the map explored.")
                         try:
                             if hasattr(self, 'goal_handle') and self.goal_handle is not None:
@@ -832,8 +836,10 @@ class ExplorationExecutionMixin:
                         self.current_phase = Phase.DONE
                         self._on_exploration_complete()
                         return
+                    # Remove coverage/goal-based completion: rely only on frontiers
 
                     if (self.goals_reached >= self.min_goals_for_complete and
+                            self._completion_guard_satisfied() and
                             self.last_percent_known >= self.zero_frontier_complete_percent):
                         self.get_logger().info(
                             f"🎉 EXPLORATION COMPLETE! Coverage {self.last_percent_known:.1f}% "
@@ -862,6 +868,7 @@ class ExplorationExecutionMixin:
                         return
 
                     if (self.last_percent_known >= self.coverage_complete_percent and
+                            self._completion_guard_satisfied() and
                             self.goals_reached >= self.min_goals_for_complete):
                         self.get_logger().info(
                             f"🎉 EXPLORATION COMPLETE! Coverage {self.last_percent_known:.1f}% "
