@@ -121,7 +121,7 @@ class ExplorationPlanningMixin:
         )
 
     def _compute_lidar_standoff_goal(self, robot_x: float, robot_y: float, fx: float, fy: float, goal_x: float, goal_y: float):
-        """Keep goal away from frontier while guaranteeing frontier remains inside lidar scan range."""
+        """Place goal just beyond the frontier on the unknown side, while keeping the frontier in scan range."""
         if not bool(getattr(self, 'frontier_use_lidar_standoff_goal', True)):
             return (goal_x, goal_y)
 
@@ -149,8 +149,11 @@ class ExplorationPlanningMixin:
         if standoff <= 0.05:
             return None
 
-        gx = fx - (ux * standoff)
-        gy = fy - (uy * standoff)
+        # Push the goal beyond the frontier so Nav2 heads toward unexplored space.
+        # A small extra bias keeps the final target on the unknown side instead of the already mapped side.
+        unknown_push = max(0.15, float(getattr(self, 'frontier_goal_unknown_push_m', 0.30)))
+        gx = fx + (ux * max(standoff, unknown_push))
+        gy = fy + (uy * max(standoff, unknown_push))
         return (gx, gy)
 
     def _frontier_unknown_stats(self, x: float, y: float, radius_m: float):
@@ -420,7 +423,7 @@ class ExplorationPlanningMixin:
                             rejection_counts['strict_attempted'] += 1
                             continue
 
-                    if not self._goal_in_free_space(goal_x, goal_y, costmap_filter):
+                    if not self._goal_in_free_space(goal_x, goal_y, costmap_filter, allow_unknown=True):
                         rejection_counts['costmap_or_free_space'] += 1
                         continue
 
@@ -620,7 +623,7 @@ class ExplorationPlanningMixin:
                     )
                     if skip:
                         continue
-                if not self._goal_in_free_space(goal_x, goal_y, self.use_costmap_goal_filter):
+                if not self._goal_in_free_space(goal_x, goal_y, self.use_costmap_goal_filter, allow_unknown=True):
                     continue
                 if not self._goal_needs_unknown_support(goal_x, goal_y):
                     continue
@@ -741,7 +744,7 @@ class ExplorationPlanningMixin:
         except Exception:
             return False  # Silent fail for speed
 
-        if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter):
+        if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter, allow_unknown=True):
             self.get_logger().warn(f"⚠️ Goal ({goal_x:.2f}, {goal_y:.2f}) no longer in free space - skipping")
             self._blacklist_goal((goal_x, goal_y))
             return False
@@ -1232,15 +1235,15 @@ class ExplorationPlanningMixin:
         fallback_goal_y = robot_y
         
         # Check if goal is in free space
-        if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True):
+        if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True, allow_unknown=False):
             # Try left diagonal
             fallback_goal_x = robot_x + 1.0
             fallback_goal_y = robot_y + 1.0
-            if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True):
+            if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True, allow_unknown=False):
                 # Try right diagonal
                 fallback_goal_x = robot_x + 1.0
                 fallback_goal_y = robot_y - 1.0
-                if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True):
+                if not self._goal_in_free_space(fallback_goal_x, fallback_goal_y, use_costmap_filter=True, allow_unknown=False):
                     return False
         
         self.get_logger().warn(

@@ -385,7 +385,7 @@ class ExplorationSensingMixin:
             
         return False
 
-    def _goal_in_free_space(self, x, y, use_costmap_filter: bool = True):
+    def _goal_in_free_space(self, x, y, use_costmap_filter: bool = True, allow_unknown: bool = False):
         if not use_costmap_filter or self.costmap is None:
             return True
 
@@ -418,7 +418,11 @@ class ExplorationSensingMixin:
         value = data[index]
 
         if value < 0:
-            return False
+            if not allow_unknown:
+                return False
+            unknown_cell = True
+        else:
+            unknown_cell = False
         if value >= self.costmap_free_threshold:
             return False
 
@@ -433,7 +437,8 @@ class ExplorationSensingMixin:
             if 0 <= nvalue < self.costmap_free_threshold:
                 free_neighbors += 1
 
-        if free_neighbors < 3:
+        min_free_neighbors = 1 if unknown_cell and allow_unknown else 3
+        if free_neighbors < min_free_neighbors:
             return False
 
         return True
