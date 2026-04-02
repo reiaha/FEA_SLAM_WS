@@ -326,6 +326,9 @@ class ExplorationSensingMixin:
         for val in data:
             if 0 <= val <= 100:
                 known_cells += 1
+        unknown_cells = max(0, total_cells - known_cells)
+        self.last_unknown_cells = unknown_cells
+        self.last_total_cells = total_cells
         if total_cells > self.max_total_cells:
             self.max_total_cells = total_cells
         if known_cells > self.max_known_cells:

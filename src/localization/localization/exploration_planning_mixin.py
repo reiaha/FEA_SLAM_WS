@@ -238,6 +238,25 @@ class ExplorationPlanningMixin:
             return False
         return True
 
+    def _goal_needs_unknown_support(self, goal_x: float, goal_y: float) -> bool:
+        """Reject goals that land entirely inside already known map space."""
+        if not bool(getattr(self, 'prune_mapped_frontiers', True)):
+            return True
+
+        radius_m = float(getattr(self, 'frontier_unknown_check_radius_m', 0.45))
+        min_unknown_ratio = float(getattr(self, 'frontier_min_unknown_ratio', 0.10))
+        min_unknown_cells = int(getattr(self, 'frontier_min_unknown_cells', 6))
+
+        stats = self._frontier_unknown_stats(goal_x, goal_y, radius_m)
+        if stats is None:
+            return False
+
+        if stats['unknown_cells'] < max(1, min_unknown_cells):
+            return False
+        if stats['unknown_ratio'] < max(0.0, min_unknown_ratio):
+            return False
+        return True
+
     def pick_best_frontier(self):
         if not self.current_frontiers:
             self.last_frontier_skip_reason = "no_frontiers"
@@ -403,6 +422,10 @@ class ExplorationPlanningMixin:
 
                     if not self._goal_in_free_space(goal_x, goal_y, costmap_filter):
                         rejection_counts['costmap_or_free_space'] += 1
+                        continue
+
+                    if not self._goal_needs_unknown_support(goal_x, goal_y):
+                        rejection_counts['already_mapped'] += 1
                         continue
 
                     if costmap_filter and self.costmap is not None:
@@ -598,6 +621,8 @@ class ExplorationPlanningMixin:
                     if skip:
                         continue
                 if not self._goal_in_free_space(goal_x, goal_y, self.use_costmap_goal_filter):
+                    continue
+                if not self._goal_needs_unknown_support(goal_x, goal_y):
                     continue
                 goal_dist = math.hypot(goal_x - robot_x, goal_y - robot_y)
                 if goal_dist < fallback_dist:

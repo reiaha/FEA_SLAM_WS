@@ -5,18 +5,23 @@ import zlib
 
 
 def occupancy_to_pixels(occupancy_data, width, height):
-    """Convert nav_msgs/OccupancyGrid data to top-down grayscale image bytes."""
+    """Convert OccupancyGrid data to strict black/white image bytes (no grayscale)."""
+    occupied_threshold = 65
+    free_threshold = 25
+
     pixels = bytearray(width * height)
     for row in range(height):
         for col in range(width):
             idx = (height - 1 - row) * width + col
             v = occupancy_data[idx]
             if v < 0:
-                pixels[row * width + col] = 205
-            elif v == 0:
-                pixels[row * width + col] = 254
+                pixels[row * width + col] = 255
+            elif v <= free_threshold:
+                pixels[row * width + col] = 255
+            elif v >= occupied_threshold:
+                pixels[row * width + col] = 0
             else:
-                pixels[row * width + col] = max(0, 255 - int(v * 2.55))
+                pixels[row * width + col] = 255
     return pixels
 
 

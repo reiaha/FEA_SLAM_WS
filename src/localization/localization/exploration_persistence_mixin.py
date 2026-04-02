@@ -7,6 +7,14 @@ from visualization_msgs.msg import Marker
 
 class ExplorationPersistenceMixin:
     def _on_exploration_complete(self):
+        if hasattr(self, '_completion_cells_known') and not self._completion_cells_known():
+            unknown_cells = int(getattr(self, 'last_unknown_cells', 0))
+            max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
+            self.get_logger().warn(
+                f"⛔ Completion blocked: unknown cells remain ({unknown_cells}>{max_unknown})."
+            )
+            return
+
         with self._exploration_complete_lock:
             if self._exploration_complete_handled:
                 return

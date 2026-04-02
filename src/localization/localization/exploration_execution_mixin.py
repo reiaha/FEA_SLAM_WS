@@ -13,36 +13,72 @@ from rclpy.duration import Duration
 class ExplorationExecutionMixin:
     lethal_escape_enabled: bool = True
 
+    def _completion_cells_known(self) -> bool:
+        """Return True when map unknown/grey cells satisfy completion policy."""
+        if not bool(getattr(self, 'require_no_grey_for_completion', False)):
+            return True
+        unknown_cells = int(getattr(self, 'last_unknown_cells', 0))
+        total_cells = int(getattr(self, 'last_total_cells', 0))
+        max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
+        return (total_cells > 0) and (unknown_cells <= max_unknown)
+
     def _completion_guard_satisfied(self) -> bool:
         """Require real robot movement and map growth before allowing completion."""
-        if not bool(getattr(self, 'require_motion_and_map_growth_for_completion', False)):
+        motion_gate_enabled = bool(getattr(self, 'require_motion_and_map_growth_for_completion', False))
+        no_grey_gate_enabled = bool(getattr(self, 'require_no_grey_for_completion', False))
+
+        if not motion_gate_enabled and not no_grey_gate_enabled:
             return True
 
-        home_pose = getattr(self, 'home_pose', None)
-        robot_pose = getattr(self, 'robot_pose', None)
-        if home_pose is None or robot_pose is None:
-            return False
+        now_t = time.time()
 
-        moved_m = math.hypot(
-            float(robot_pose[0]) - float(home_pose[0]),
-            float(robot_pose[1]) - float(home_pose[1]),
-        )
+        motion_ok = True
+        moved_m = 0.0
         min_disp_m = max(0.0, float(getattr(self, 'completion_min_displacement_m', 0.30)))
-
-        start_known = int(getattr(self, 'exploration_start_known_cells', 0))
-        now_known = int(getattr(self, 'max_known_cells', 0))
-        known_gain = max(0, now_known - start_known)
+        known_gain = 0
         min_known_gain = max(0, int(getattr(self, 'completion_min_known_cell_gain', 40)))
 
-        ok = (moved_m >= min_disp_m) and (known_gain >= min_known_gain)
+        if motion_gate_enabled:
+            home_pose = getattr(self, 'home_pose', None)
+            robot_pose = getattr(self, 'robot_pose', None)
+            if home_pose is None or robot_pose is None:
+                motion_ok = False
+            else:
+                moved_m = math.hypot(
+                    float(robot_pose[0]) - float(home_pose[0]),
+                    float(robot_pose[1]) - float(home_pose[1]),
+                )
+
+                start_known = int(getattr(self, 'exploration_start_known_cells', 0))
+                now_known = int(getattr(self, 'max_known_cells', 0))
+                known_gain = max(0, now_known - start_known)
+                motion_ok = (moved_m >= min_disp_m) and (known_gain >= min_known_gain)
+
+        no_grey_ok = True
+        unknown_cells = int(getattr(self, 'last_unknown_cells', 0))
+        max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
+        if no_grey_gate_enabled:
+            no_grey_ok = self._completion_cells_known()
+
+        ok = motion_ok and no_grey_ok
         if not ok:
-            now_t = time.time()
             if (now_t - float(getattr(self, 'last_completion_guard_log_time', 0.0))) >= 2.0:
                 self.last_completion_guard_log_time = now_t
-                self.get_logger().warn(
-                    f"⛔ Completion gate blocked: moved={moved_m:.2f}/{min_disp_m:.2f}m, "
-                    f"known_gain={known_gain}/{min_known_gain} cells"
-                )
+                if motion_gate_enabled and no_grey_gate_enabled:
+                    self.get_logger().warn(
+                        f"⛔ Completion gate blocked: moved={moved_m:.2f}/{min_disp_m:.2f}m, "
+                        f"known_gain={known_gain}/{min_known_gain}, "
+                        f"unknown_cells={unknown_cells}>{max_unknown}"
+                    )
+                elif motion_gate_enabled:
+                    self.get_logger().warn(
+                        f"⛔ Completion gate blocked: moved={moved_m:.2f}/{min_disp_m:.2f}m, "
+                        f"known_gain={known_gain}/{min_known_gain} cells"
+                    )
+                elif no_grey_gate_enabled:
+                    self.get_logger().warn(
+                        f"⛔ Completion gate blocked: unknown_cells={unknown_cells}>{max_unknown}"
+                    )
         return ok
 
     def _reverse_recovery_allowed(self) -> bool:
@@ -759,7 +795,11 @@ class ExplorationExecutionMixin:
                 self.no_frontier_cycles += 1
 
                 _imm_frontiers = len(self.current_frontiers)
-                if _imm_frontiers == 0 and bool(getattr(self, 'complete_on_zero_frontiers', False)):
+                if (
+                    _imm_frontiers == 0 and
+                    bool(getattr(self, 'complete_on_zero_frontiers', False)) and
+                    self._completion_guard_satisfied()
+                ):
                     self.get_logger().info("🎉 EXPLORATION COMPLETE! 0 valid frontiers detected.")
                     self.get_logger().info(f"🗺️ Final map coverage: {self.last_percent_known:.2f}%")
                     try:

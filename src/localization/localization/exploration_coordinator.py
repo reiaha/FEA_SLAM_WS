@@ -34,7 +34,14 @@ def _graceful_shutdown_handler(signalnum, frame):
         node = ExplorationCoordinator._active_instance if hasattr(ExplorationCoordinator, '_active_instance') else None
         if node is not None and hasattr(node, '_on_exploration_complete'):
             node.get_logger().warn('🛑 Signal received: running graceful shutdown handler.')
-            node._on_exploration_complete()
+            if hasattr(node, '_completion_cells_known') and not node._completion_cells_known():
+                unknown_cells = int(getattr(node, 'last_unknown_cells', 0))
+                max_unknown = max(0, int(getattr(node, 'completion_max_unknown_cells', 0)))
+                node.get_logger().warn(
+                    f'⛔ Graceful completion skipped: unknown cells remain ({unknown_cells}>{max_unknown}).'
+                )
+            else:
+                node._on_exploration_complete()
     except Exception as e:
         print(f"[GracefulShutdown] Exception: {e}")
     sys.exit(0)
@@ -204,6 +211,8 @@ class ExplorationCoordinator(
             'require_motion_and_map_growth_for_completion': True,
             'completion_min_displacement_m': 0.30,
             'completion_min_known_cell_gain': 40,
+            'require_no_grey_for_completion': True,
+            'completion_max_unknown_cells': 0,
             'small_test_mode': False,
             'complete_on_zero_frontiers': False,  # Only stop when coverage and min_goals are met
             'auto_save_on_complete': True,
@@ -287,6 +296,8 @@ class ExplorationCoordinator(
         self.home_pose = None                                                 
         self.exploration_start_known_cells = 0
         self.last_completion_guard_log_time = 0.0
+        self.last_unknown_cells = 0
+        self.last_total_cells = 0
         self.current_frontiers = []
         self.obstacle_detected = False
         self.obstacle_distance_m = float('inf')
