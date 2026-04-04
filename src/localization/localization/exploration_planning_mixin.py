@@ -12,6 +12,107 @@ from nav2_msgs.srv import ClearEntireCostmap
 from rclpy.duration import Duration
 
 class ExplorationPlanningMixin:
+    def pick_unknown_cell_goal(self):
+        """Pick a reachable goal adjacent to unknown cells when no frontiers are available."""
+        if not bool(getattr(self, 'enable_unknown_cell_seek', True)):
+            return None
+
+        self.update_pose()
+        if not self.pose_valid:
+            return None
+
+        slam_map = getattr(self, 'last_slam_map', None)
+        if slam_map is None:
+            return None
+
+        coverage = float(getattr(self, 'last_percent_known', 0.0) or 0.0)
+        min_cov = float(getattr(self, 'unknown_cell_seek_min_coverage', 90.0))
+        if coverage < min_cov:
+            return None
+
+        unknown_cells = int(getattr(self, 'last_unknown_cells', 0))
+        min_unknown = int(getattr(self, 'unknown_cell_seek_min_unknown_cells', 20))
+        if unknown_cells < min_unknown:
+            return None
+
+        try:
+            info = slam_map.info
+            resolution = float(info.resolution)
+            if resolution <= 0.0:
+                return None
+            origin_x = float(info.origin.position.x)
+            origin_y = float(info.origin.position.y)
+            width = int(info.width)
+            height = int(info.height)
+            data = slam_map.data
+            if width <= 2 or height <= 2 or not data:
+                return None
+        except Exception:
+            return None
+
+        robot_x, robot_y, _ = self.robot_pose
+        stride = max(1, int(getattr(self, 'unknown_cell_seek_stride', 2)))
+        max_occ = min(99, int(getattr(self, 'costmap_free_threshold', 100)))
+
+        best = None
+        best_dist = float('inf')
+        examined = 0
+        max_candidates = max(50, int(getattr(self, 'unknown_cell_seek_max_candidates', 1200)))
+
+        for my in range(1, height - 1, stride):
+            for mx in range(1, width - 1, stride):
+                idx = my * width + mx
+                if int(data[idx]) != -1:
+                    continue
+
+                # Select a neighboring known-free cell as the actual navigation goal.
+                chosen = None
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx = mx + dx
+                    ny = my + dy
+                    nval = int(data[ny * width + nx])
+                    if 0 <= nval < max_occ:
+                        chosen = (nx, ny)
+                        break
+                if chosen is None:
+                    continue
+
+                gx = origin_x + (chosen[0] + 0.5) * resolution
+                gy = origin_y + (chosen[1] + 0.5) * resolution
+                ux = origin_x + (mx + 0.5) * resolution
+                uy = origin_y + (my + 0.5) * resolution
+
+                if not self._goal_in_free_space(gx, gy, self.use_costmap_goal_filter, allow_unknown=False):
+                    continue
+                if not self._goal_needs_unknown_support(gx, gy):
+                    continue
+
+                d = math.hypot(gx - robot_x, gy - robot_y)
+                if d < 0.20:
+                    continue
+                if d < best_dist:
+                    best_dist = d
+                    best = {
+                        'frontier': (ux, uy),
+                        'goal': (gx, gy),
+                        'dist': d,
+                        'costmap_filtered': self.use_costmap_goal_filter,
+                        'source': 'unknown_cell_seek',
+                    }
+
+                examined += 1
+                if examined >= max_candidates:
+                    break
+            if examined >= max_candidates:
+                break
+
+        if best is not None:
+            self.get_logger().warn(
+                f"🧭 Unknown-cell seek: selected boundary goal ({best['goal'][0]:.2f}, {best['goal'][1]:.2f}) "
+                f"toward unknown cell ({best['frontier'][0]:.2f}, {best['frontier'][1]:.2f}), dist {best['dist']:.2f}m"
+            )
+        return best
+
     def _dynamic_obstacle_pruning_active(self) -> bool:
         """Return True only when pruning should react to moving obstacles."""
         if not bool(getattr(self, 'prune_only_moving_obstacles', False)):
@@ -1075,6 +1176,10 @@ class ExplorationPlanningMixin:
     def goal_result_cb(self, future):
         """Handle Nav2 goal completion"""
         Phase = self.current_phase.__class__
+        if self.current_phase == Phase.DONE:
+            self.goal_handle = None
+            self.goal_in_progress = False
+            return
         result = future.result()
         self.goal_handle = None                                                
         self.frontiers_dirty = True                                                          
@@ -1094,6 +1199,39 @@ class ExplorationPlanningMixin:
                 self.last_goal_time = 0.0
                 return
         self.replan_cancel_pending = False
+
+        near_goal_acceptance = max(0.0, float(getattr(self, 'near_goal_acceptance_distance', 0.0)))
+        goal_error = None
+        if self.last_goal_target is not None:
+            goal_error = math.hypot(
+                robot_x - self.last_goal_target[0],
+                robot_y - self.last_goal_target[1]
+            )
+
+        if (
+            result.status in (5, 6)
+            and near_goal_acceptance > 0.0
+            and goal_error is not None
+            and goal_error <= near_goal_acceptance
+            and not self.obstacle_detected
+        ):
+            self.get_logger().info(
+                f"✅ Near-goal acceptance: treating {('ABORTED' if result.status == 5 else 'CANCELED')} as success "
+                f"(goal error {goal_error:.2f}m <= {near_goal_acceptance:.2f}m)"
+            )
+            self.post_abort_cooldown_until = 0.0
+            self.consecutive_failures = 0
+            self.last_successful_goal_pos = (robot_x, robot_y)
+            self.goals_reached += 1
+            self.get_logger().info(f"📊 Goals reached: {self.goals_reached}/{self.min_goals_for_complete}")
+            if self.goals_reached == 1 and hasattr(self, 'enable_lethal_escape'):
+                self.enable_lethal_escape()
+                self.get_logger().info("✅ First goal completed: lethal logic is now enabled")
+            if self.avoid_revisit:
+                self.visited_goals.append((robot_x, robot_y))
+            if self.strict_no_revisit and self.last_goal_target is not None:
+                self.strict_avoid_goals.append(self.last_goal_target)
+            return
 
         if result.status == 4:             
             self.get_logger().info(f"✅ Reached frontier goal! Robot at ({robot_x:.2f}, {robot_y:.2f})")

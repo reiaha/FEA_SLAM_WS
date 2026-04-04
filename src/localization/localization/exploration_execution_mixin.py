@@ -4,6 +4,7 @@
 import math
 import time
 import threading
+from collections import deque
 
 import rclpy
 from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
@@ -13,11 +14,105 @@ from rclpy.duration import Duration
 class ExplorationExecutionMixin:
     lethal_escape_enabled: bool = True
 
+    def _log_completion_unknown_summary(self):
+        """Log raw vs actionable unknown counts used by completion gate."""
+        raw_unknown = int(getattr(self, 'last_unknown_cells', 0))
+        actionable_unknown = int(getattr(self, 'last_completion_unknown_cells', 0))
+        if actionable_unknown <= 0:
+            actionable_unknown = int(self._count_actionable_unknown_cells())
+            self.last_completion_unknown_cells = actionable_unknown
+        max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
+        self.get_logger().info(
+            f"🧩 Unknown-cell gate: actionable(within walls)={actionable_unknown}/{max_unknown}, raw_map_unknown={raw_unknown}"
+        )
+
+    def _count_actionable_unknown_cells(self) -> int:
+        """Count unknown cells that are adjacent to traversable free space.
+
+        Unknown cells are counted only when they are likely interior:
+        1) adjacent to traversable free space, and
+        2) not connected to map borders through unknown-only regions.
+
+        This intentionally ignores large outside-of-walls unknown regions,
+        which are not actionable for indoor completion decisions.
+        """
+        slam_map = getattr(self, 'last_slam_map', None)
+        if slam_map is None:
+            return int(getattr(self, 'last_unknown_cells', 0))
+
+        try:
+            info = slam_map.info
+            width = int(info.width)
+            height = int(info.height)
+            data = slam_map.data
+            if width <= 2 or height <= 2 or not data:
+                return int(getattr(self, 'last_unknown_cells', 0))
+
+            free_threshold = max(1, int(getattr(self, 'costmap_free_threshold', 100)))
+
+            # Mark unknown cells connected to map edges as exterior (outside walls).
+            exterior_unknown = set()
+            q = deque()
+
+            def _enqueue_if_unknown(x: int, y: int):
+                idx = y * width + x
+                if int(data[idx]) == -1 and idx not in exterior_unknown:
+                    exterior_unknown.add(idx)
+                    q.append(idx)
+
+            for x in range(width):
+                _enqueue_if_unknown(x, 0)
+                _enqueue_if_unknown(x, height - 1)
+            for y in range(1, height - 1):
+                _enqueue_if_unknown(0, y)
+                _enqueue_if_unknown(width - 1, y)
+
+            while q:
+                idx = q.popleft()
+                y, x = divmod(idx, width)
+                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    nx = x + dx
+                    ny = y + dy
+                    if nx <= 0 or nx >= (width - 1) or ny <= 0 or ny >= (height - 1):
+                        continue
+                    nidx = ny * width + nx
+                    if int(data[nidx]) == -1 and nidx not in exterior_unknown:
+                        exterior_unknown.add(nidx)
+                        q.append(nidx)
+
+            actionable_unknown = 0
+
+            for y in range(1, height - 1):
+                row = y * width
+                for x in range(1, width - 1):
+                    idx = row + x
+                    if int(data[idx]) != -1:
+                        continue
+                    if idx in exterior_unknown:
+                        continue
+
+                    # Only count unknown cells that touch traversable free space.
+                    has_free_neighbor = False
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nidx = (y + dy) * width + (x + dx)
+                        nval = int(data[nidx])
+                        if 0 <= nval < free_threshold:
+                            has_free_neighbor = True
+                            break
+
+                    if has_free_neighbor:
+                        actionable_unknown += 1
+
+            return actionable_unknown
+        except Exception:
+            return int(getattr(self, 'last_unknown_cells', 0))
+
     def _completion_cells_known(self) -> bool:
         """Return True when map unknown/grey cells satisfy completion policy."""
         if not bool(getattr(self, 'require_no_grey_for_completion', False)):
             return True
-        unknown_cells = int(getattr(self, 'last_unknown_cells', 0))
+        unknown_cells = self._count_actionable_unknown_cells()
+        self.last_completion_unknown_cells = unknown_cells
         total_cells = int(getattr(self, 'last_total_cells', 0))
         max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
         return (total_cells > 0) and (unknown_cells <= max_unknown)
@@ -55,7 +150,8 @@ class ExplorationExecutionMixin:
                 motion_ok = (moved_m >= min_disp_m) and (known_gain >= min_known_gain)
 
         no_grey_ok = True
-        unknown_cells = int(getattr(self, 'last_unknown_cells', 0))
+        unknown_cells = self._count_actionable_unknown_cells()
+        self.last_completion_unknown_cells = unknown_cells
         max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
         if no_grey_gate_enabled:
             no_grey_ok = self._completion_cells_known()
@@ -751,6 +847,32 @@ class ExplorationExecutionMixin:
             goal_info = self.pick_best_frontier()
             self.frontiers_dirty = False
             if goal_info is None:
+                if len(self.current_frontiers) == 0:
+                    unknown_goal_info = self.pick_unknown_cell_goal()
+                    if unknown_goal_info is not None:
+                        goal_x, goal_y = unknown_goal_info['goal']
+                        frontier_x, frontier_y = unknown_goal_info['frontier']
+                        self.update_pose()
+                        robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
+                        self.get_logger().info(
+                            f"🎯 Unknown-cell target: Robot at ({robot_x:.2f}, {robot_y:.2f}) → Unknown ({frontier_x:.2f}, {frontier_y:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f})"
+                        )
+                        self.get_logger().info(
+                            f"📏 Distance to unknown-cell goal: {unknown_goal_info['dist']:.2f}m"
+                        )
+                        self.ever_sent_goal = True
+                        sent = self.send_goal_to_nav2(
+                            goal_x,
+                            goal_y,
+                            unknown_goal_info.get('costmap_filtered'),
+                            frontier_xy=(frontier_x, frontier_y),
+                        )
+                        if sent:
+                            self.last_goal_time = now
+                            return
+                        self.last_goal_time = 0.0
+                        self.frontiers_dirty = True
+
                 if self.enable_simple_exploration and self.no_frontier_cycles >= 2:
                     if not self.simple_exploration_active:
                         self.simple_exploration_active = True
@@ -798,10 +920,12 @@ class ExplorationExecutionMixin:
                 if (
                     _imm_frontiers == 0 and
                     bool(getattr(self, 'complete_on_zero_frontiers', False)) and
-                    self._completion_guard_satisfied()
+                    self._completion_guard_satisfied() and
+                    (self.last_percent_known >= self.coverage_complete_percent)
                 ):
                     self.get_logger().info("🎉 EXPLORATION COMPLETE! 0 valid frontiers detected.")
                     self.get_logger().info(f"🗺️ Final map coverage: {self.last_percent_known:.2f}%")
+                    self._log_completion_unknown_summary()
                     try:
                         if hasattr(self, 'goal_handle') and self.goal_handle is not None:
                             self.goal_handle.cancel_goal_async()
@@ -819,6 +943,16 @@ class ExplorationExecutionMixin:
                     self.current_phase = Phase.DONE
                     self._on_exploration_complete()
                     return
+                elif (
+                    _imm_frontiers == 0 and
+                    bool(getattr(self, 'complete_on_zero_frontiers', False)) and
+                    self._completion_guard_satisfied() and
+                    (self.last_percent_known < self.coverage_complete_percent)
+                ):
+                    self.get_logger().warn(
+                        f"⛔ Zero-frontier completion blocked: coverage {self.last_percent_known:.2f}% "
+                        f"< required {self.coverage_complete_percent:.2f}%"
+                    )
 
                 # Remove coverage/goal-based completion: rely only on frontiers
 
@@ -852,12 +986,17 @@ class ExplorationExecutionMixin:
                 if self.no_frontier_cycles >= self.no_frontier_complete_cycles:
                     total_frontiers = len(self.current_frontiers)
 
-                    if total_frontiers == 0 and self._completion_guard_satisfied():
+                    if (
+                        total_frontiers == 0 and
+                        self._completion_guard_satisfied() and
+                        (self.last_percent_known >= self.coverage_complete_percent)
+                    ):
                         self.get_logger().info(
                             f"🎉 EXPLORATION COMPLETE! 0 frontiers detected. "
                             f"Final coverage: {self.last_percent_known:.1f}%"
                         )
                         self.get_logger().info(f"🗺️ Map completion: {self.last_percent_known:.2f}% of the map explored.")
+                        self._log_completion_unknown_summary()
                         try:
                             if hasattr(self, 'goal_handle') and self.goal_handle is not None:
                                 cancel_future = self.goal_handle.cancel_goal_async()
@@ -876,11 +1015,22 @@ class ExplorationExecutionMixin:
                         self.current_phase = Phase.DONE
                         self._on_exploration_complete()
                         return
+                    elif (
+                        total_frontiers == 0 and
+                        self._completion_guard_satisfied() and
+                        (self.last_percent_known < self.coverage_complete_percent)
+                    ):
+                        self.get_logger().warn(
+                            f"⛔ Zero-frontier completion blocked: coverage {self.last_percent_known:.2f}% "
+                            f"< required {self.coverage_complete_percent:.2f}%"
+                        )
                     # Remove coverage/goal-based completion: rely only on frontiers
 
-                    if (self.goals_reached >= self.min_goals_for_complete and
-                            self._completion_guard_satisfied() and
-                            self.last_percent_known >= self.zero_frontier_complete_percent):
+                    if (
+                        total_frontiers == 0 and
+                        self.goals_reached >= self.min_goals_for_complete and
+                        self._completion_guard_satisfied() and
+                        self.last_percent_known >= self.zero_frontier_complete_percent):
                         self.get_logger().info(
                             f"🎉 EXPLORATION COMPLETE! Coverage {self.last_percent_known:.1f}% "
                             f">= minimum {self.zero_frontier_complete_percent:.1f}% "
@@ -888,6 +1038,7 @@ class ExplorationExecutionMixin:
                         )
                         self.get_logger().info(f"   Goals reached: {self.goals_reached}")
                         self.get_logger().info(f"🗺️ Map completion: {self.last_percent_known:.2f}% of the map explored.")
+                        self._log_completion_unknown_summary()
                         try:
                             if hasattr(self, 'goal_handle') and self.goal_handle is not None:
                                 cancel_future = self.goal_handle.cancel_goal_async()
@@ -907,16 +1058,19 @@ class ExplorationExecutionMixin:
                         self._on_exploration_complete()
                         return
 
-                    if (self.last_percent_known >= self.coverage_complete_percent and
-                            self._completion_guard_satisfied() and
-                            self.goals_reached >= self.min_goals_for_complete):
+                    if (
+                        total_frontiers == 0 and
+                        self.last_percent_known >= self.coverage_complete_percent and
+                        self._completion_guard_satisfied() and
+                        self.goals_reached >= self.min_goals_for_complete):
                         self.get_logger().info(
                             f"🎉 EXPLORATION COMPLETE! Coverage {self.last_percent_known:.1f}% "
-                            f">= target {self.coverage_complete_percent:.1f}%."
+                            f">= target {self.coverage_complete_percent:.1f}% (now 85%)."
                         )
                         self.get_logger().info(f"   Goals reached: {self.goals_reached}")
                         self.get_logger().info(f"   Remaining frontiers: {total_frontiers}")
                         self.get_logger().info(f"🗺️ Map completion: {self.last_percent_known:.2f}% of the map explored.")
+                        self._log_completion_unknown_summary()
                         try:
                             if hasattr(self, 'goal_handle') and self.goal_handle is not None:
                                 cancel_future = self.goal_handle.cancel_goal_async()
@@ -940,14 +1094,14 @@ class ExplorationExecutionMixin:
                             self.goals_reached < self.min_goals_for_complete):
                         self.get_logger().warn(
                             f"⚠️ Coverage target met ({self.last_percent_known:.1f}% >= "
-                            f"{self.coverage_complete_percent:.1f}%) but goals reached "
+                            f"{self.coverage_complete_percent:.1f}%, now 85%) but goals reached "
                             f"{self.goals_reached}/{self.min_goals_for_complete}; continuing exploration."
                         )
                         self.no_frontier_cycles = 0
                         return
 
                     self.get_logger().warn(
-                        f"⚠️ Coverage {self.last_percent_known:.1f}% < {self.coverage_complete_percent:.1f}% "
+                        f"⚠️ Coverage {self.last_percent_known:.1f}% < {self.coverage_complete_percent:.1f}% (now 85%) "
                         f"with {total_frontiers} frontier(s) remaining — continuing exploration."
                     )
                     self.no_frontier_cycles = 0

@@ -8,11 +8,9 @@ lidar_explorer:
   obstacle_distance: 0.7     # meters - stop distance (increased for more caution)
   safe_distance: 1.2         # meters - slow down distance (increased for more caution)
 
-# Arduino Motor Bridge PWM limits
-# (affects max speed of all /cmd_vel commands)
 arduino_motor_bridge:
-  max_speed: 200             # PWM 0-255 (255=max hardware speed)
-  min_pwm: 70                # minimum PWM to overcome friction
+  max_speed: 210             # PWM 0-255 (255=max hardware speed)
+  min_pwm: 80                # minimum PWM to overcome friction
   velocity_deadband: 0.03    # m/s - commands below this become 0
   wheel_base: 0.18           # meters - distance between wheels
 
@@ -20,11 +18,3 @@ arduino_motor_bridge:
 nav2:
   max_linear_velocity: 0.3   # m/s
   max_angular_velocity: 1.0  # rad/s
-
-# Quick Test Commands (copy & paste into terminal):
-# 
-# Test forward: ros2 run localization motor_speed_tester
-#   Then type: f 0.2
-#
-# Quick speeds from launch:
-#   ros2 launch fea_slam robot_full.launch.py exploration:=true
