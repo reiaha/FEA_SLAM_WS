@@ -288,8 +288,12 @@ class ExplorationCoordinator(
         self.startup_time = time.time()
         self.init_start_time = self.startup_time
         import datetime as _dt_csv
-        _session_ts = _dt_csv.datetime.fromtimestamp(self.startup_time).strftime('%Y-%m-%d_%H-%M-%S')
-        self.map_save_dir = f'/home/pi/FEA_SLAM_WS/saved_maps/session_{_session_ts}'
+        _session_dt = _dt_csv.datetime.fromtimestamp(self.startup_time)
+        _session_ts = _session_dt.strftime('%Y-%m-%d_%H-%M-%S')
+        # Organize maps by date hierarchy: saved_maps/YYYY/MM/DD/session_HH-MM-SS/
+        _date_hierarchy = _session_dt.strftime('%Y/%m/%d')
+        _time_only = _session_dt.strftime('%H-%M-%S')
+        self.map_save_dir = f'/home/pi/FEA_SLAM_WS/saved_maps/{_date_hierarchy}/session_{_time_only}'
         self.mapped_area_file = f'explore_area_{_session_ts}.csv'
         self.robot_path_file = f'explore_path_{_session_ts}.csv'
         self.nav_goals_file = f'explore_nav_goals_{_session_ts}.csv'
