@@ -222,7 +222,7 @@ class ExplorationPlanningMixin:
         )
 
     def _compute_lidar_standoff_goal(self, robot_x: float, robot_y: float, fx: float, fy: float, goal_x: float, goal_y: float):
-        """Place goal just beyond the frontier on the unknown side, while keeping the frontier in scan range."""
+        """Place goal on the known/free side of the frontier while keeping it in scan range."""
         if not bool(getattr(self, 'frontier_use_lidar_standoff_goal', True)):
             return (goal_x, goal_y)
 
@@ -250,11 +250,9 @@ class ExplorationPlanningMixin:
         if standoff <= 0.05:
             return None
 
-        # Push the goal beyond the frontier so Nav2 heads toward unexplored space.
-        # A small extra bias keeps the final target on the unknown side instead of the already mapped side.
-        unknown_push = max(0.15, float(getattr(self, 'frontier_goal_unknown_push_m', 0.30)))
-        gx = fx + (ux * max(standoff, unknown_push))
-        gy = fy + (uy * max(standoff, unknown_push))
+        # Keep the goal on the mapped side (toward robot) to avoid selecting targets beyond walls.
+        gx = fx - (ux * standoff)
+        gy = fy - (uy * standoff)
         return (gx, gy)
 
     def _frontier_unknown_stats(self, x: float, y: float, radius_m: float):
@@ -524,7 +522,7 @@ class ExplorationPlanningMixin:
                             rejection_counts['strict_attempted'] += 1
                             continue
 
-                    if not self._goal_in_free_space(goal_x, goal_y, costmap_filter, allow_unknown=True):
+                    if not self._goal_in_free_space(goal_x, goal_y, costmap_filter, allow_unknown=False):
                         rejection_counts['costmap_or_free_space'] += 1
                         continue
 
@@ -724,7 +722,7 @@ class ExplorationPlanningMixin:
                     )
                     if skip:
                         continue
-                if not self._goal_in_free_space(goal_x, goal_y, self.use_costmap_goal_filter, allow_unknown=True):
+                if not self._goal_in_free_space(goal_x, goal_y, self.use_costmap_goal_filter, allow_unknown=False):
                     continue
                 if not self._goal_needs_unknown_support(goal_x, goal_y):
                     continue
@@ -845,10 +843,32 @@ class ExplorationPlanningMixin:
         except Exception:
             return False  # Silent fail for speed
 
-        if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter, allow_unknown=True):
+        if not self._goal_in_free_space(goal_x, goal_y, use_costmap_filter, allow_unknown=False):
             self.get_logger().warn(f"⚠️ Goal ({goal_x:.2f}, {goal_y:.2f}) no longer in free space - skipping")
             self._blacklist_goal((goal_x, goal_y))
             return False
+
+        # Hard guard: planner can throw worldToMap errors if a goal is outside current costmap extents.
+        # Validate bounds regardless of costmap free-space filtering policy.
+        costmap_info = self._get_costmap_info()
+        if costmap_info is not None:
+            goal_cell = self._world_to_costmap(goal_x, goal_y, costmap_info)
+            if goal_cell is None:
+                self.get_logger().warn(
+                    f"⚠️ Goal ({goal_x:.2f}, {goal_y:.2f}) is outside global costmap bounds; skipping to avoid worldToMap failure"
+                )
+                self._blacklist_goal((goal_x, goal_y))
+                return False
+            edge_margin = max(0, int(getattr(self, 'costmap_goal_edge_margin_cells', 2)))
+            gx_cell, gy_cell = goal_cell
+            _, _, _, width, height, _ = costmap_info
+            if edge_margin > 0:
+                if gx_cell < edge_margin or gy_cell < edge_margin or gx_cell >= (width - edge_margin) or gy_cell >= (height - edge_margin):
+                    self.get_logger().warn(
+                        f"⚠️ Goal ({goal_x:.2f}, {goal_y:.2f}) near costmap edge cell=({gx_cell},{gy_cell}) size=({width},{height}); skipping"
+                    )
+                    self._blacklist_goal((goal_x, goal_y))
+                    return False
 
         # Optionally defer lethal start-cell checks until first success.
         # On jittery systems this can hide persistent start-cell blockage and create goal abort loops,

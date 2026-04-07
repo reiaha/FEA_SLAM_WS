@@ -10,13 +10,90 @@ from .phase_enum import Phase
 import rclpy
 from geometry_msgs.msg import Twist
 from nav2_msgs.msg import Costmap
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.duration import Duration
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Float32
 from visualization_msgs.msg import MarkerArray
 
 class ExplorationSensingMixin:
+    def _normalize_angle(self, angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    def plan_cb(self, msg: Path):
+        if not bool(getattr(self, 'tracking_metrics_enabled', True)):
+            return
+        points = []
+        for pose_stamped in msg.poses:
+            points.append((float(pose_stamped.pose.position.x), float(pose_stamped.pose.position.y)))
+        self.current_plan_points = points
+        self.last_plan_time = time.time()
+
+    def _update_path_tracking_metrics(self, x: float, y: float, yaw: float):
+        if not bool(getattr(self, 'tracking_metrics_enabled', True)):
+            return
+
+        now = time.time()
+        stale_timeout = max(0.1, float(getattr(self, 'tracking_plan_stale_timeout', 2.0)))
+        points = getattr(self, 'current_plan_points', [])
+        if len(points) < 2 or (now - float(getattr(self, 'last_plan_time', 0.0))) > stale_timeout:
+            return
+
+        best_dist = float('inf')
+        desired_heading = None
+
+        for i in range(len(points) - 1):
+            x1, y1 = points[i]
+            x2, y2 = points[i + 1]
+            dx = x2 - x1
+            dy = y2 - y1
+            seg_len_sq = (dx * dx) + (dy * dy)
+            if seg_len_sq <= 1e-9:
+                continue
+
+            t = ((x - x1) * dx + (y - y1) * dy) / seg_len_sq
+            t = max(0.0, min(1.0, t))
+            px = x1 + (t * dx)
+            py = y1 + (t * dy)
+            dist = math.hypot(x - px, y - py)
+            if dist < best_dist:
+                best_dist = dist
+                desired_heading = math.atan2(dy, dx)
+
+        if not math.isfinite(best_dist) or desired_heading is None:
+            return
+
+        heading_err_rad = abs(self._normalize_angle(yaw - desired_heading))
+        heading_err_deg = math.degrees(heading_err_rad)
+        alpha = max(0.01, min(1.0, float(getattr(self, 'tracking_ema_alpha', 0.25))))
+        self.path_cross_track_error_m = best_dist
+        self.path_heading_error_deg = heading_err_deg
+        self.path_cross_track_error_ema_m = (
+            (alpha * best_dist) + ((1.0 - alpha) * float(getattr(self, 'path_cross_track_error_ema_m', best_dist)))
+        )
+        self.path_heading_error_ema_deg = (
+            (alpha * heading_err_deg) + ((1.0 - alpha) * float(getattr(self, 'path_heading_error_ema_deg', heading_err_deg)))
+        )
+
+        log_interval = max(0.2, float(getattr(self, 'tracking_log_interval', 1.0)))
+        if (now - float(getattr(self, 'last_tracking_metrics_log_time', 0.0))) >= log_interval:
+            self.last_tracking_metrics_log_time = now
+            cte_warn = max(0.01, float(getattr(self, 'tracking_warn_cross_track_m', 0.25)))
+            heading_warn = max(1.0, float(getattr(self, 'tracking_warn_heading_deg', 35.0)))
+            if best_dist >= cte_warn or heading_err_deg >= heading_warn:
+                self.get_logger().warn(
+                    f"📏 Path tracking error: cte={best_dist:.3f}m (ema {self.path_cross_track_error_ema_m:.3f}), "
+                    f"heading={heading_err_deg:.1f}deg (ema {self.path_heading_error_ema_deg:.1f})"
+                )
+            else:
+                self.get_logger().info(
+                    f"📏 Path tracking: cte={best_dist:.3f}m, heading={heading_err_deg:.1f}deg"
+                )
+
     def _save_map_sync(self):
         from .map_saver import save_occupancy_grid_map
 
@@ -414,6 +491,13 @@ class ExplorationSensingMixin:
         if mx < 0 or my < 0 or mx >= width or my >= height:
             return False
 
+        edge_margin = max(0, int(getattr(self, 'costmap_goal_edge_margin_cells', 2)))
+        if edge_margin > 0:
+            if mx < edge_margin or my < edge_margin:
+                return False
+            if mx >= (width - edge_margin) or my >= (height - edge_margin):
+                return False
+
         index = my * width + mx
         value = data[index]
 
@@ -456,11 +540,15 @@ class ExplorationSensingMixin:
             tf = self.tf_buffer.lookup_transform('map', self.base_frame, rclpy.time.Time(), timeout=timeout)
             x = tf.transform.translation.x
             y = tf.transform.translation.y
-            self.robot_pose
-            self.robot_pose = (x, y, 0.0)
+            q = tf.transform.rotation
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            yaw = math.atan2(siny_cosp, cosy_cosp)
+            self.robot_pose = (x, y, yaw)
             self.pose_valid = True
             self._update_pose_stale_state(x, y, tf.header.stamp)
             self._record_path_point(x, y)
+            self._update_path_tracking_metrics(x, y, yaw)
             
             if abs(x) < 0.01 and abs(y) < 0.01:
                 now = time.time()
@@ -480,10 +568,15 @@ class ExplorationSensingMixin:
                 tf = self.tf_buffer.lookup_transform('map', fallback_frame, rclpy.time.Time(), timeout=timeout)
                 x = tf.transform.translation.x
                 y = tf.transform.translation.y
-                self.robot_pose = (x, y, 0.0)
+                q = tf.transform.rotation
+                siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+                cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+                yaw = math.atan2(siny_cosp, cosy_cosp)
+                self.robot_pose = (x, y, yaw)
                 self.pose_valid = True
                 self._update_pose_stale_state(x, y, tf.header.stamp)
                 self._record_path_point(x, y)
+                self._update_path_tracking_metrics(x, y, yaw)
             except Exception:
                 self.pose_valid = False
 

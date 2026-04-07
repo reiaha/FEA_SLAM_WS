@@ -26,19 +26,18 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('wheel_base', 0.18)
-        self.declare_parameter('max_speed', 220)
         self.declare_parameter('max_speed_forward', 160)
         self.declare_parameter('max_speed_backward', 150)
         self.declare_parameter('max_linear_speed_mps', 0.35)
         self.declare_parameter('max_angular_speed_radps', 0.8)
         self.declare_parameter('fixed_pwm_forward', 150)
         self.declare_parameter('fixed_pwm_backward', 120)
-        self.declare_parameter('fixed_pwm_turn', 140)
+        self.declare_parameter('fixed_pwm_turn', 150)
         self.declare_parameter('auto_backup_speed_mps', 0.10)
-        self.declare_parameter('min_pwm', 90)
+        self.declare_parameter('min_pwm', 100)
         self.declare_parameter('min_pwm_forward', 120)
         self.declare_parameter('min_pwm_backward', 115)
-        self.declare_parameter('min_pwm_turn', 110)
+        self.declare_parameter('min_pwm_turn', 120)
         self.declare_parameter('velocity_deadband', 0.03)
         self.declare_parameter('angular_deadband', 0.05)
         self.declare_parameter('pwm_change_threshold', 8)
@@ -77,22 +76,20 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('scan_stale_timeout', 1.2)
         self.declare_parameter('flip_guard_time', 0.15)
         self.declare_parameter('swap_lidar_front_back', False)
-        self.declare_parameter('escape_turn_speed', 0.6)
-        self.declare_parameter('escape_turn_period', 2.0)
+        self.declare_parameter('escape_turn_speed', 0.7)
         self.declare_parameter('escape_turn_toggle_interval', 1.2)
         self.declare_parameter('osc_escape_turn_dur', 3.0)                                                                        
         self.declare_parameter('turn_angular_scale', 0.75)
         self.declare_parameter('turn_smoothing_enabled', True)
         self.declare_parameter('turn_slew_rate_radps2', 3.0)                                         
         self.declare_parameter('invert_turn_direction', False)
-        self.declare_parameter('turn_pwm_limit', 125)
+        self.declare_parameter('turn_pwm_limit', 135)
         self.declare_parameter('front_obstacle_backup_speed_mps', 0.12)
         self.declare_parameter('front_obstacle_backup_turn_scale', 0.35)
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('front_obstacle_half_angle_deg', 50.0)
         self.declare_parameter('rear_obstacle_half_angle_deg', 30.0)
         self.declare_parameter('force_backward_on_zero_cmd', False)
-        self.declare_parameter('zero_cmd_forward_pwm', 110)
         self.declare_parameter('allow_backward_when_rear_blocked', False)
         self.declare_parameter('require_nav2_active', True)
         self.declare_parameter('require_active_goal', True)                                         
@@ -108,10 +105,11 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('serial_reconnect_interval', 1.0)
         self.declare_parameter('serial_max_error_streak', 5)
         self.declare_parameter('serial_error_log_interval', 2.0)
-        self.declare_parameter('motor_log_interval', 0.25)
         self.declare_parameter('odom_feedback_gate_enabled', True)
         self.declare_parameter('odom_stationary_speed_threshold', 5.0)
         self.declare_parameter('odom_freeze_pose_when_stationary', True)
+        self.declare_parameter('odom_linear_scale', 1.0)
+        self.declare_parameter('odom_angular_scale', 1.0)
         self.declare_parameter('use_imu_yaw_in_odom', True)                                                      
         self.declare_parameter('imu_publish', True)                                                                  
         self.declare_parameter('imu_rotated_180', True)                                                                                                    
@@ -129,7 +127,6 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         serial_port = self.get_parameter('serial_port').value
         baud_rate = self.get_parameter('baud_rate').value
         self.wheel_base = self.get_parameter('wheel_base').value
-        self.max_speed = int(self.get_parameter('max_speed').value)
         self.max_speed_forward = int(self.get_parameter('max_speed_forward').value)
         self.max_speed_backward = int(self.get_parameter('max_speed_backward').value)
         self.max_linear_speed_mps = float(self.get_parameter('max_linear_speed_mps').value)
@@ -142,6 +139,15 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.min_pwm_forward = int(self.get_parameter('min_pwm_forward').value)
         self.min_pwm_backward = int(self.get_parameter('min_pwm_backward').value)
         self.min_pwm_turn = int(self.get_parameter('min_pwm_turn').value)
+        self.turn_pwm_floor = max(100, self.min_pwm_turn)
+
+        # Keep in-place turning above the configured turn deadzone.
+        if self.fixed_pwm_turn < self.min_pwm_turn:
+            self.get_logger().warn(
+                f"⚠️ fixed_pwm_turn ({self.fixed_pwm_turn}) < min_pwm_turn ({self.min_pwm_turn}); "
+                f"clamping turn PWM to {self.min_pwm_turn}"
+            )
+            self.fixed_pwm_turn = self.min_pwm_turn
         self.velocity_deadband = float(self.get_parameter('velocity_deadband').value)
         self.angular_deadband = float(self.get_parameter('angular_deadband').value)
         self.pwm_change_threshold = int(self.get_parameter('pwm_change_threshold').value)
@@ -196,7 +202,6 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.flip_guard_time = float(self.get_parameter('flip_guard_time').value)
         self.swap_lidar_front_back = bool(self.get_parameter('swap_lidar_front_back').value)
         self.escape_turn_speed = float(self.get_parameter('escape_turn_speed').value)
-        self.escape_turn_period = float(self.get_parameter('escape_turn_period').value)
         self.escape_turn_toggle_interval = float(self.get_parameter('escape_turn_toggle_interval').value)
         _osc_turn_dur_param = float(self.get_parameter('osc_escape_turn_dur').value)
         self.turn_angular_scale = float(self.get_parameter('turn_angular_scale').value)
@@ -210,7 +215,6 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.front_obstacle_half_angle = math.radians(float(self.get_parameter('front_obstacle_half_angle_deg').value))
         self.rear_obstacle_half_angle = math.radians(float(self.get_parameter('rear_obstacle_half_angle_deg').value))
         self.force_backward_on_zero_cmd = bool(self.get_parameter('force_backward_on_zero_cmd').value)
-        self.zero_cmd_forward_pwm = int(self.get_parameter('zero_cmd_forward_pwm').value)
         self.allow_backward_when_rear_blocked = bool(self.get_parameter('allow_backward_when_rear_blocked').value)
         self.require_nav2_active = bool(self.get_parameter('require_nav2_active').value)
         self.require_active_goal = bool(self.get_parameter('require_active_goal').value)
@@ -226,7 +230,6 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.serial_reconnect_interval = float(self.get_parameter('serial_reconnect_interval').value)
         self.serial_max_error_streak = int(self.get_parameter('serial_max_error_streak').value)
         self.serial_error_log_interval = float(self.get_parameter('serial_error_log_interval').value)
-        self.motor_log_interval = float(self.get_parameter('motor_log_interval').value)
         self.odom_feedback_gate_enabled = bool(self.get_parameter('odom_feedback_gate_enabled').value)
         self.use_imu_yaw_in_odom = bool(self.get_parameter('use_imu_yaw_in_odom').value)
         self.imu_publish = bool(self.get_parameter('imu_publish').value)
@@ -243,6 +246,8 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.tilt_emergency_topic = str(self.get_parameter('tilt_emergency_topic').value)
         self.odom_stationary_speed_threshold = float(self.get_parameter('odom_stationary_speed_threshold').value)
         self.odom_freeze_pose_when_stationary = bool(self.get_parameter('odom_freeze_pose_when_stationary').value)
+        self.odom_linear_scale = float(self.get_parameter('odom_linear_scale').value)
+        self.odom_angular_scale = float(self.get_parameter('odom_angular_scale').value)
 
         self.tilt_speed_scale = 1.0
         self.tilt_hazard_active = False
@@ -257,6 +262,9 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
 
         self.get_logger().info(
             f"⚙️ PWM profile loaded: forward={self.fixed_pwm_forward}, backward={self.fixed_pwm_backward}, turn={self.fixed_pwm_turn}"
+        )
+        self.get_logger().info(
+            f"⚙️ Turn PWM guards: min_turn={self.min_pwm_turn}, turn_limit={self.turn_pwm_limit}, turn_floor={self.turn_pwm_floor}"
         )
 
         self.nav2_ready = not self.require_nav2_active
@@ -356,6 +364,8 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.ultrasonic_pub = self.create_publisher(Float32, '/ultrasonic_distance', 10)
         self.ultrasonic_range_pub = self.create_publisher(Range, '/ultrasonic_range', 10)
         self.safety_stop_pub = self.create_publisher(Float32, '/safety_stop', 10)
+        self.x_rel_pub = self.create_publisher(Float32, '/x_rel', 10)
+        self.y_rel_pub = self.create_publisher(Float32, '/y_rel', 10)
         self._Imu = Imu
         self.imu_pub = self.create_publisher(Imu, '/imu/data_raw', 10) if self.imu_publish else None
 
@@ -373,6 +383,8 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
             self.x = 0.0
             self.y = 0.0
             self.yaw = 0.0
+            self.x_origin = 0.0
+            self.y_origin = 0.0
             self.last_cmd_linear = 0.0
             self.last_cmd_angular = 0.0
             self.last_time = self.get_clock().now()
@@ -815,12 +827,13 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
             pwm_left = -back_pwm
             pwm_right = -back_pwm
         elif abs(linear) <= self.velocity_deadband and abs(angular) > self.angular_deadband:
+            target_turn_pwm = max(self.turn_pwm_floor, abs(turn_pwm))
             if angular > 0.0:
-                pwm_left = -turn_pwm
-                pwm_right = turn_pwm
+                pwm_left = -target_turn_pwm
+                pwm_right = target_turn_pwm
             else:
-                pwm_left = turn_pwm
-                pwm_right = -turn_pwm
+                pwm_left = target_turn_pwm
+                pwm_right = -target_turn_pwm
         elif linear > self.velocity_deadband and abs(angular) > self.angular_deadband:
             turn_fraction = min(abs(angular) / self.max_angular_speed_radps, 1.0)
             inner_pwm = max(self.min_pwm_forward, int(fwd_pwm * (1.0 - turn_fraction)))
@@ -839,7 +852,8 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
                 pwm_right = -turn_pwm
 
         if linear == 0.0 and abs(angular) > self.angular_deadband:
-            turn_limit = max(self.min_pwm, self.turn_pwm_limit)
+            # Keep commanded in-place turn above turn deadzone even when turn limit is set too low.
+            turn_limit = max(self.min_pwm_turn, self.min_pwm, self.turn_pwm_limit, self.turn_pwm_floor)
             pwm_left = max(-turn_limit, min(turn_limit, pwm_left))
             pwm_right = max(-turn_limit, min(turn_limit, pwm_right))
 

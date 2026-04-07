@@ -22,7 +22,7 @@ class LidarExplorer(Node):
         self.declare_parameter('obstacle_distance', 0.25)                      
         self.declare_parameter('safe_distance', 0.35)                         
         self.declare_parameter('forward_speed', 0.15)     
-        self.declare_parameter('turn_speed', 0.4)         
+        self.declare_parameter('turn_speed', 0.5)         
         self.declare_parameter('exploration_timeout', 300.0)  
         self.declare_parameter('scan_topic', '/scan')
         

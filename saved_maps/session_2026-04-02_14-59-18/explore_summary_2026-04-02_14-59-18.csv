@@ -1,2 +1,0 @@
-status,start_datetime,completion_datetime,elapsed_s,coverage_pct,goals_reached,path_points,nav_goals,frontier_points
-complete,2026-04-02 14:59:18,2026-04-02 15:02:05,167.7,92.39,2,23,5,389

@@ -5,7 +5,13 @@ import zlib
 
 
 def occupancy_to_pixels(occupancy_data, width, height):
-    """Convert OccupancyGrid data to strict black/white image bytes (no grayscale)."""
+    """Convert OccupancyGrid data to black/white export pixels.
+
+    Color mapping:
+    - occupied -> 0 (black)
+    - free -> 254 (white)
+    - unknown/intermediate -> 254 (white)
+    """
     occupied_threshold = 65
     free_threshold = 25
 
@@ -15,13 +21,13 @@ def occupancy_to_pixels(occupancy_data, width, height):
             idx = (height - 1 - row) * width + col
             v = occupancy_data[idx]
             if v < 0:
-                pixels[row * width + col] = 255
+                pixels[row * width + col] = 254
             elif v <= free_threshold:
-                pixels[row * width + col] = 255
+                pixels[row * width + col] = 254
             elif v >= occupied_threshold:
                 pixels[row * width + col] = 0
             else:
-                pixels[row * width + col] = 255
+                pixels[row * width + col] = 254
     return pixels
 
 
@@ -31,11 +37,11 @@ def write_pgm(path, width, height, pixels):
         f.write(bytes(pixels))
 
 
-def write_yaml(path, image_filename, resolution, origin_x, origin_y):
+def write_yaml(path, image_filename, resolution, origin_x, origin_y, origin_yaw):
     with open(path, 'w', encoding='ascii') as f:
         f.write(f'image: {image_filename}\n')
         f.write(f'resolution: {resolution}\n')
-        f.write(f'origin: [{origin_x:.6f}, {origin_y:.6f}, 0.000000]\n')
+        f.write(f'origin: [{origin_x:.6f}, {origin_y:.6f}, {origin_yaw:.6f}]\n')
         f.write('negate: 0\n')
         f.write('occupied_thresh: 0.65\n')
         f.write('free_thresh: 0.25\n')

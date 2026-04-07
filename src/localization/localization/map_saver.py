@@ -23,6 +23,18 @@ def save_occupancy_grid_map(slam_map, map_save_dir, name_prefix='map'):
     resolution = info.resolution
     origin_x = info.origin.position.x
     origin_y = info.origin.position.y
+    q = info.origin.orientation
+    origin_yaw = 0.0
+    try:
+        # Preserve map origin orientation so saved map aligns exactly with RViz/world frame.
+        origin_yaw = float(
+            __import__('math').atan2(
+                2.0 * (q.w * q.z + q.x * q.y),
+                1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            )
+        )
+    except Exception:
+        origin_yaw = 0.0
 
     pixels = occupancy_to_pixels(slam_map.data, width, height)
 
@@ -31,7 +43,7 @@ def save_occupancy_grid_map(slam_map, map_save_dir, name_prefix='map'):
     png_path = base_path + '.png'
 
     write_pgm(pgm_path, width, height, pixels)
-    write_yaml(yaml_path, f'{timed_name}.pgm', resolution, origin_x, origin_y)
+    write_yaml(yaml_path, f'{timed_name}.pgm', resolution, origin_x, origin_y, origin_yaw)
     write_png(png_path, width, height, pixels)
 
     return {

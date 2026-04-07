@@ -8,13 +8,13 @@ from nav2_msgs.action import NavigateToPose
 from nav2_msgs.srv import SaveMap
 from nav2_msgs.srv import ClearEntireCostmap
 from nav2_msgs.msg import Costmap
-from geometry_msgs.msg import Twist, PoseWithCovarianceStamped
+from geometry_msgs.msg import Twist, PoseWithCovarianceStamped, TransformStamped
 from visualization_msgs.msg import MarkerArray, Marker
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from lifecycle_msgs.srv import GetState
 from std_msgs.msg import Float32
-from tf2_ros import TransformListener, Buffer
+from tf2_ros import TransformListener, Buffer, StaticTransformBroadcaster
 
 from enum import Enum
 import math
@@ -59,10 +59,6 @@ class ExplorationCoordinator(
     # Track the active instance for signal handler
     _active_instance = None
 
-    def __init__(self, *args, **kwargs):
-        ExplorationCoordinator._active_instance = self
-        super().__init__(*args, **kwargs)
-
     def _declare_params(self, defaults):
         """Declare all node parameters from a single defaults map."""
         for name, default in defaults.items():
@@ -93,6 +89,26 @@ class ExplorationCoordinator(
                 self.get_logger().warn("🔒 Ignoring /initialpose outside INIT phase")
             return
 
+        # Seed path origin from the accepted initial pose so relative coordinates
+        # remain consistent when exported.
+        try:
+            self._path_origin_x = float(msg.pose.pose.position.x)
+            self._path_origin_y = float(msg.pose.pose.position.y)
+            q = msg.pose.pose.orientation
+            siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            self._path_origin_yaw = math.atan2(siny_cosp, cosy_cosp)
+        except Exception:
+            pass
+
+        # Record the first path row from a real measured TF pose (no synthetic anchor).
+        try:
+            self.update_pose()
+            if bool(getattr(self, 'pose_valid', False)):
+                self._record_path_point(float(self.robot_pose[0]), float(self.robot_pose[1]))
+        except Exception:
+            pass
+
         self.initial_pose_set = True
         if self.lock_initial_pose_after_set:
             self.initial_pose_locked = True
@@ -101,8 +117,28 @@ class ExplorationCoordinator(
             self.disable_lethal_escape()
         self.get_logger().info("✅ Initial pose received. Exploration can begin.")
 
+    def _publish_room_frame_offset(self):
+        """Publish a map->room frame with the same orientation as the real world."""
+        transform = TransformStamped()
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = 'map'
+        transform.child_frame_id = 'room'
+
+        transform.transform.translation.x = 0.0
+        transform.transform.translation.y = 0.0
+        transform.transform.translation.z = 0.0
+
+        transform.transform.rotation.x = 0.0
+        transform.transform.rotation.y = 0.0
+        transform.transform.rotation.z = 0.0
+        transform.transform.rotation.w = 1.0
+        
+        self.tf_static_broadcaster.sendTransform(transform)
+        self.get_logger().info("📍 Published real-world aligned map->room TF (no rotation)")
+
     def __init__(self):
         super().__init__('exploration_coordinator_v2')
+        ExplorationCoordinator._active_instance = self
         self.shutdown_by_signal = False
         self.initial_pose_set = False
         self.initialpose_sub_abs = self.create_subscription(
@@ -169,8 +205,8 @@ class ExplorationCoordinator(
             'frontier_scanned_max_unknown_ratio': 0.03,
             'frontier_scanned_max_unknown_cells': 2,
             'frontier_use_lidar_standoff_goal': True,
-            'frontier_goal_standoff_min_m': 1.0,
-            'frontier_goal_standoff_max_m': 2.5,
+            'frontier_goal_standoff_min_m': 0.20,
+            'frontier_goal_standoff_max_m': 0.60,
             'frontier_unknown_check_radius_m': 0.45,
             'frontier_min_unknown_ratio': 0.15,
             'frontier_min_unknown_cells': 10,
@@ -187,6 +223,7 @@ class ExplorationCoordinator(
             'local_costmap_raw_topic': '/local_costmap/costmap_raw',
             'frontier_lidar_fallback_timeout': 2.0,
             'costmap_free_threshold': 90,
+            'costmap_goal_edge_margin_cells': 4,
             'use_costmap_goal_filter': True,
             'pose_movement_threshold': 0.05,
             'pose_stale_timeout': 3.0,
@@ -202,9 +239,9 @@ class ExplorationCoordinator(
             'enable_simple_exploration': True,
             'stop_when_no_frontiers': True,  # Stop if there are no frontiers
             'no_frontier_recovery_cycles': 1,
-            'no_frontier_complete_cycles': 3,
+            'no_frontier_complete_cycles': 2,
             'corner_recovery_time': 1.5,
-            'corner_recovery_turn_speed': 0.65,
+            'corner_recovery_turn_speed': 0.75,
             'coverage_complete_percent': 85.0,
             'zero_frontier_complete_percent': 80.0,
             'min_goals_for_complete': 3,
@@ -213,8 +250,9 @@ class ExplorationCoordinator(
             'completion_min_known_cell_gain': 40,
             'require_no_grey_for_completion': True,
             'completion_max_unknown_cells': 0,
+            'completion_unknown_free_threshold': 25,
             'small_test_mode': False,
-            'complete_on_zero_frontiers': False,  # Only stop when coverage and min_goals are met
+            'complete_on_zero_frontiers': True,  # Complete when the explored map has no actionable frontiers
             'auto_save_on_complete': True,
             'map_topic': '/map',
             'map_save_dir': '/home/pi/FEA_SLAM_WS/saved_maps',
@@ -223,7 +261,26 @@ class ExplorationCoordinator(
             'robot_path_file': 'auto_explore_path.csv',
             'nav_goals_file': 'auto_explore_nav_goals.csv',
             'frontier_history_file': 'auto_explore_frontiers.csv',
-            'path_record_min_dist': 0.2,
+            'path_record_min_dist': 0.05,
+            'path_record_max_interval': 1.0,
+            'path_record_time_only': False,
+            'path_pose_max_age_sec': 0.5,
+            'path_max_speed_mps': 1.20,
+            'path_clip_non_negative': False,
+            'path_min_x_m': 0.0,
+            'path_min_y_m': 0.0,
+            'path_log_relative_to_initial_pose': False,
+            'path_log_align_to_initial_heading': True,
+            'path_room_yaw_offset_rad': 0.0,
+            'path_room_x_offset_m': 0.0,
+            'path_room_y_offset_m': 0.0,
+            'tracking_metrics_enabled': True,
+            'tracking_plan_topic': '/plan',
+            'tracking_plan_stale_timeout': 2.0,
+            'tracking_log_interval': 1.0,
+            'tracking_warn_cross_track_m': 0.25,
+            'tracking_warn_heading_deg': 35.0,
+            'tracking_ema_alpha': 0.25,
             'replan_on_frontier_update': True,
             'replan_interval': 2.0,  # More frequent replanning
             'replan_goal_change_distance': 0.5,  # More sensitive to new/better goals
@@ -239,7 +296,7 @@ class ExplorationCoordinator(
             'avoid_return_radius': 1.0,
             'avoid_last_goal_radius': 0.8,
             'frontier_pick_farthest': False,
-            'frontier_selection_method': 'astar',
+            'frontier_selection_method': 'nearest',
             'astar_max_candidates': 30,
             'astar_max_expansions': 12000,
             'clear_costmap_on_obstacle': True,
@@ -248,33 +305,52 @@ class ExplorationCoordinator(
             'frontier_stagnation_drop_pct': 10.0,
             'frontier_goal_refresh_min_interval': 0.8,
             'goal_ack_timeout': 2.0,
-            'goal_watchdog_timeout': 18.0,
+            'goal_watchdog_timeout': 10.0,
             'goal_watchdog_min_motion': 0.15,
             'near_goal_acceptance_distance': 0.45,
             'frontier_change_pos_quant': 0.10,
             'frontier_history_sample_interval': 1.0,
             'enable_unknown_cell_seek': True,
-            'unknown_cell_seek_min_coverage': 90.0,
-            'unknown_cell_seek_min_unknown_cells': 20,
+            'unknown_cell_seek_min_coverage': 0.0,
+            'unknown_cell_seek_min_unknown_cells': 1,
             'unknown_cell_seek_stride': 2,
             'unknown_cell_seek_max_candidates': 1200,
             'startup_clear_hold_time': 0.0,
             'startup_frontier_timeout': 20.0,
             'auto_publish_initial_pose': True,
-            'auto_publish_initial_pose_timeout': 15.0,
+            'auto_publish_initial_pose_timeout': 0.5,
             'initial_pose_wait_timeout': 30.0,
+            'auto_initial_pose_x_m': 0.93,
+            'auto_initial_pose_y_m': 0.15,
+            'auto_initial_pose_yaw_rad': 0.0,
             'lock_initial_pose_after_set': True,
             'allow_initial_pose_updates_after_init': False,
             'startup_health_window_sec': 4.0,
             'startup_require_scan_recent': False,
             'startup_require_odom_recent': False,
             'startup_require_fresh_pose': True,
-            'startup_max_tf_age_sec': 1.0,
+            'startup_max_tf_age_sec': 0.5,
         }
 
         self._declare_params(defaults)
         for name, default in defaults.items():
             setattr(self, name, self._read_param(name, default))
+
+        # Emit effective runtime values for key params so launch overrides are visible in logs.
+        self.get_logger().info(
+            "⚙️ Effective params: "
+            f"auto_pose_timeout={self.auto_publish_initial_pose_timeout}, "
+            f"init_wait_timeout={self.initial_pose_wait_timeout}, "
+            f"init_pose=({self.auto_initial_pose_x_m:.2f},{self.auto_initial_pose_y_m:.2f},{self.auto_initial_pose_yaw_rad:.2f}), "
+            f"path_min_dist={self.path_record_min_dist}, path_max_interval={self.path_record_max_interval}, "
+            f"path_align={self.path_log_relative_to_initial_pose}/{self.path_log_align_to_initial_heading}, "
+            f"path_room_cal=({self.path_room_yaw_offset_rad:.3f},{self.path_room_x_offset_m:.3f},{self.path_room_y_offset_m:.3f}), "
+            f"tracking={self.tracking_metrics_enabled} topic={self.tracking_plan_topic}, "
+            f"startup_odom_recent={self.startup_require_odom_recent}, require_nav2_active={self.require_nav2_active}, "
+            f"completion_max_unknown={self.completion_max_unknown_cells}, "
+            f"replan=({self.replan_interval},{self.replan_hard_min_interval},{self.replan_cancel_cooldown}), "
+            f"always_replan={self.always_replan_on_frontier_update}"
+        )
 
         self.backup_iterations = int(self.backup_time / 0.05)
         self.front_obstacle_half_angle = math.radians(self.front_obstacle_half_angle_deg)
@@ -293,7 +369,11 @@ class ExplorationCoordinator(
         # Organize maps by date hierarchy: saved_maps/YYYY/MM/DD/session_HH-MM-SS/
         _date_hierarchy = _session_dt.strftime('%Y/%m/%d')
         _time_only = _session_dt.strftime('%H-%M-%S')
-        self.map_save_dir = f'/home/pi/FEA_SLAM_WS/saved_maps/{_date_hierarchy}/session_{_time_only}'
+        _configured_map_dir = str(getattr(self, 'map_save_dir', '') or '').strip()
+        if '/session_' in _configured_map_dir:
+            self.map_save_dir = _configured_map_dir
+        else:
+            self.map_save_dir = f'/home/pi/FEA_SLAM_WS/saved_maps/{_date_hierarchy}/session_{_time_only}'
         self.mapped_area_file = f'explore_area_{_session_ts}.csv'
         self.robot_path_file = f'explore_path_{_session_ts}.csv'
         self.nav_goals_file = f'explore_nav_goals_{_session_ts}.csv'
@@ -392,6 +472,13 @@ class ExplorationCoordinator(
         self.last_recorded_path_y = None                                        
         self.nav_goals_series = []                                                                        
         self.frontier_history_series = []                                                 
+        self.current_plan_points = []
+        self.last_plan_time = 0.0
+        self.path_cross_track_error_m = 0.0
+        self.path_heading_error_deg = 0.0
+        self.path_cross_track_error_ema_m = 0.0
+        self.path_heading_error_ema_deg = 0.0
+        self.last_tracking_metrics_log_time = 0.0
         self.completion_datetime = None                                          
         self.completion_elapsed_s = None                                    
         self._csv_flushed = False                                             
@@ -454,6 +541,11 @@ class ExplorationCoordinator(
         
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+        
+        # Publish static transform from map to room frame (offset by initial pose)
+        self.tf_static_broadcaster = StaticTransformBroadcaster(self)
+        self._publish_room_frame_offset()
+        
         self.pose_valid = False
         self.last_pose = None
         self.last_pose_change_time = time.time()
@@ -518,6 +610,7 @@ class ExplorationCoordinator(
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
         self.create_subscription(LaserScan, self.scan_raw_topic, self.scan_raw_cb, qos_profile_sensor_data)
         self.create_subscription(Odometry, '/odometry/filtered', self.odom_cb, 10)
+        self.create_subscription(Path, self.tracking_plan_topic, self.plan_cb, 10)
         costmap_qos = QoSProfile(depth=1)
         costmap_qos.durability = DurabilityPolicy.VOLATILE
         costmap_qos.reliability = ReliabilityPolicy.RELIABLE

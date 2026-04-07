@@ -376,6 +376,8 @@ class ArduinoMotorBridgeRuntimeMixin:
         w_cmd = self.last_cmd_angular
         v = v_cmd
         w = w_cmd
+        odom_linear_scale = float(getattr(self, 'odom_linear_scale', 1.0))
+        odom_angular_scale = float(getattr(self, 'odom_angular_scale', 1.0))
         freeze_pose_update = False
         now_wall = time.time()
         imu_yaw_allowed = self.use_imu_yaw_in_odom and (now_wall >= self.imu_yaw_override_disabled_until)
@@ -407,6 +409,9 @@ class ArduinoMotorBridgeRuntimeMixin:
                 w = math.copysign(_pivot_wheel_vel / self.wheel_base, w_cmd)
             if abs(v_cmd) <= self.velocity_deadband:
                 v = 0.0
+
+        v *= odom_linear_scale
+        w *= odom_angular_scale
 
         if self.odom_feedback_gate_enabled:
             feedback_recent = (time.time() - self.last_motor_speed_time) <= 0.5
@@ -490,6 +495,13 @@ class ArduinoMotorBridgeRuntimeMixin:
         odom.twist.covariance[35] = 0.05            
 
         self.odom_pub.publish(odom)
+
+        x_rel_msg = Float32()
+        y_rel_msg = Float32()
+        x_rel_msg.data = float(self.x - getattr(self, 'x_origin', 0.0))
+        y_rel_msg.data = float(self.y - getattr(self, 'y_origin', 0.0))
+        self.x_rel_pub.publish(x_rel_msg)
+        self.y_rel_pub.publish(y_rel_msg)
 
         if self.serial_disabled and not self.odom_fallback_active:
             self.odom_fallback_active = True
