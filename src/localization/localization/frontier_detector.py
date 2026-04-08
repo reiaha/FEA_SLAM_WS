@@ -38,7 +38,7 @@ class FrontierDetector(Node):
         self.frontier_throttle_rate = 1.0                                   
         self.last_diag_log_time = 0.0
         
-        self.frontiers_pub = self.create_publisher(MarkerArray, 'frontiers', 10)
+        self.frontiers_pub = self.create_publisher(MarkerArray, '/exploration_frontiers', 10)
         self.frontier_points_pub = self.create_publisher(PointStamped, 'frontier_points', 10)
         
         self.map_sub = self.create_subscription(
@@ -152,7 +152,7 @@ class FrontierDetector(Node):
             for idx, m in enumerate(marker_array.markers):
                 m.id = idx
         self.frontiers_pub.publish(marker_array)
-        self.get_logger().info(f'✅ Published MarkerArray with {len(marker_array.markers)} markers to /frontiers')
+        self.get_logger().info(f'✅ Published MarkerArray with {len(marker_array.markers)} markers to /exploration_frontiers')
         if len(marker_array.markers) > 0:
             self.get_logger().info(f'   First marker at: ({marker_array.markers[0].pose.position.x:.2f}, {marker_array.markers[0].pose.position.y:.2f})')
         else:

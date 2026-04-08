@@ -45,6 +45,28 @@ class ArduinoMotorBridgeRuntimeMixin:
 
         self._motion_state_history.append((now, state))
 
+        # Detect ping-pong between forward and backward in a tight window.
+        if state in ('FORWARD', 'BACKWARD'):
+            sign = 1 if state == 'FORWARD' else -1
+            self._dir_flip_history.append((now, sign))
+            dir_cutoff = now - self._dir_flip_window_sec
+            while self._dir_flip_history and self._dir_flip_history[0][0] < dir_cutoff:
+                self._dir_flip_history.popleft()
+
+            dir_flips = 0
+            prev_sign = None
+            for _, cur_sign in self._dir_flip_history:
+                if prev_sign is not None and cur_sign != prev_sign:
+                    dir_flips += 1
+                prev_sign = cur_sign
+            if dir_flips >= self._dir_flip_trip_count:
+                self.get_logger().warn(
+                    f"🔁 Forward/backward loop detected: {dir_flips} direction flips "
+                    f"in {self._dir_flip_window_sec:.0f}s — forcing turn escape"
+                )
+                self._direction_flip_escape()
+                return
+
         transitions = 0
         prev = None
         for _, s in self._motion_state_history:
@@ -68,6 +90,24 @@ class ArduinoMotorBridgeRuntimeMixin:
             )
             self._oscillation_escape()
 
+    def _direction_flip_escape(self):
+        """Break repeated FORWARD/BACKWARD toggling by forcing a rotate-only escape."""
+        turn_pwm = max(0, min(255, abs(self.fixed_pwm_turn)))
+        turn_dur = max(0.5, float(self._dir_flip_escape_turn_dur))
+        self.cmd_vel_override_until = time.time() + turn_dur + 0.5
+        self._osc_escape_active = True
+        self._osc_escape_step = 1
+        self._osc_escape_step_start = time.time()
+        self._osc_escape_turn_dir = self.escape_turn_dir
+        self.escape_turn_dir *= -1.0
+        self._send_osc_turn(turn_pwm)
+        self._osc_escape_until = time.time() + self._osc_window_sec
+        self._motion_state_history.clear()
+        self._dir_flip_history.clear()
+        self.get_logger().warn(
+            f"🆘 Direction-flip escape: turning for {turn_dur:.1f}s to break local loop"
+        )
+
     def _oscillation_escape(self):
         """Deep escape when robot is oscillating FORWARD/TURN ↔ STOPPED.
         Backs up longer and turns further than the normal front-obstacle escape."""
@@ -88,6 +128,7 @@ class ArduinoMotorBridgeRuntimeMixin:
 
     def cmd_vel_nav_cb(self, msg: Twist):
         """Handle cmd_vel_nav only when no override is active"""
+        self.last_nav_cmd_time = time.time()
         if time.time() < self.cmd_vel_override_until:
             return                                              
         self._handle_cmd_vel(msg, source='cmd_vel_nav')
@@ -158,6 +199,7 @@ class ArduinoMotorBridgeRuntimeMixin:
                 self.front_blocked_until = now + self.front_stop_hold_time
                 if not was_front_blocked:                                               
                     newly_blocked = True
+                    self.front_blocked_backup_until = now + self.front_blocked_max_backup_sec
 
         if min_rear < float('inf'):
             self.last_rear_distance = min_rear
@@ -848,8 +890,30 @@ class ArduinoMotorBridgeRuntimeMixin:
         if self.ser is None:
             return
 
+        now = time.time()
+        if (
+            self.require_nav2_active and
+            self.nav2_ready and
+            self.has_active_goal and
+            self.last_nav_cmd_time > 0.0 and
+            (now - self.last_nav_cmd_time) > self.nav_cmd_timeout_sec
+        ):
+            if (
+                self.last_cmd_pwm_left != 0 or
+                self.last_cmd_pwm_right != 0 or
+                (now - self.last_nav2_inactive_stop_time) >= self.nav2_inactive_stop_repeat_sec
+            ):
+                self.last_nav2_inactive_stop_time = now
+                self._send_stop(action_override='🛑 STOPPED (NAV2 CMD STALE)', log_level='none', source='nav_cmd_stale')
+            if (now - self.last_nav_cmd_stale_log_time) >= self.nav_cmd_log_interval:
+                self.last_nav_cmd_stale_log_time = now
+                self.get_logger().warn(
+                    f"🧭 Nav2 command stream stale for {(now - self.last_nav_cmd_time):.2f}s "
+                    f"(timeout={self.nav_cmd_timeout_sec:.2f}s); holding stop"
+                )
+            return
+
         if self.require_nav2_active and not self.nav2_ready:
-            now = time.time()
             uncertain_state = not self.nav2_explicitly_inactive
             within_uncertain_grace = (now - self.last_nav2_ready_true_at) <= self.nav2_uncertain_grace_sec
             allow_hold = uncertain_state and (within_uncertain_grace or self.has_active_goal)
@@ -870,7 +934,6 @@ class ArduinoMotorBridgeRuntimeMixin:
         if not self.enable_safety_override:
             return
 
-        now = time.time()
         if now < self.safety_override_until:
             moving = self._send_rear_limited_backward(
                 self.safety_stop_backup_pwm,

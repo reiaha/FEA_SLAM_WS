@@ -747,7 +747,17 @@ class ExplorationPlanningMixin:
         if best_frontier:
             fx, fy = best_frontier['frontier']
             gx, gy = best_frontier['goal']
-            self.get_logger().info(f"🎯 Nearest frontier: ({fx:.2f}, {fy:.2f}) -> goal ({gx:.2f}, {gy:.2f}), dist: {best_frontier['dist']:.2f}m")
+            now = time.time()
+            frontier_key = (round(fx, 2), round(fy, 2), round(gx, 2), round(gy, 2))
+            last_key = getattr(self, '_last_nearest_frontier_log_key', None)
+            last_log_t = float(getattr(self, '_last_nearest_frontier_log_time', 0.0))
+            log_interval = max(0.3, float(getattr(self, 'frontier_pick_log_interval_sec', 1.0)))
+            if frontier_key != last_key or (now - last_log_t) >= log_interval:
+                self._last_nearest_frontier_log_key = frontier_key
+                self._last_nearest_frontier_log_time = now
+                self.get_logger().info(
+                    f"🎯 Nearest frontier: ({fx:.2f}, {fy:.2f}) -> goal ({gx:.2f}, {gy:.2f}), dist: {best_frontier['dist']:.2f}m"
+                )
             return best_frontier
 
         self.last_frontier_skip_reason = "no_valid_frontiers"
@@ -828,10 +838,15 @@ class ExplorationPlanningMixin:
         # Front clearance check: during INIT allow goal send even if slightly close
         # In force-send mode, also skip front clearance check
         front_clearance = self.last_lidar_front_distance
-        if front_clearance is not None and front_clearance <= (self.lidar_obstacle_distance + 0.04) and not is_init_phase and not force_send_mode:
+        front_clearance_margin = max(0.0, float(getattr(self, 'front_clearance_extra_margin_m', 0.01)))
+        front_clearance_threshold = self.lidar_obstacle_distance + front_clearance_margin
+        if front_clearance is not None and front_clearance <= front_clearance_threshold and not is_init_phase and not force_send_mode:
+            block_blacklist_sec = max(0.0, float(getattr(self, 'front_clearance_block_blacklist_sec', 1.0)))
+            if block_blacklist_sec > 0.0:
+                self.blacklisted_goals[(goal_x, goal_y)] = now + block_blacklist_sec
             if (now - self.last_front_clearance_warn_time) > 5.0:
                 self.get_logger().warn(
-                    f"⚠️ Front clearance low ({front_clearance:.2f}m); waiting for clearer path"
+                    f"⚠️ Front clearance low ({front_clearance:.2f}m <= {front_clearance_threshold:.2f}m); waiting for clearer path"
                 )
                 self.last_front_clearance_warn_time = now
             return False

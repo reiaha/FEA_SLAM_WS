@@ -110,6 +110,65 @@ class ExplorationExecutionMixin:
         except Exception:
             return int(getattr(self, 'last_unknown_cells', 0))
 
+    def _count_boundary_unknown_cells(self, boundary_margin_cells: int | None = None) -> int:
+        """Count raw unknown cells that sit within a thin band near the map boundary.
+
+        This is used as a fallback completion signal when the only remaining unknown
+        cells are on the outer edge of the map rather than in the actionable interior.
+        """
+        slam_map = getattr(self, 'last_slam_map', None)
+        if slam_map is None:
+            return 0
+
+        try:
+            info = slam_map.info
+            width = int(info.width)
+            height = int(info.height)
+            data = slam_map.data
+            if width <= 2 or height <= 2 or not data:
+                return 0
+
+            margin = boundary_margin_cells
+            if margin is None:
+                margin = int(getattr(self, 'completion_boundary_margin_cells', 4))
+            margin = max(1, min(max(1, min(width, height) // 2), int(margin)))
+
+            boundary_unknown = 0
+            for y in range(height):
+                for x in range(width):
+                    idx = y * width + x
+                    if int(data[idx]) != -1:
+                        continue
+                    if (
+                        x < margin or
+                        y < margin or
+                        x >= (width - margin) or
+                        y >= (height - margin)
+                    ):
+                        boundary_unknown += 1
+            return boundary_unknown
+        except Exception:
+            return 0
+
+    def _boundary_limited_completion_allowed(self) -> bool:
+        """Allow completion when the remaining unknown cells are a small boundary band."""
+        raw_unknown = int(getattr(self, 'last_unknown_cells', 0))
+        if raw_unknown <= 0:
+            return True
+
+        max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
+        boundary_unknown = self._count_boundary_unknown_cells()
+        self.last_boundary_unknown_cells = boundary_unknown
+
+        if raw_unknown > max_unknown:
+            return False
+
+        boundary_margin = max(1, int(getattr(self, 'completion_boundary_margin_cells', 4)))
+        # Treat the map as effectively done if almost all remaining unknown cells are
+        # in the boundary band, i.e. they are not interior holes that need more travel.
+        boundary_ratio = float(boundary_unknown) / float(max(1, raw_unknown))
+        return boundary_unknown > 0 and boundary_ratio >= 0.80 and boundary_margin > 0
+
     def _completion_cells_known(self) -> bool:
         """Return True when map unknown/grey cells satisfy completion policy."""
         if not bool(getattr(self, 'require_no_grey_for_completion', False)):
@@ -118,7 +177,18 @@ class ExplorationExecutionMixin:
         self.last_completion_unknown_cells = unknown_cells
         total_cells = int(getattr(self, 'last_total_cells', 0))
         max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
-        return (total_cells > 0) and (unknown_cells <= max_unknown)
+        if (total_cells > 0) and (unknown_cells <= max_unknown):
+            return True
+
+        if self._boundary_limited_completion_allowed():
+            boundary_unknown = int(getattr(self, 'last_boundary_unknown_cells', 0))
+            raw_unknown = int(getattr(self, 'last_unknown_cells', 0))
+            self.get_logger().info(
+                f"🧩 Boundary-limited completion allowed: actionable={unknown_cells}, raw={raw_unknown}, boundary_band={boundary_unknown}, threshold={max_unknown}"
+            )
+            return True
+
+        return False
 
     def _completion_guard_satisfied(self) -> bool:
         """Require real robot movement and map growth before allowing completion."""
@@ -156,6 +226,8 @@ class ExplorationExecutionMixin:
         unknown_cells = self._count_actionable_unknown_cells()
         self.last_completion_unknown_cells = unknown_cells
         max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
+        boundary_unknown = self._count_boundary_unknown_cells()
+        self.last_boundary_unknown_cells = boundary_unknown
         if no_grey_gate_enabled:
             no_grey_ok = self._completion_cells_known()
 
@@ -167,7 +239,7 @@ class ExplorationExecutionMixin:
                     self.get_logger().warn(
                         f"⛔ Completion gate blocked: moved={moved_m:.2f}/{min_disp_m:.2f}m, "
                         f"known_gain={known_gain}/{min_known_gain}, "
-                        f"unknown_cells={unknown_cells}>{max_unknown}"
+                        f"unknown_cells={unknown_cells}>{max_unknown}, boundary_band={boundary_unknown}"
                     )
                 elif motion_gate_enabled:
                     self.get_logger().warn(
@@ -176,7 +248,7 @@ class ExplorationExecutionMixin:
                     )
                 elif no_grey_gate_enabled:
                     self.get_logger().warn(
-                        f"⛔ Completion gate blocked: unknown_cells={unknown_cells}>{max_unknown}"
+                        f"⛔ Completion gate blocked: unknown_cells={unknown_cells}>{max_unknown}, boundary_band={boundary_unknown}"
                     )
         return ok
 
@@ -1132,12 +1204,23 @@ class ExplorationExecutionMixin:
             self.update_pose()
             robot_x, robot_y = self.robot_pose[0], self.robot_pose[1]
             distance_to_goal = goal_info['dist']
-            self.get_logger().info(
-                f"🎯 New frontier detected: Robot at ({robot_x:.2f}, {robot_y:.2f}) → Frontier ({frontier_x:.2f}, {frontier_y:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f})"
+            candidate_key = (
+                round(frontier_x, 2),
+                round(frontier_y, 2),
+                round(goal_x, 2),
+                round(goal_y, 2),
             )
-            self.get_logger().info(
-                f"📏 Distance to goal: {distance_to_goal:.2f}m | Available frontiers: {total_frontiers}"
-            )
+            last_key = getattr(self, '_last_dispatch_candidate_key', None)
+            last_log_t = float(getattr(self, '_last_dispatch_candidate_log_time', 0.0))
+            if candidate_key != last_key or (now - last_log_t) >= 1.5:
+                self._last_dispatch_candidate_key = candidate_key
+                self._last_dispatch_candidate_log_time = now
+                self.get_logger().info(
+                    f"🎯 New frontier detected: Robot at ({robot_x:.2f}, {robot_y:.2f}) → Frontier ({frontier_x:.2f}, {frontier_y:.2f}) → Goal ({goal_x:.2f}, {goal_y:.2f})"
+                )
+                self.get_logger().info(
+                    f"📏 Distance to goal: {distance_to_goal:.2f}m | Available frontiers: {total_frontiers}"
+                )
             self.ever_sent_goal = True
             sent = self.send_goal_to_nav2(
                 goal_x, goal_y, goal_info.get('costmap_filtered'), frontier_xy=(frontier_x, frontier_y)

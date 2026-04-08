@@ -171,6 +171,9 @@ class ExplorationCoordinator(
             'lidar_obstacle_class_log_interval': 2.0,
             'lidar_stale_timeout': 2.0,
             'lidar_backup_on_obstacle': True,
+            'front_clearance_extra_margin_m': 0.01,
+            'front_clearance_block_blacklist_sec': 1.0,
+            'frontier_pick_log_interval_sec': 1.0,
             'swap_lidar_front_back': False,
             'rear_obstacle_threshold': 0.25,
             'rear_obstacle_hold_time': 0.8,
@@ -205,8 +208,8 @@ class ExplorationCoordinator(
             'frontier_scanned_max_unknown_ratio': 0.03,
             'frontier_scanned_max_unknown_cells': 2,
             'frontier_use_lidar_standoff_goal': True,
-            'frontier_goal_standoff_min_m': 0.20,
-            'frontier_goal_standoff_max_m': 0.60,
+            'frontier_goal_standoff_min_m': 0.30,
+            'frontier_goal_standoff_max_m': 0.45,
             'frontier_unknown_check_radius_m': 0.45,
             'frontier_min_unknown_ratio': 0.15,
             'frontier_min_unknown_cells': 10,
@@ -223,7 +226,9 @@ class ExplorationCoordinator(
             'local_costmap_raw_topic': '/local_costmap/costmap_raw',
             'frontier_lidar_fallback_timeout': 2.0,
             'costmap_free_threshold': 90,
-            'costmap_goal_edge_margin_cells': 4,
+            'costmap_goal_edge_margin_cells': 8,
+            'costmap_robot_edge_margin_cells': 10,
+            'completion_boundary_margin_cells': 4,
             'use_costmap_goal_filter': True,
             'pose_movement_threshold': 0.05,
             'pose_stale_timeout': 3.0,
@@ -249,7 +254,7 @@ class ExplorationCoordinator(
             'completion_min_displacement_m': 0.30,
             'completion_min_known_cell_gain': 40,
             'require_no_grey_for_completion': True,
-            'completion_max_unknown_cells': 0,
+            'completion_max_unknown_cells': 240,
             'completion_unknown_free_threshold': 25,
             'small_test_mode': False,
             'complete_on_zero_frontiers': True,  # Complete when the explored map has no actionable frontiers
@@ -347,6 +352,8 @@ class ExplorationCoordinator(
             f"path_room_cal=({self.path_room_yaw_offset_rad:.3f},{self.path_room_x_offset_m:.3f},{self.path_room_y_offset_m:.3f}), "
             f"tracking={self.tracking_metrics_enabled} topic={self.tracking_plan_topic}, "
             f"startup_odom_recent={self.startup_require_odom_recent}, require_nav2_active={self.require_nav2_active}, "
+            f"edge_margin(goal/robot)={self.costmap_goal_edge_margin_cells}/{self.costmap_robot_edge_margin_cells}, "
+            f"completion_boundary_margin={self.completion_boundary_margin_cells}, "
             f"completion_max_unknown={self.completion_max_unknown_cells}, "
             f"replan=({self.replan_interval},{self.replan_hard_min_interval},{self.replan_cancel_cooldown}), "
             f"always_replan={self.always_replan_on_frontier_update}"
@@ -605,7 +612,7 @@ class ExplorationCoordinator(
             '/local_costmap/clear_entirely_local_costmap'
         )
         
-        self.create_subscription(MarkerArray, '/frontiers', self.frontiers_cb, 10)
+        self.create_subscription(MarkerArray, '/exploration_frontiers', self.frontiers_cb, 10)
         self.create_subscription(Float32, '/safety_stop', self.obstacle_distance_cb, 10)
         self.create_subscription(LaserScan, self.scan_topic, self.scan_cb, qos_profile_sensor_data)
         self.create_subscription(LaserScan, self.scan_raw_topic, self.scan_raw_cb, qos_profile_sensor_data)

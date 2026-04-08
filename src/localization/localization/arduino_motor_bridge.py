@@ -26,14 +26,14 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('baud_rate', 115200)
         self.declare_parameter('wheel_base', 0.18)
-        self.declare_parameter('max_speed_forward', 160)
-        self.declare_parameter('max_speed_backward', 150)
-        self.declare_parameter('max_linear_speed_mps', 0.35)
-        self.declare_parameter('max_angular_speed_radps', 0.8)
-        self.declare_parameter('fixed_pwm_forward', 150)
-        self.declare_parameter('fixed_pwm_backward', 120)
-        self.declare_parameter('fixed_pwm_turn', 150)
-        self.declare_parameter('auto_backup_speed_mps', 0.10)
+        self.declare_parameter('max_speed_forward', 158)
+        self.declare_parameter('max_speed_backward', 149)
+        self.declare_parameter('max_linear_speed_mps', 0.347)
+        self.declare_parameter('max_angular_speed_radps', 0.792)
+        self.declare_parameter('fixed_pwm_forward', 149)
+        self.declare_parameter('fixed_pwm_backward', 119)
+        self.declare_parameter('fixed_pwm_turn', 149)
+        self.declare_parameter('auto_backup_speed_mps', 0.099)
         self.declare_parameter('min_pwm', 100)
         self.declare_parameter('min_pwm_forward', 120)
         self.declare_parameter('min_pwm_backward', 115)
@@ -52,7 +52,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('stuck_backup_pwm', 120)
         self.declare_parameter('stuck_backup_time', 0.8)
         self.declare_parameter('safety_stop_backup_time', 2.0)
-        self.declare_parameter('safety_stop_backup_pwm', 120)
+        self.declare_parameter('safety_stop_backup_pwm', 119)
         self.declare_parameter('safety_stop_trigger_distance', 0.08)
         self.declare_parameter('safety_stop_confirm_count', 2)
         self.declare_parameter('safety_stop_clear_confirm_count', 2)
@@ -76,16 +76,20 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('scan_stale_timeout', 1.2)
         self.declare_parameter('flip_guard_time', 0.15)
         self.declare_parameter('swap_lidar_front_back', False)
-        self.declare_parameter('escape_turn_speed', 0.7)
+        self.declare_parameter('escape_turn_speed', 0.693)
         self.declare_parameter('escape_turn_toggle_interval', 1.2)
         self.declare_parameter('osc_escape_turn_dur', 3.0)                                                                        
+        self.declare_parameter('direction_flip_window_sec', 12.0)
+        self.declare_parameter('direction_flip_trip_count', 6)
+        self.declare_parameter('direction_flip_escape_turn_dur', 1.2)
         self.declare_parameter('turn_angular_scale', 0.75)
         self.declare_parameter('turn_smoothing_enabled', True)
         self.declare_parameter('turn_slew_rate_radps2', 3.0)                                         
         self.declare_parameter('invert_turn_direction', False)
-        self.declare_parameter('turn_pwm_limit', 135)
-        self.declare_parameter('front_obstacle_backup_speed_mps', 0.12)
+        self.declare_parameter('turn_pwm_limit', 134)
+        self.declare_parameter('front_obstacle_backup_speed_mps', 0.119)
         self.declare_parameter('front_obstacle_backup_turn_scale', 0.35)
+        self.declare_parameter('front_blocked_max_backup_sec', 0.9)
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('front_obstacle_half_angle_deg', 50.0)
         self.declare_parameter('rear_obstacle_half_angle_deg', 30.0)
@@ -102,6 +106,8 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('nav2_tolerate_bt_pending', True)
         self.declare_parameter('nav2_uncertain_grace_sec', 10.0)
         self.declare_parameter('nav2_inactive_stop_repeat_sec', 0.5)
+        self.declare_parameter('nav_cmd_timeout_sec', 1.2)
+        self.declare_parameter('nav_cmd_log_interval', 2.0)
         self.declare_parameter('serial_reconnect_interval', 1.0)
         self.declare_parameter('serial_max_error_streak', 5)
         self.declare_parameter('serial_error_log_interval', 2.0)
@@ -204,6 +210,9 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.escape_turn_speed = float(self.get_parameter('escape_turn_speed').value)
         self.escape_turn_toggle_interval = float(self.get_parameter('escape_turn_toggle_interval').value)
         _osc_turn_dur_param = float(self.get_parameter('osc_escape_turn_dur').value)
+        _dir_flip_window_sec_param = max(4.0, float(self.get_parameter('direction_flip_window_sec').value))
+        _dir_flip_trip_count_param = max(3, int(self.get_parameter('direction_flip_trip_count').value))
+        _dir_flip_escape_turn_dur_param = max(0.5, float(self.get_parameter('direction_flip_escape_turn_dur').value))
         self.turn_angular_scale = float(self.get_parameter('turn_angular_scale').value)
         self.turn_smoothing_enabled = bool(self.get_parameter('turn_smoothing_enabled').value)
         self.turn_slew_rate_radps2 = float(self.get_parameter('turn_slew_rate_radps2').value)
@@ -211,6 +220,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.turn_pwm_limit = int(self.get_parameter('turn_pwm_limit').value)
         self.front_obstacle_backup_speed_mps = float(self.get_parameter('front_obstacle_backup_speed_mps').value)
         self.front_obstacle_backup_turn_scale = float(self.get_parameter('front_obstacle_backup_turn_scale').value)
+        self.front_blocked_max_backup_sec = max(0.0, float(self.get_parameter('front_blocked_max_backup_sec').value))
         self.scan_topic = self.get_parameter('scan_topic').value
         self.front_obstacle_half_angle = math.radians(float(self.get_parameter('front_obstacle_half_angle_deg').value))
         self.rear_obstacle_half_angle = math.radians(float(self.get_parameter('rear_obstacle_half_angle_deg').value))
@@ -227,6 +237,8 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.nav2_tolerate_bt_pending = bool(self.get_parameter('nav2_tolerate_bt_pending').value)
         self.nav2_uncertain_grace_sec = float(self.get_parameter('nav2_uncertain_grace_sec').value)
         self.nav2_inactive_stop_repeat_sec = float(self.get_parameter('nav2_inactive_stop_repeat_sec').value)
+        self.nav_cmd_timeout_sec = max(0.2, float(self.get_parameter('nav_cmd_timeout_sec').value))
+        self.nav_cmd_log_interval = max(0.5, float(self.get_parameter('nav_cmd_log_interval').value))
         self.serial_reconnect_interval = float(self.get_parameter('serial_reconnect_interval').value)
         self.serial_max_error_streak = int(self.get_parameter('serial_max_error_streak').value)
         self.serial_error_log_interval = float(self.get_parameter('serial_error_log_interval').value)
@@ -281,6 +293,8 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.nav2_explicitly_inactive = False
         self.last_nav2_ready_true_at = time.time()
         self.last_nav2_inactive_stop_time = 0.0
+        self.last_nav_cmd_time = 0.0
+        self.last_nav_cmd_stale_log_time = 0.0
         self.nav2_clients = {
             'controller_server': self.create_client(GetState, '/controller_server/get_state'),
             'planner_server': self.create_client(GetState, '/planner_server/get_state'),
@@ -412,6 +426,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.last_front_distance = float('inf')
         self.any_obstacle_blocked_until = 0.0
         self.last_any_obstacle_distance = float('inf')
+        self.front_blocked_backup_until = 0.0
         self.spin_only_start = 0.0                                                              
         self.spin_escape_timeout = 4.0                                                         
         self.last_rear_block_log_time = 0.0
@@ -441,6 +456,10 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self._motion_state_history = deque()                          
         self._osc_window_sec   = 20.0                                         
         self._osc_trip_count   = 8                                                        
+        self._dir_flip_history = deque()
+        self._dir_flip_window_sec = _dir_flip_window_sec_param
+        self._dir_flip_trip_count = _dir_flip_trip_count_param
+        self._dir_flip_escape_turn_dur = _dir_flip_escape_turn_dur_param
         self._osc_escape_until = 0.0                                              
         self._osc_escape_backup_dur = 0.8
         self._osc_escape_turn_dur   = _osc_turn_dur_param                              
@@ -681,6 +700,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         )
 
         front_blocked  = (not scan_stale) and self._front_blocked()
+        backup_window_open = now <= self.front_blocked_backup_until
         spin_timeout_exceeded = (
             self.spin_only_start > 0.0 and
             (now - self.spin_only_start) >= self.spin_escape_timeout
@@ -695,7 +715,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
                     f"rear {self.last_rear_distance:.2f}m); allowing turn only"
                 )
 
-        elif linear > 0.0 and front_blocked and abs(angular) > self.angular_deadband and can_front_backup:
+        elif linear > 0.0 and front_blocked and abs(angular) > self.angular_deadband and can_front_backup and backup_window_open:
             linear = -abs(self.front_obstacle_backup_speed_mps)
             angular *= self.front_obstacle_backup_turn_scale
             self.spin_only_start = 0.0
@@ -707,7 +727,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
 
         elif linear > 0.0 and (front_blocked or spin_timeout_exceeded):
             angular = self._select_escape_turn(angular)
-            if can_front_backup or spin_timeout_exceeded:
+            if backup_window_open and (can_front_backup or spin_timeout_exceeded):
                 linear = -abs(self.front_obstacle_backup_speed_mps)
                 angular *= self.front_obstacle_backup_turn_scale
                 if spin_timeout_exceeded:
@@ -719,13 +739,18 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
                 linear = 0.0
                 if self.spin_only_start == 0.0:
                     self.spin_only_start = now
+                if now - self.last_front_block_log_time >= self.rear_block_log_interval:
+                    self.last_front_block_log_time = now
+                    self.get_logger().warn(
+                        f"🧭 Front blocked persists beyond backup window ({self.front_blocked_max_backup_sec:.2f}s); rotate-only"
+                    )
             dist_str = (f"{self.last_front_distance:.2f}m" if front_blocked
                         else f"{self.last_any_obstacle_distance:.2f}m")
             if now - self.last_front_block_log_time >= self.rear_block_log_interval:
                 self.last_front_block_log_time = now
                 self.get_logger().warn(
                     f"⬇️ Obstacle at {dist_str}; "
-                    f"{'backing off' if (can_front_backup or spin_timeout_exceeded) else 'rotate-only'}"
+                    f"{'backing off' if (backup_window_open and (can_front_backup or spin_timeout_exceeded)) else 'rotate-only'}"
                 )
 
         else:
