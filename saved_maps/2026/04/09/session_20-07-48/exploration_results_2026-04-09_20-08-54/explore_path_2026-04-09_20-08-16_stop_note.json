@@ -1,0 +1,10 @@
+{
+  "data_end_x_m": 0.4896,
+  "data_end_y_m": 0.191,
+  "stable_end_x_m": 0.1547,
+  "stable_end_y_m": 0.003,
+  "jump_flag": 1,
+  "jump_distance_m": 0.3505168326913844,
+  "jump_dt_s": 0.2099999999999973,
+  "note": "jump_flag=1 means final saved end may not match physical stop; use stable_end_* for stop comparison"
+}

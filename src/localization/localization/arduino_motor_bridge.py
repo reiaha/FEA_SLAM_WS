@@ -108,6 +108,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('nav2_inactive_stop_repeat_sec', 0.5)
         self.declare_parameter('nav_cmd_timeout_sec', 1.2)
         self.declare_parameter('nav_cmd_log_interval', 2.0)
+        self.declare_parameter('motor_cmd_log_interval', 1.5)
         self.declare_parameter('serial_reconnect_interval', 1.0)
         self.declare_parameter('serial_max_error_streak', 5)
         self.declare_parameter('serial_error_log_interval', 2.0)
@@ -239,6 +240,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.nav2_inactive_stop_repeat_sec = float(self.get_parameter('nav2_inactive_stop_repeat_sec').value)
         self.nav_cmd_timeout_sec = max(0.2, float(self.get_parameter('nav_cmd_timeout_sec').value))
         self.nav_cmd_log_interval = max(0.5, float(self.get_parameter('nav_cmd_log_interval').value))
+        self.motor_cmd_log_interval = max(0.2, float(self.get_parameter('motor_cmd_log_interval').value))
         self.serial_reconnect_interval = float(self.get_parameter('serial_reconnect_interval').value)
         self.serial_max_error_streak = int(self.get_parameter('serial_max_error_streak').value)
         self.serial_error_log_interval = float(self.get_parameter('serial_error_log_interval').value)
@@ -323,6 +325,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.last_serial_error_log_time = 0.0
         self.last_serial_reconnect_time = 0.0
         self.last_motor_log_time = 0.0
+        self.last_motor_log_signature = None
         for port in ports_to_try:
             try:
                 self.ser = serial.Serial(port, baud_rate, timeout=1)

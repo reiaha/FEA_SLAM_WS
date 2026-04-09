@@ -1,0 +1,17 @@
+metric,value
+rows,11
+duration_s,11.910000
+total_distance_m,0.915906
+start_x_m,0.000000
+start_y_m,0.000000
+end_x_m,0.408000
+end_y_m,0.163900
+max_segment_speed_mps,1.445994
+mean_segment_speed_mps,0.254944
+speed_spike_threshold_mps,0.800000
+speed_spike_count,1
+end_stable_x_m,-0.116000
+end_stable_y_m,-0.143000
+end_jump_flag,1
+end_jump_distance_m,0.433798
+end_jump_dt_s,0.300000

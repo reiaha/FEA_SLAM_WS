@@ -609,9 +609,20 @@ class ArduinoMotorBridgeRuntimeMixin:
             self.last_cmd_pwm_left = pwm_left
             self.last_cmd_pwm_right = pwm_right
             self.last_cmd_time = now
-            # Always log motor output as warn for visibility
-            self.get_logger().warn(msg)
-            self.last_motor_log_time = now
+
+            # Reduce repetitive spam: always log command/state transitions,
+            # throttle identical repeats to a configurable interval.
+            # Group by action+source so tiny PWM jitter does not flood logs.
+            signature = (str(action), str(source))
+            last_sig = getattr(self, 'last_motor_log_signature', None)
+            log_interval = float(getattr(self, 'motor_cmd_log_interval', 0.8))
+            is_changed = signature != last_sig
+            due = (now - float(getattr(self, 'last_motor_log_time', 0.0))) >= log_interval
+
+            if is_changed or due:
+                self.get_logger().warn(msg)
+                self.last_motor_log_time = now
+                self.last_motor_log_signature = signature
         except Exception as e:
             self.get_logger().error(f'Serial write error: {e}')
 

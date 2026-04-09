@@ -24,6 +24,36 @@ class ExplorationSensingMixin:
             angle += 2.0 * math.pi
         return angle
 
+    def _update_corner_state(self, front_distance: float, left_distance: float, right_distance: float):
+        """Track whether the robot is cornered from front and side clearances."""
+        front_limit = max(0.10, float(getattr(self, 'corner_detect_front_distance', 0.34)))
+        side_limit = max(0.10, float(getattr(self, 'corner_detect_side_distance', 0.26)))
+        hold_sec = max(0.1, float(getattr(self, 'corner_detect_hold_sec', 0.8)))
+        now = time.time()
+
+        front_blocked = math.isfinite(front_distance) and front_distance <= front_limit
+        left_blocked = math.isfinite(left_distance) and left_distance <= side_limit
+        right_blocked = math.isfinite(right_distance) and right_distance <= side_limit
+
+        corner_detected = front_blocked and (left_blocked or right_blocked)
+        if corner_detected:
+            self.corner_detected = True
+            self.corner_detected_since = now if getattr(self, 'corner_detected_since', 0.0) <= 0.0 else getattr(self, 'corner_detected_since', now)
+            self.last_corner_time = now
+            if left_blocked and not right_blocked:
+                self.corner_escape_dir = -1.0
+            elif right_blocked and not left_blocked:
+                self.corner_escape_dir = 1.0
+            else:
+                self.corner_escape_dir = self._clear_turn_dir() if hasattr(self, '_clear_turn_dir') else 1.0
+            self.corner_recovery_until = max(float(getattr(self, 'corner_recovery_until', 0.0)), now + hold_sec)
+            self.corner_recovery_mode = 'rotate'
+        elif getattr(self, 'corner_detected', False):
+            if (now - float(getattr(self, 'last_corner_time', 0.0))) >= hold_sec:
+                self.corner_detected = False
+                self.corner_detected_since = 0.0
+                self.corner_escape_dir = 0.0
+
     def plan_cb(self, msg: Path):
         if not bool(getattr(self, 'tracking_metrics_enabled', True)):
             return
@@ -376,6 +406,8 @@ class ExplorationSensingMixin:
                 self.front_obstacle_detected = False
             self.static_stuck_start = 0.0
             self.static_stuck_escape_active = False
+
+        self._update_corner_state(min_front_distance, min_left_distance, min_right_distance)
 
     def scan_raw_cb(self, msg: LaserScan):
         """Track raw scan timing for startup readiness"""

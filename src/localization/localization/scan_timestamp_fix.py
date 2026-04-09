@@ -162,7 +162,9 @@ class ScanTimestampFix(Node):
                     return
 
             if self.force_stamp_now:
-                stamp_ns = now_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
+                # When forcing stamp to now, do not apply additional offset.
+                # Adding offset here can future-date scans and destabilize TF lookups.
+                stamp_ns = now_ns
             elif msg_stamp_ns > 0:
                 stamp_ns = msg_stamp_ns + int(max(0.0, self.timestamp_offset_sec) * 1e9)
             else:

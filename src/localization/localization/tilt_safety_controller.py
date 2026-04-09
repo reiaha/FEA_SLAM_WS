@@ -89,7 +89,7 @@ class TiltSafetyController(Node):
             now = self.get_clock().now().nanoseconds / 1e9
             if (now - self.last_invalid_imu_log_time) >= 1.0:
                 self.last_invalid_imu_log_time = now
-                self.get_logger().warn(
+                self.get_logger().debug(
                     f'Ignoring invalid IMU accel norm={accel_norm:.2f} m/s^2 '
                     f'(range {self.accel_norm_min_ms2:.1f}-{self.accel_norm_max_ms2:.1f})'
                 )
@@ -173,7 +173,7 @@ class TiltSafetyController(Node):
 
         if self.state != self.last_state:
             self.last_state = self.state
-            self.get_logger().warn(
+            self.get_logger().debug(
                 f'Tilt state={self.state} roll={self.roll_deg:.2f}deg pitch={self.pitch_deg:.2f}deg '
                 f'scale={self.speed_scale:.2f}'
             )

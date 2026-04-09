@@ -1,7 +1,7 @@
 ekf_filter_node:
   ros__parameters:
-    frequency: 20.0 # Try 20Hz; if it still fails, go back to 10Hz but optimize elsewhere
-    sensor_timeout: 0.1
+    frequency: 3.0  # Reduced from 5Hz: Mission-critical to 3Hz on Pi hardware. See fea_slam/config/ekf.yaml for full config.
+    sensor_timeout: 1.5
     two_d_mode: true
     publish_tf: true
 

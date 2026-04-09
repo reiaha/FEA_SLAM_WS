@@ -7,7 +7,16 @@ package_name = 'localization'
 setup(
     name=package_name,
     version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    packages=find_packages(exclude=[
+        'test',
+        'test.*',
+        'install',
+        'install.*',
+        'log',
+        'log.*',
+        'build',
+        'build.*',
+    ]),
     data_files=[
         # required ROS index
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),

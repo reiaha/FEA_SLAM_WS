@@ -1,0 +1,9 @@
+metric,value
+data_end_x_m,0.3937
+data_end_y_m,0.1888
+stable_end_x_m,0.0446
+stable_end_y_m,-0.061
+jump_flag,1
+jump_distance_m,0.4292678068525521
+jump_dt_s,0.5
+note,jump_flag=1 means final saved end may not match physical stop; use stable_end_* for stop comparison

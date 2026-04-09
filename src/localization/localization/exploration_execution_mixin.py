@@ -14,6 +14,44 @@ from rclpy.duration import Duration
 class ExplorationExecutionMixin:
     lethal_escape_enabled: bool = True
 
+    def _finish_exploration(self, reason: str):
+        """Finalize exploration safely and transition to DONE."""
+        Phase = self.current_phase.__class__
+        self.get_logger().info(reason)
+        self.get_logger().info(f"🗺️ Final map coverage: {self.last_percent_known:.2f}%")
+        self._log_completion_unknown_summary()
+        try:
+            if hasattr(self, 'goal_handle') and self.goal_handle is not None:
+                self.goal_handle.cancel_goal_async()
+                self.goal_handle = None
+                self.goal_in_progress = False
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ Could not cancel goal: {e}")
+        try:
+            stop_msg = Twist()
+            self.cmd_vel_pub.publish(stop_msg)
+            if hasattr(self, 'cmd_vel_nav_pub'):
+                self.cmd_vel_nav_pub.publish(stop_msg)
+        except Exception as e:
+            self.get_logger().warn(f"⚠️ Could not publish stop command: {e}")
+        self.current_phase = Phase.DONE
+        self._on_exploration_complete()
+
+    def _coverage_completion_ready(self) -> bool:
+        """Allow completion when map is complete even if a few frontiers/goals remain."""
+        if not bool(getattr(self, 'complete_on_coverage_even_with_frontiers', False)):
+            return False
+
+        coverage_target = float(getattr(self, 'coverage_complete_percent', 100.0))
+        if float(getattr(self, 'last_percent_known', 0.0)) < coverage_target:
+            return False
+
+        max_frontiers = int(getattr(self, 'coverage_completion_max_frontiers', -1))
+        if max_frontiers >= 0 and len(getattr(self, 'current_frontiers', [])) > max_frontiers:
+            return False
+
+        return self._completion_guard_satisfied() and self._completion_cells_known()
+
     def _log_completion_unknown_summary(self):
         """Log raw vs actionable unknown counts used by completion gate."""
         raw_unknown = int(getattr(self, 'last_unknown_cells', 0))
@@ -169,24 +207,102 @@ class ExplorationExecutionMixin:
         boundary_ratio = float(boundary_unknown) / float(max(1, raw_unknown))
         return boundary_unknown > 0 and boundary_ratio >= 0.80 and boundary_margin > 0
 
+    def _count_boundary_leak_cells(self, boundary_margin_cells: int | None = None) -> int:
+        """Count boundary-band unknown cells that still touch traversable free space.
+
+        A non-zero count usually indicates the mapped perimeter is still open,
+        so completion should remain blocked until the wall loop is closed.
+        """
+        slam_map = getattr(self, 'last_slam_map', None)
+        if slam_map is None:
+            return 0
+
+        try:
+            info = slam_map.info
+            width = int(info.width)
+            height = int(info.height)
+            data = slam_map.data
+            if width <= 2 or height <= 2 or not data:
+                return 0
+
+            margin = boundary_margin_cells
+            if margin is None:
+                margin = int(getattr(self, 'completion_boundary_leak_margin_cells', 4))
+            margin = max(1, min(max(1, min(width, height) // 2), int(margin)))
+
+            free_threshold = max(1, min(100, int(getattr(self, 'completion_unknown_free_threshold', 25))))
+            leak_cells = 0
+
+            for y in range(1, height - 1):
+                row = y * width
+                for x in range(1, width - 1):
+                    if not (
+                        x < margin or
+                        y < margin or
+                        x >= (width - margin) or
+                        y >= (height - margin)
+                    ):
+                        continue
+
+                    idx = row + x
+                    if int(data[idx]) != -1:
+                        continue
+
+                    has_free_neighbor = False
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nidx = (y + dy) * width + (x + dx)
+                        nval = int(data[nidx])
+                        if 0 <= nval < free_threshold:
+                            has_free_neighbor = True
+                            break
+
+                    if has_free_neighbor:
+                        leak_cells += 1
+
+            return leak_cells
+        except Exception:
+            return 0
+
+    def _walls_closed_for_completion(self) -> bool:
+        """Return True when boundary leak cells are within completion tolerance."""
+        if not bool(getattr(self, 'require_wall_closed_for_completion', False)):
+            return True
+
+        leak_cells = int(self._count_boundary_leak_cells())
+        self.last_boundary_leak_cells = leak_cells
+        max_leak = max(0, int(getattr(self, 'completion_max_boundary_leak_cells', 0)))
+
+        ok = leak_cells <= max_leak
+        if not ok:
+            now_t = time.time()
+            if (now_t - float(getattr(self, 'last_boundary_leak_log_time', 0.0))) >= 2.0:
+                self.last_boundary_leak_log_time = now_t
+                self.get_logger().warn(
+                    f"⛔ Completion gate blocked: boundary leak cells={leak_cells}>{max_leak} (close wall first)"
+                )
+        return ok
+
     def _completion_cells_known(self) -> bool:
         """Return True when map unknown/grey cells satisfy completion policy."""
         if not bool(getattr(self, 'require_no_grey_for_completion', False)):
-            return True
+            return self._walls_closed_for_completion()
         unknown_cells = self._count_actionable_unknown_cells()
         self.last_completion_unknown_cells = unknown_cells
         total_cells = int(getattr(self, 'last_total_cells', 0))
         max_unknown = max(0, int(getattr(self, 'completion_max_unknown_cells', 0)))
         if (total_cells > 0) and (unknown_cells <= max_unknown):
-            return True
+            return self._walls_closed_for_completion()
 
         if self._boundary_limited_completion_allowed():
             boundary_unknown = int(getattr(self, 'last_boundary_unknown_cells', 0))
             raw_unknown = int(getattr(self, 'last_unknown_cells', 0))
+            wall_closed = self._walls_closed_for_completion()
             self.get_logger().info(
-                f"🧩 Boundary-limited completion allowed: actionable={unknown_cells}, raw={raw_unknown}, boundary_band={boundary_unknown}, threshold={max_unknown}"
+                f"🧩 Boundary-limited completion check: actionable={unknown_cells}, raw={raw_unknown}, "
+                f"boundary_band={boundary_unknown}, boundary_leak={int(getattr(self, 'last_boundary_leak_cells', 0))}, "
+                f"threshold={max_unknown}, wall_closed={wall_closed}"
             )
-            return True
+            return wall_closed
 
         return False
 
@@ -354,6 +470,11 @@ class ExplorationExecutionMixin:
 
     def _clear_turn_dir(self) -> float:
         """Choose turn direction using side clearances (left:+, right:-)."""
+        if bool(getattr(self, 'corner_detected', False)):
+            corner_dir = float(getattr(self, 'corner_escape_dir', 0.0) or 0.0)
+            if corner_dir != 0.0:
+                return corner_dir
+
         left = self.last_lidar_left_distance
         right = self.last_lidar_right_distance
         if left is None and right is None:
@@ -743,6 +864,57 @@ class ExplorationExecutionMixin:
             # failure/recovery paths to avoid self-inflicted abort loops.
             self.update_pose()
 
+            if self._coverage_completion_ready():
+                frontier_count = len(getattr(self, 'current_frontiers', []))
+                self._finish_exploration(
+                    f"🎉 EXPLORATION COMPLETE! Coverage threshold reached ({self.last_percent_known:.2f}% >= {self.coverage_complete_percent:.2f}%) "
+                    f"with completion gates satisfied; finishing regardless of remaining frontier count ({frontier_count})."
+                )
+                return
+
+            if bool(getattr(self, 'corner_detected', False)):
+                # Corner detection uses a larger front distance than emergency obstacle stop.
+                # If we are not actually near a front obstacle, treat it as a false positive
+                # and immediately release corner recovery to avoid endless in-place spinning.
+                front_dist = getattr(self, 'last_lidar_front_distance', None)
+                corner_front_limit = max(0.10, float(getattr(self, 'corner_detect_front_distance', 0.34)))
+                close_front = (
+                    front_dist is not None and
+                    math.isfinite(front_dist) and
+                    front_dist <= corner_front_limit
+                )
+                if (not bool(getattr(self, 'front_obstacle_detected', False))) and (not close_front):
+                    self.corner_detected = False
+                    self.corner_detected_since = 0.0
+                    self.corner_escape_dir = 0.0
+                    self.corner_recovery_until = 0.0
+                    self.corner_recovery_mode = None
+                else:
+                    self.corner_recovery_until = max(
+                        float(getattr(self, 'corner_recovery_until', 0.0)),
+                        now + max(0.1, float(getattr(self, 'corner_avoid_hold_sec', 1.5)))
+                    )
+                    if self.goal_handle is not None and bool(getattr(self, 'front_obstacle_detected', False)):
+                        try:
+                            self.goal_handle.cancel_goal_async()
+                        except Exception:
+                            pass
+                        self.goal_handle = None
+                        self.goal_in_progress = False
+                    reverse_allowed = self._reverse_recovery_allowed()
+                    escape_msg = Twist()
+                    escape_dir = float(getattr(self, 'corner_escape_dir', 0.0) or 0.0)
+                    if escape_dir == 0.0:
+                        escape_dir = self._clear_turn_dir()
+                        self.corner_escape_dir = escape_dir
+                    if reverse_allowed and (not self.rear_obstacle_detected or self.last_rear_distance > self.rear_emergency_distance):
+                        # In a true corner, first create space by turning away before any reverse motion.
+                        escape_msg.angular.z = escape_dir * self.corner_recovery_turn_speed
+                    else:
+                        escape_msg.angular.z = escape_dir * self.corner_recovery_turn_speed
+                    self.cmd_vel_pub.publish(escape_msg)
+                    return
+
             if self.static_stuck_escape_active:
                 step_elapsed = now - self.static_stuck_escape_step_start
                 escape_msg = Twist()
@@ -849,7 +1021,10 @@ class ExplorationExecutionMixin:
                 else:
                     reverse_allowed = self._reverse_recovery_allowed()
                     recovery_msg = Twist()
-                    turn_dir = 1.0 if (self.no_frontier_cycles % 2 == 0) else -1.0
+                    turn_dir = float(getattr(self, 'corner_escape_dir', 0.0) or 0.0)
+                    if turn_dir == 0.0:
+                        turn_dir = self._clear_turn_dir()
+                        self.corner_escape_dir = turn_dir
                     if self.corner_recovery_mode == "backup":
                         # Only back up if a close front obstacle is detected and rear is clear
                         if reverse_allowed and self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:

@@ -183,6 +183,10 @@ class ExplorationCoordinator(
             'rear_obstacle_min_hits': 2,
             'rear_emergency_distance': 0.25,
             'front_emergency_rotate_distance': 0.30,
+            'corner_detect_front_distance': 0.34,
+            'corner_detect_side_distance': 0.26,
+            'corner_detect_hold_sec': 0.8,
+            'corner_avoid_hold_sec': 1.5,
             'frontier_goal_offset': 0.35,
             'min_frontier_distance': 0.3,
             'relaxed_frontier_after_cycles': 2,
@@ -210,6 +214,8 @@ class ExplorationCoordinator(
             'frontier_use_lidar_standoff_goal': True,
             'frontier_goal_standoff_min_m': 0.30,
             'frontier_goal_standoff_max_m': 0.45,
+            'prefer_open_space_frontiers': True,
+            'frontier_open_space_weight': 1.0,
             'frontier_unknown_check_radius_m': 0.45,
             'frontier_min_unknown_ratio': 0.15,
             'frontier_min_unknown_cells': 10,
@@ -249,6 +255,8 @@ class ExplorationCoordinator(
             'corner_recovery_turn_speed': 0.75,
             'coverage_complete_percent': 85.0,
             'zero_frontier_complete_percent': 80.0,
+            'complete_on_coverage_even_with_frontiers': True,
+            'coverage_completion_max_frontiers': -1,
             'min_goals_for_complete': 3,
             'require_motion_and_map_growth_for_completion': True,
             'completion_min_displacement_m': 0.30,
@@ -257,6 +265,9 @@ class ExplorationCoordinator(
             'completion_max_unknown_cells': 240,
             'completion_unknown_free_threshold': 25,
             'small_test_mode': False,
+            'require_wall_closed_for_completion': True,
+            'completion_boundary_leak_margin_cells': 4,
+            'completion_max_boundary_leak_cells': 0,
             'complete_on_zero_frontiers': True,  # Complete when the explored map has no actionable frontiers
             'auto_save_on_complete': True,
             'map_topic': '/map',
@@ -301,7 +312,7 @@ class ExplorationCoordinator(
             'avoid_return_radius': 1.0,
             'avoid_last_goal_radius': 0.8,
             'frontier_pick_farthest': False,
-            'frontier_selection_method': 'nearest',
+            'frontier_selection_method': 'astar',
             'astar_max_candidates': 30,
             'astar_max_expansions': 12000,
             'clear_costmap_on_obstacle': True,
@@ -355,6 +366,8 @@ class ExplorationCoordinator(
             f"edge_margin(goal/robot)={self.costmap_goal_edge_margin_cells}/{self.costmap_robot_edge_margin_cells}, "
             f"completion_boundary_margin={self.completion_boundary_margin_cells}, "
             f"completion_max_unknown={self.completion_max_unknown_cells}, "
+            f"require_wall_closed={self.require_wall_closed_for_completion}, "
+            f"boundary_leak(max/margin)={self.completion_max_boundary_leak_cells}/{self.completion_boundary_leak_margin_cells}, "
             f"replan=({self.replan_interval},{self.replan_hard_min_interval},{self.replan_cancel_cooldown}), "
             f"always_replan={self.always_replan_on_frontier_update}"
         )
@@ -395,6 +408,8 @@ class ExplorationCoordinator(
         self.last_completion_guard_log_time = 0.0
         self.last_unknown_cells = 0
         self.last_total_cells = 0
+        self.last_boundary_leak_cells = 0
+        self.last_boundary_leak_log_time = 0.0
         self.current_frontiers = []
         self.obstacle_detected = False
         self.obstacle_distance_m = float('inf')
@@ -439,6 +454,10 @@ class ExplorationCoordinator(
         self.no_frontier_cycles = 0
         self.corner_recovery_until = 0.0
         self.corner_recovery_mode = None
+        self.corner_detected = False
+        self.corner_detected_since = 0.0
+        self.corner_escape_dir = 0.0
+        self.last_corner_time = 0.0
         self.last_goal_time = 0.0                                  
         self.last_goal_dispatch_time = 0.0
         self.goal_dispatch_pose = None

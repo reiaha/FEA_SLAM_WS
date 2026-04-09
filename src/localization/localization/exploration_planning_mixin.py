@@ -497,6 +497,20 @@ class ExplorationPlanningMixin:
                         continue
                     goal_x, goal_y = standoff_goal
 
+                    frontier_stats = self._frontier_unknown_stats(
+                        fx,
+                        fy,
+                        float(getattr(self, 'frontier_unknown_check_radius_m', 0.45))
+                    )
+                    unknown_ratio = 0.0
+                    unknown_cells = 0
+                    open_space_score = 0.0
+                    if frontier_stats is not None:
+                        unknown_ratio = float(frontier_stats['unknown_ratio'])
+                        unknown_cells = int(frontier_stats['unknown_cells'])
+                        open_weight = max(0.0, float(getattr(self, 'frontier_open_space_weight', 1.0)))
+                        open_space_score = (unknown_ratio * open_weight) + min(1.0, float(unknown_cells) / 20.0)
+
                     if self.strict_no_revisit and self.strict_avoid_goals:
                         strict_radius = max(
                             self.visited_goal_radius,
@@ -585,7 +599,10 @@ class ExplorationPlanningMixin:
                         'frontier': (fx, fy),
                         'goal': (goal_x, goal_y),
                         'dist': dist,
-                        'costmap_filtered': costmap_filter
+                        'costmap_filtered': costmap_filter,
+                        'unknown_ratio': unknown_ratio,
+                        'unknown_cells': unknown_cells,
+                        'open_space_score': open_space_score,
                     })
                 return built
 
@@ -602,7 +619,15 @@ class ExplorationPlanningMixin:
                 return None
 
             if self.frontier_selection_method == 'astar':
-                candidates.sort(key=lambda c: c['dist'])
+                if bool(getattr(self, 'prefer_open_space_frontiers', False)):
+                    candidates.sort(
+                        key=lambda c: (
+                            -float(c.get('open_space_score', 0.0)),
+                            float(c.get('dist', float('inf'))),
+                        )
+                    )
+                else:
+                    candidates.sort(key=lambda c: c['dist'])
                 candidates = candidates[:max(1, self.astar_max_candidates)]
                 best_cost = None
                 astar_found = False
@@ -799,20 +824,47 @@ class ExplorationPlanningMixin:
         if use_costmap_filter is None:
             use_costmap_filter = self.use_costmap_goal_filter
 
-        # Force-send mode: if > 5 consecutive failures, bypass some strict checks
-        force_send_mode = (self.consecutive_failures >= 5 and len(self.current_frontiers) > 0)
+        if not hasattr(self, '_goal_send_block_streak'):
+            self._goal_send_block_streak = 0
+
+        def _block_goal_send(reason: str, throttle_sec: float = 2.0):
+            self._goal_send_block_streak += 1
+            last_log_t = float(getattr(self, '_goal_send_block_log_time', 0.0))
+            if (now - last_log_t) >= max(0.2, throttle_sec):
+                self._goal_send_block_log_time = now
+                self.get_logger().warn(
+                    f"⚠️ Skipping goal send: {reason} (blocked {self._goal_send_block_streak}x)"
+                )
+            return False
+
+        # Force-send mode: if many planning failures or repeated dispatch blocks, bypass strict gates.
+        force_send_mode = (
+            (self.consecutive_failures >= 5 or self._goal_send_block_streak >= 12)
+            and len(self.current_frontiers) > 0
+        )
         if force_send_mode and not hasattr(self, '_force_send_log_time'):
             self._force_send_log_time = now
         if force_send_mode and (now - getattr(self, '_force_send_log_time', 0)) > 10.0:
             self.get_logger().warn(
-                f"⚠️ Force-send mode: {self.consecutive_failures} failures — bypassing strict checks to keep exploring"
+                f"⚠️ Force-send mode: failures={self.consecutive_failures}, blocked={self._goal_send_block_streak} — bypassing strict checks to keep exploring"
             )
             self._force_send_log_time = now
 
-        # In force-send mode, skip immediate obstacle check
-        if (self.obstacle_detected or self.front_obstacle_detected) and not force_send_mode:
-            self.get_logger().warn("⚠️ Skipping goal send: obstacle currently detected")
-            return False
+        nav2_handles_obstacles = bool(getattr(self, 'nav2_handles_obstacles', True))
+        strict_obstacle_mode = bool(getattr(self, 'strict_obstacle_handling', False)) or (not nav2_handles_obstacles)
+        emergency_front_dist = max(0.05, float(getattr(self, 'front_emergency_rotate_distance', self.lidar_obstacle_distance)))
+
+        obstacle_is_emergency = (
+            (self.front_obstacle_detected or self.obstacle_detected)
+            and math.isfinite(float(getattr(self, 'obstacle_distance_m', float('inf'))))
+            and float(self.obstacle_distance_m) <= emergency_front_dist
+        )
+
+        # In Nav2-managed mode, don't block goal dispatch on non-emergency obstacle flags.
+        if (strict_obstacle_mode and (self.obstacle_detected or self.front_obstacle_detected) and not force_send_mode) or (
+            obstacle_is_emergency and not force_send_mode
+        ):
+            return _block_goal_send("obstacle currently detected")
 
         scan_age = now - self.last_scan_time
         current_phase = getattr(self, 'current_phase', None)
@@ -827,7 +879,7 @@ class ExplorationPlanningMixin:
                     f"⚠️ Scan stale ({scan_age:.2f}s > {self.lidar_stale_timeout:.2f}s) — may affect path planning"
                 )
                 self.last_scan_stale_warn_time = now
-            return False
+            return _block_goal_send("scan stale", throttle_sec=3.0)
         elif scan_age > self.lidar_stale_timeout and is_init_phase:
             if (now - self.last_scan_stale_warn_time) > 5.0:
                 self.get_logger().warn(
@@ -840,7 +892,14 @@ class ExplorationPlanningMixin:
         front_clearance = self.last_lidar_front_distance
         front_clearance_margin = max(0.0, float(getattr(self, 'front_clearance_extra_margin_m', 0.01)))
         front_clearance_threshold = self.lidar_obstacle_distance + front_clearance_margin
-        if front_clearance is not None and front_clearance <= front_clearance_threshold and not is_init_phase and not force_send_mode:
+        apply_front_clearance_gate = strict_obstacle_mode or obstacle_is_emergency
+        if (
+            front_clearance is not None
+            and front_clearance <= front_clearance_threshold
+            and not is_init_phase
+            and not force_send_mode
+            and apply_front_clearance_gate
+        ):
             block_blacklist_sec = max(0.0, float(getattr(self, 'front_clearance_block_blacklist_sec', 1.0)))
             if block_blacklist_sec > 0.0:
                 self.blacklisted_goals[(goal_x, goal_y)] = now + block_blacklist_sec
@@ -849,7 +908,7 @@ class ExplorationPlanningMixin:
                     f"⚠️ Front clearance low ({front_clearance:.2f}m <= {front_clearance_threshold:.2f}m); waiting for clearer path"
                 )
                 self.last_front_clearance_warn_time = now
-            return False
+            return _block_goal_send("front clearance low", throttle_sec=3.0)
         
         try:
             can_map_base = self.tf_buffer.can_transform('map', self.base_frame, rclpy.time.Time(), timeout=Duration(seconds=0.05))
@@ -988,6 +1047,7 @@ class ExplorationPlanningMixin:
         
         send_goal_future = self.nav_client.send_goal_async(goal_msg)
         send_goal_future.add_done_callback(self.goal_response_cb)
+        self._goal_send_block_streak = 0
         self.last_goal_dispatch_time = time.time()
         self.goal_dispatch_pose = (robot_x, robot_y)
         self._publish_goal_arrow(robot_x, robot_y, goal_x, goal_y)
