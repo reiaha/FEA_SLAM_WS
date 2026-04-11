@@ -1,0 +1,2 @@
+status,start_datetime,completion_datetime,elapsed_s,coverage_pct,goals_reached,path_points,nav_goals,frontier_points,final_map_x_m,final_map_y_m,final_odom_x_m,final_odom_y_m,final_room_x_m,final_room_y_m
+complete,2026-04-11 18:24:37,2026-04-11 18:24:56,19.4,96.41,0,4,1,28,-0.4937,-0.2489,0.1015,0.0569,0.4937,0.2489

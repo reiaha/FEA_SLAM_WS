@@ -53,6 +53,7 @@ check_overlay_pkg_prefix() {
 
 check_overlay_pkg_prefix localization
 check_overlay_pkg_prefix fea_slam
+check_overlay_pkg_prefix visualization_pkg
 
 if ! command -v ros2 >/dev/null 2>&1; then
 	echo "[ERROR] ros2 command not found after sourcing setup files"
@@ -346,6 +347,7 @@ echo "[MODE] nav2=${USE_NAV2}"
 echo "[MODE] slam=${USE_SLAM}"
 echo "[MODE] map=${MAP_FILE}"
 echo "[MODE] rviz_config=${RVIZ_CONFIG}"
+EXTRA_LAUNCH_ARGS=("$@")
 
 # Fixed ON: always publish script-level initial pose.
 AUTO_INITIAL_POSE="true"
@@ -355,7 +357,7 @@ SYSTEM_READY=0
 READY_FLAG_FILE="/tmp/fea_slam_ready_$$"
 
 # Run launch in a dedicated session/process-group so Ctrl+C handler can reliably terminate it
-setsid ros2 launch fea_slam robot_full.launch.py slam:=${USE_SLAM} map:=${MAP_FILE} nav2:=${USE_NAV2} exploration:=${USE_EXPLORATION} rviz:=true rviz_config:=${RVIZ_CONFIG} map_odom_fallback:=false nav2_lifecycle_override:=false small_test_mode:=${SMALL_TEST_MODE} env:=${ENV_MODE} &
+setsid ros2 launch fea_slam robot_full.launch.py slam:=${USE_SLAM} map:=${MAP_FILE} nav2:=${USE_NAV2} exploration:=${USE_EXPLORATION} rviz:=true rviz_config:=${RVIZ_CONFIG} map_odom_fallback:=false nav2_lifecycle_override:=false small_test_mode:=${SMALL_TEST_MODE} env:=${ENV_MODE} "${EXTRA_LAUNCH_ARGS[@]}" &
 LAUNCH_PID=$!
 LAUNCH_PGID="$(ps -o pgid= -p "$LAUNCH_PID" 2>/dev/null | tr -d '[:space:]' || true)"
 

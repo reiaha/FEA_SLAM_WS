@@ -157,7 +157,7 @@ class ExplorationCoordinator(
             'backup_time': 0.8,
             'use_lidar_obstacle': True,
             'strict_obstacle_handling': True,
-            'use_ultrasonic_backup': True,
+            'use_ultrasonic_backup': False,
             'scan_min_range': 0.27,
             'lidar_obstacle_distance': 0.45,
             'ultrasonic_backup_distance': 0.15,

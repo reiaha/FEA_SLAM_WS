@@ -695,6 +695,8 @@ class ArduinoMotorBridgeRuntimeMixin:
                 )
 
     def _handle_safety_stop_line(self, line: str):
+        if not bool(getattr(self, 'use_ultrasonic_safety', True)):
+            return
         self.get_logger().warn(f'🚨 Arduino: {line}')
         try:
             if ',' not in line:

@@ -1,0 +1,18 @@
+{
+  "rows": 11,
+  "duration_s": 20.1,
+  "total_distance_m": 0.8959337180041695,
+  "start_x_m": 0.0,
+  "start_y_m": 0.0,
+  "end_x_m": 0.4003,
+  "end_y_m": 0.341,
+  "max_segment_speed_mps": 0.5585055953166469,
+  "mean_segment_speed_mps": 0.10894021249300687,
+  "speed_spike_threshold_mps": 0.8,
+  "speed_spike_count": 0,
+  "end_stable_x_m": -0.0415,
+  "end_stable_y_m": -0.0885,
+  "end_jump_flag": 1,
+  "end_jump_distance_m": 0.6710670681832033,
+  "end_jump_dt_s": 1.5600000000000023
+}

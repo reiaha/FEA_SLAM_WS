@@ -58,6 +58,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.declare_parameter('safety_stop_clear_confirm_count', 2)
         self.declare_parameter('safety_stop_front_latch_time', 0.8)
         self.declare_parameter('enable_safety_override', True)
+        self.declare_parameter('use_ultrasonic_safety', True)
         self.declare_parameter('ultrasonic_frame', 'base_footprint')
         self.declare_parameter('ultrasonic_min_range', 0.02)
         self.declare_parameter('ultrasonic_max_range', 0.50)
@@ -190,6 +191,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.safety_stop_clear_confirm_count = int(self.get_parameter('safety_stop_clear_confirm_count').value)
         self.safety_stop_front_latch_time = float(self.get_parameter('safety_stop_front_latch_time').value)
         self.enable_safety_override = self.get_parameter('enable_safety_override').value
+        self.use_ultrasonic_safety = bool(self.get_parameter('use_ultrasonic_safety').value)
         self.ultrasonic_frame = self.get_parameter('ultrasonic_frame').value
         self.ultrasonic_min_range = float(self.get_parameter('ultrasonic_min_range').value)
         self.ultrasonic_max_range = float(self.get_parameter('ultrasonic_max_range').value)
@@ -228,6 +230,11 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.force_backward_on_zero_cmd = bool(self.get_parameter('force_backward_on_zero_cmd').value)
         self.allow_backward_when_rear_blocked = bool(self.get_parameter('allow_backward_when_rear_blocked').value)
         self.require_nav2_active = bool(self.get_parameter('require_nav2_active').value)
+
+        if self.use_ultrasonic_safety:
+            self.get_logger().info('🛡️ Ultrasonic safety is ENABLED (SAFETY_STOP active)')
+        else:
+            self.get_logger().info('🛰️ Ultrasonic safety is DISABLED (LiDAR/scan safety only)')
         self.require_active_goal = bool(self.get_parameter('require_active_goal').value)
         self.prefer_nav_cmd_with_active_goal = bool(self.get_parameter('prefer_nav_cmd_with_active_goal').value)
         self.nav2_state_check_interval = float(self.get_parameter('nav2_state_check_interval').value)

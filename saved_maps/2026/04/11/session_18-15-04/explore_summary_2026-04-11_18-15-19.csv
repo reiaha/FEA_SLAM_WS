@@ -1,0 +1,2 @@
+status,start_datetime,completion_datetime,elapsed_s,coverage_pct,goals_reached,path_points,nav_goals,frontier_points,final_map_x_m,final_map_y_m,final_odom_x_m,final_odom_y_m,final_room_x_m,final_room_y_m
+interrupted,2026-04-11 18:15:19,2026-04-11 18:17:54,155.2,83.58,1,206,9,731,,,1.9515,0.3711,,
