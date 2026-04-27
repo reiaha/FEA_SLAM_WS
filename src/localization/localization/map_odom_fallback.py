@@ -75,7 +75,7 @@ class MapOdomFallback(Node):
             self.last_slam_tf_time = now
             self.saw_slam_tf_once = True
             if self.fallback_active:
-                self.get_logger().info("✅ map->odom from SLAM detected; disabling fallback TF")
+                self.get_logger().info("map->odom from SLAM detected; disabling fallback TF")
                 self.fallback_active = False
             return
 

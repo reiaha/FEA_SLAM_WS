@@ -55,7 +55,7 @@ class ExplorationPersistenceMixin:
                         continue
 
             if not rows:
-                self.get_logger().warn('⚠️ Path diagnostics skipped: no valid path rows')
+                self.get_logger().warn('️ Path diagnostics skipped: no valid path rows')
                 return
 
             times = [r[0] for r in rows]
@@ -420,7 +420,7 @@ class ExplorationPersistenceMixin:
             f"elapsed {self.completion_elapsed_s:.1f}s | "
             f"completed at {self.completion_datetime.strftime('%Y-%m-%d %H:%M:%S')}"
         )
-        self.get_logger().info("✅ EXPLORATION COMPLETE - Saving map and outputs...")
+        self.get_logger().info("EXPLORATION COMPLETE - Saving map and outputs...")
         self._flush_csv_data()
         self._archive_exploration_outputs()
         self._save_and_shutdown()
@@ -439,7 +439,7 @@ class ExplorationPersistenceMixin:
             stop = Twist()
             self.cmd_vel_pub.publish(stop)
             self.cmd_vel_nav_pub.publish(stop)
-            self.get_logger().info("🛑 Auto-shutdown: map saved, terminating all nodes.")
+            self.get_logger().info("Auto-shutdown: map saved, terminating all nodes.")
             ppid = os.getppid()
             try:
                 pgid = os.getpgid(ppid)
@@ -462,7 +462,7 @@ class ExplorationPersistenceMixin:
 
     def _save_mapped_area_series(self):
         if not self.mapped_area_series:
-            self.get_logger().warn('⚠️ No mapped area data to save')
+            self.get_logger().warn('️ No mapped area data to save')
             return
         os.makedirs(self.map_save_dir, exist_ok=True)
         out_path = os.path.join(self.map_save_dir, self.mapped_area_file)
@@ -564,7 +564,7 @@ class ExplorationPersistenceMixin:
 
     def _save_robot_path_series(self):
         if not self.robot_path_series:
-            self.get_logger().warn('⚠️ No robot path data to save')
+            self.get_logger().warn('️ No robot path data to save')
             return
         os.makedirs(self.map_save_dir, exist_ok=True)
         path_file = getattr(self, 'robot_path_file', 'auto_explore_path.csv')
@@ -875,7 +875,7 @@ class ExplorationPersistenceMixin:
 
     def _save_nav_goals_series(self):
         if not self.nav_goals_series:
-            self.get_logger().warn('⚠️ No nav goal data to save')
+            self.get_logger().warn('️ No nav goal data to save')
             return
         os.makedirs(self.map_save_dir, exist_ok=True)
         out_path = os.path.join(self.map_save_dir, getattr(self, 'nav_goals_file', 'auto_explore_nav_goals.csv'))
@@ -891,7 +891,7 @@ class ExplorationPersistenceMixin:
 
     def _save_frontier_history_series(self):
         if not self.frontier_history_series:
-            self.get_logger().warn('⚠️ No frontier history data to save')
+            self.get_logger().warn('️ No frontier history data to save')
             return
         os.makedirs(self.map_save_dir, exist_ok=True)
         out_path = os.path.join(self.map_save_dir, getattr(self, 'frontier_history_file', 'auto_explore_frontiers.csv'))
@@ -967,7 +967,7 @@ class ExplorationPersistenceMixin:
 
         slam_map = getattr(self, 'last_slam_map', None)
         if slam_map is None:
-            self.get_logger().warn('⚠️ No map data received yet; skipping save')
+            self.get_logger().warn('️ No map data received yet; skipping save')
             return
 
         def _on_success(result):
@@ -998,9 +998,9 @@ class ExplorationPersistenceMixin:
         try:
             result = future.result()
             if result is not None and result.result:
-                self.get_logger().info('✅ Map saved successfully')
+                self.get_logger().info('Map saved successfully')
             else:
-                self.get_logger().warn('⚠️ Map save failed')
+                self.get_logger().warn('️ Map save failed')
         except Exception as e:
             self.get_logger().error(f'❌ Map save error: {e}')
 

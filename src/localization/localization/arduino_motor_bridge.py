@@ -232,9 +232,9 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.require_nav2_active = bool(self.get_parameter('require_nav2_active').value)
 
         if self.use_ultrasonic_safety:
-            self.get_logger().info('🛡️ Ultrasonic safety is ENABLED (SAFETY_STOP active)')
+            self.get_logger().info('️ Ultrasonic safety is ENABLED (SAFETY_STOP active)')
         else:
-            self.get_logger().info('🛰️ Ultrasonic safety is DISABLED (LiDAR/scan safety only)')
+            self.get_logger().info('️ Ultrasonic safety is DISABLED (LiDAR/scan safety only)')
         self.require_active_goal = bool(self.get_parameter('require_active_goal').value)
         self.prefer_nav_cmd_with_active_goal = bool(self.get_parameter('prefer_nav_cmd_with_active_goal').value)
         self.nav2_state_check_interval = float(self.get_parameter('nav2_state_check_interval').value)
@@ -318,7 +318,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
             self.create_timer(check_interval, self._check_nav2_state)
             self.get_logger().info(f"🧭 Nav2 state checker enabled (interval: {check_interval}s)")
         else:
-            self.get_logger().info("🧭 Nav2 state checking disabled")
+            self.get_logger().info("Nav2 state checking disabled")
 
         self.ser = None
         if serial_port.startswith('/dev/ttyACM'):
@@ -347,7 +347,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
         self.serial_disabled = False
         if self.ser is None:
             self.serial_disabled = True
-            self.get_logger().error('❌ Failed to connect to Arduino - running without serial (odom only)')
+            self.get_logger().error('Failed to connect to Arduino - running without serial (odom only)')
         else:
             self.get_logger().info(f'✅ Serial port open: {self.ser.port}, baudrate: {self.ser.baudrate}')
 
@@ -356,12 +356,12 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
                 bytes_written = self.ser.write(b'START\n')
                 self.get_logger().info(f'📤 Sent START command: {bytes_written} bytes')
                 time.sleep(0.1)
-                self.get_logger().info('✅ Motors ENABLED')
+                self.get_logger().info('Motors ENABLED')
 
                 bytes_written = self.ser.write(b'AUTO:OFF\n')
                 self.get_logger().info(f'📤 Sent AUTO:OFF command: {bytes_written} bytes')
                 time.sleep(0.1)
-                self.get_logger().info('✅ Arduino local avoidance DISABLED')
+                self.get_logger().info('Arduino local avoidance DISABLED')
             except Exception as e:
                 self.get_logger().error(f'Failed to initialize Arduino: {e}')
 
@@ -413,7 +413,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
             self.last_cmd_angular = 0.0
             self.last_time = self.get_clock().now()
             self.create_timer(1.0 / max(1.0, self.odom_rate), self._publish_odom)
-            self.get_logger().info('✅ Odometry publisher initialized')
+            self.get_logger().info('Odometry publisher initialized')
 
         self.serial_reading = True
         self.serial_thread = threading.Thread(target=self._serial_reader, daemon=True)
@@ -484,7 +484,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
 
         self.create_timer(0.05, self._safety_override_loop)
 
-        self.get_logger().info('🚀 Arduino Motor Bridge initialized')
+        self.get_logger().info('Arduino Motor Bridge initialized')
 
         atexit.register(self._shutdown_motors)
 
@@ -563,7 +563,7 @@ class ArduinoMotorBridge(ArduinoMotorBridgeRuntimeMixin, Node):
                 now = time.time()
                 if now - self.last_goal_block_log_time >= self.goal_block_log_interval:
                     self.last_goal_block_log_time = now
-                    self.get_logger().warn('🧭 Active Nav2 goal: suppressing /cmd_vel to keep motor-goal sync')
+                    self.get_logger().warn('Active Nav2 goal: suppressing /cmd_vel to keep motor-goal sync')
                 return
         self._handle_cmd_vel(msg, source='cmd_vel')
 

@@ -15,19 +15,16 @@
 
 Adafruit_MPU6050 mpu;
 
-// Calibrated offsets
 float gx_offset = -2.8;
 float gy_offset = -1.4;
-float gz_offset = 0.96;  // recalibrated: raw bias was -0.96 deg/s → offset +0.96 nulls it (measured 2026-03-10)
+float gz_offset = 0.96;
 float ax_offset = 0.0;
 float ay_offset = 0.0;
 float az_offset = 0.0;
 
-// Ultrasonic Pins
 const int TRIG_PIN = A0;
 const int ECHO_PIN = A1;
 
-// Motor Control Pins
 const int MOTOR_A_IN1 = 5;   
 const int MOTOR_A_IN2 = 4;  
 const int MOTOR_A_PWM = 6;
@@ -36,23 +33,18 @@ const int MOTOR_B_IN2 = 8;
 const int MOTOR_B_PWM = 11; 
 const int MOTOR_STBY = 3;
 
-// Motor speed variables
 int motorA_speed = 0;
 int motorB_speed = 0;
 
-// Motors enabled by default (Python sends START for confirmation)
 bool motors_enabled = true;
 
-// Safety stop state (emergency only)
 bool safety_stop_active = false;
 int safety_hit_streak = 0;
 int safety_clear_streak = 0;
 
-// Serial buffer
 String inputBuffer = "";
 const char COMMAND_DELIMITER = '\n';
 
-// IMU status
 bool imu_initialized = false;
 
 void setup() {
@@ -72,20 +64,17 @@ void setup() {
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
 
-  // Timer2 (pin 11 = MOTOR_B_PWM): fast PWM, prescaler=1 → 62.5kHz
   TCCR2B = (TCCR2B & 0b11111000) | 0x01;
 
   stopMotors();
 
-  // Initialize I2C and MPU6050
-  Wire.begin();  // Explicit init: SDA=A4, SCL=A5 on Uno
-  delay(100);    // Let I2C bus settle
+  Wire.begin();
+  delay(100);
   initMPU6050();
 
   Serial.println("IMU-Motor-Ultrasonic System Ready");
 }
 
-// Try to initialize MPU6050 — attempts address 0x68 first, then 0x69 (AD0 high)
 void initMPU6050() {
   imu_initialized = false;
   Serial.print("Initializing MPU6050...");
@@ -111,7 +100,6 @@ void initMPU6050() {
   }
 }
 
-// Scan I2C bus and print found addresses
 void i2cScan() {
   Serial.println("I2C_SCAN:start");
   int found = 0;
@@ -130,20 +118,18 @@ void i2cScan() {
 }
 
 void loop() {
-  // PRIORITY 1: Handle incoming commands (check multiple times)
   for (int i = 0; i < 3; i++) {
     while (Serial.available() > 0) {
       char c = Serial.read();
       if (c == COMMAND_DELIMITER) {
         processCommand(inputBuffer);
         inputBuffer = "";
-      } else if (c != '\r') {  // Ignore carriage return
+      } else if (c != '\r') {
         inputBuffer += c;
       }
     }
   }
 
-  // PRIORITY 2: Read sensors
   float ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
   if (imu_initialized) {
     sensors_event_t a, g, temp;
@@ -158,10 +144,8 @@ void loop() {
     gz = (g.gyro.z * 57.2958) + gz_offset;
   }
 
-  // Ultrasonic
   float distance = readUltrasonic();
 
-  // PRIORITY 3: Safety stop: emergency signal only (do not stop motors here)
   if (distance > 0 && distance < SAFETY_STOP_CM) {
     safety_hit_streak++;
     safety_clear_streak = 0;
@@ -169,7 +153,7 @@ void loop() {
       safety_stop_active = true;
       Serial.print("SAFETY_STOP:1,");
       Serial.println(distance, 2);
-      Serial.flush();  // Ensure safety stop is sent immediately
+      Serial.flush();
     }
   } else {
     safety_clear_streak++;
@@ -181,7 +165,6 @@ void loop() {
     }
   }
 
-  // PRIORITY 4: CSV output for Raspberry Pi
   Serial.print(ax, 4); Serial.print(",");
   Serial.print(ay, 4); Serial.print(",");
   Serial.print(az, 4); Serial.print(",");
@@ -191,9 +174,9 @@ void loop() {
   Serial.print(distance, 2); Serial.print(",");
   Serial.print(motorA_speed); Serial.print(",");
   Serial.println(motorB_speed);
-  Serial.flush();  // Ensure data is sent
+  Serial.flush();
 
-  delay(20); // ~50Hz
+  delay(20);
 }
 
 float readUltrasonic() {
@@ -240,7 +223,6 @@ void setMotorB(int speed) {
 }
 
 void setMotors(int speedA, int speedB) {
-  // Always record the commanded speeds so the CSV feedback is accurate.
   motorA_speed = constrain(speedA, -MAX_SPEED, MAX_SPEED);
   motorB_speed = constrain(speedB, -MAX_SPEED, MAX_SPEED);
 
@@ -293,7 +275,6 @@ void processCommand(String cmd) {
     Serial.flush();
     return;
   }
-  // Check if motors are enabled for motor commands
   if (!motors_enabled && cmd.startsWith("MOTOR:")) {
     Serial.println("IGNORED: Motors disabled (send START)");
     Serial.flush();
@@ -329,7 +310,6 @@ void processCommand(String cmd) {
     Serial.print("ACK:RIGHT:"); Serial.println(TURN_SPEED);
     Serial.flush();
   } else if (cmd == "REINIT_IMU") {
-    // Retry MPU6050 init without power cycling — useful when wiring was loose on boot
     Wire.begin();
     delay(100);
     initMPU6050();
@@ -337,12 +317,9 @@ void processCommand(String cmd) {
     Serial.println(imu_initialized ? "OK" : "FAILED");
     Serial.flush();
   } else if (cmd == "I2C_SCAN") {
-    // Scan I2C bus and report device addresses — helps diagnose MPU6050 wiring
     i2cScan();
     Serial.flush();
   } else if (cmd.startsWith("AUTO:")) {
-    // AUTO:ON / AUTO:OFF — sent by ROS bridge to enable/disable onboard avoidance.
-    // This firmware delegates all avoidance to ROS; just acknowledge.
     Serial.print("ACK:"); Serial.println(cmd);
     Serial.flush();
   }

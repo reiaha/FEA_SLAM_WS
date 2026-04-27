@@ -304,19 +304,32 @@ post_launch_healthcheck() {
 # Run health check in background so launch remains foreground and interruptible
 
 SMALL_TEST_MODE="${SMALL_TEST_MODE:-false}"
-echo "[MODE] small_test_mode=${SMALL_TEST_MODE}"
 
-# ENV_MODE: set to 'dynamic' for environments with chairs/containers (slower speed, wider safety margins)
-#   Usage: ENV_MODE=dynamic ./START_ROBOT.sh
-#   Default: static (open room, normal speed)
+STARTUP_DISPLAY_MODE="${STARTUP_DISPLAY_MODE:-compact}"
+if [[ "$STARTUP_DISPLAY_MODE" != "compact" && "$STARTUP_DISPLAY_MODE" != "verbose" ]]; then
+	echo "[ERROR] STARTUP_DISPLAY_MODE must be 'compact' or 'verbose' (got: '$STARTUP_DISPLAY_MODE')"
+	exit 1
+fi
+
+log_startup_mode() {
+	if [[ "$STARTUP_DISPLAY_MODE" == "verbose" ]]; then
+		echo "$1"
+	fi
+}
+
+if [[ "$STARTUP_DISPLAY_MODE" == "compact" ]]; then
+	echo "[STARTUP] small_test=${SMALL_TEST_MODE} | display=${STARTUP_DISPLAY_MODE}"
+else
+	echo "[MODE] small_test_mode=${SMALL_TEST_MODE}"
+fi
+
 ENV_MODE="${ENV_MODE:-static}"
 if [[ "$ENV_MODE" != "static" && "$ENV_MODE" != "dynamic" ]]; then
         echo "[ERROR] ENV_MODE must be 'static' or 'dynamic' (got: '$ENV_MODE')"
         exit 1
 fi
-echo "[MODE] env=${ENV_MODE}"
+log_startup_mode "[MODE] env=${ENV_MODE}"
 
-# Single startup profile: autonomous exploration stack enabled.
 USE_EXPLORATION="true"
 USE_NAV2="true"
 DEFAULT_RVIZ_CONFIG="/home/pi/FEA_SLAM_WS/src/fea_slam/rviz/robot_autonomous_lite.rviz"
@@ -327,8 +340,6 @@ else
 fi
 USE_SLAM="${USE_SLAM:-true}"
 
-# In SLAM mode, do not auto-load a previously saved map.
-# In localization mode (USE_SLAM=false), load latest saved map by default.
 if [[ -n "${MAP_YAML:-}" ]]; then
 	MAP_FILE="${MAP_YAML}"
 elif [[ "${USE_SLAM}" == "true" ]]; then
@@ -342,16 +353,21 @@ else
 	fi
 fi
 
-echo "[MODE] exploration=${USE_EXPLORATION}"
-echo "[MODE] nav2=${USE_NAV2}"
-echo "[MODE] slam=${USE_SLAM}"
-echo "[MODE] map=${MAP_FILE}"
-echo "[MODE] rviz_config=${RVIZ_CONFIG}"
+if [[ "$STARTUP_DISPLAY_MODE" == "compact" ]]; then
+	echo "[MODE] exploration=${USE_EXPLORATION} nav2=${USE_NAV2} slam=${USE_SLAM}"
+	echo "[MODE] map=${MAP_FILE}"
+	echo "[MODE] rviz=${RVIZ_CONFIG}"
+else
+	echo "[MODE] exploration=${USE_EXPLORATION}"
+	echo "[MODE] nav2=${USE_NAV2}"
+	echo "[MODE] slam=${USE_SLAM}"
+	echo "[MODE] map=${MAP_FILE}"
+	echo "[MODE] rviz_config=${RVIZ_CONFIG}"
+fi
 EXTRA_LAUNCH_ARGS=("$@")
 
-# Fixed ON: always publish script-level initial pose.
 AUTO_INITIAL_POSE="true"
-echo "[MODE] auto_initial_pose=${AUTO_INITIAL_POSE}"
+log_startup_mode "[MODE] auto_initial_pose=${AUTO_INITIAL_POSE}"
 
 SYSTEM_READY=0
 READY_FLAG_FILE="/tmp/fea_slam_ready_$$"

@@ -422,14 +422,14 @@ class ExplorationExecutionMixin:
         # Clear BOTH costmaps immediately (local + global)
         try:
             self.clear_local_costmap_client.call_async(ClearEntireCostmap.Request())
-            self.get_logger().warn("🧹 LOCAL costmap cleared (lethal escape)")
+            self.get_logger().warn("LOCAL costmap cleared (lethal escape)")
         except Exception as e:
             self.get_logger().warn(f"⚠️ Local costmap clear failed: {e}")
         
         if self.clear_global_costmap_client.service_is_ready():
             try:
                 self.clear_global_costmap_client.call_async(ClearEntireCostmap.Request())
-                self.get_logger().warn("🧹 GLOBAL costmap cleared (lethal escape)")
+                self.get_logger().warn("GLOBAL costmap cleared (lethal escape)")
             except Exception as e:
                 self.get_logger().warn(f"⚠️ Global costmap clear in lethal escape failed: {e}")
         
@@ -503,10 +503,10 @@ class ExplorationExecutionMixin:
         self.get_logger().error(f"🚨 OBSTACLE at {self.obstacle_distance_m:.3f}m - BACKING UP + SCANNING!")
         
         if self.goal_handle is not None:
-            self.get_logger().error("🛑 Cancelling Nav2 goal")
+            self.get_logger().error("Cancelling Nav2 goal")
             try:
                 cancel_future = self.goal_handle.cancel_goal_async()
-                cancel_future.add_done_callback(lambda f: self.get_logger().info("🛑 Nav2 goal cancel requested"))
+                cancel_future.add_done_callback(lambda f: self.get_logger().info("Nav2 goal cancel requested"))
             except Exception as e:
                 self.get_logger().warn(f"⚠️ Could not cancel goal: {e}")
             self.goal_handle = None
@@ -557,7 +557,7 @@ class ExplorationExecutionMixin:
             stop_msg = Twist()
             self.cmd_vel_pub.publish(stop_msg)
             self.scan_in_progress = False
-            self.get_logger().info("✅ Backward scan complete")
+            self.get_logger().info("Backward scan complete")
             return False                 
         
         if self.front_obstacle_detected and self.obstacle_distance_m <= self.front_emergency_rotate_distance:
@@ -626,7 +626,7 @@ class ExplorationExecutionMixin:
         if self.strict_obstacle_handling or not self.nav2_handles_obstacles:
             if time.time() < self.ultrasonic_emergency_until:
                 if self.rear_obstacle_detected:
-                    self.get_logger().error("🛑 Rear obstacle detected during backup: stopping and rotating away.")
+                    self.get_logger().error("Rear obstacle detected during backup: stopping and rotating away.")
                     stop_msg = Twist()
                     self.cmd_vel_pub.publish(stop_msg)
                     rotate_msg = Twist()
@@ -680,7 +680,7 @@ class ExplorationExecutionMixin:
             if not self._odom_recent():
                 if now - self.last_odom_stale_log_time > self.odom_stale_log_interval:
                     self.last_odom_stale_log_time = now
-                    self.get_logger().warn("⚠️ No /odom or odom TF updates in the last 1s. Check Arduino bridge and TF.")
+                    self.get_logger().warn("No /odom or odom TF updates in the last 1s. Check Arduino bridge and TF.")
         
         if self.current_phase == Phase.INIT:
             self.update_pose()
@@ -816,7 +816,7 @@ class ExplorationExecutionMixin:
                 self.exploration_start_known_cells = int(getattr(self, 'max_known_cells', 0))
                 self.get_logger().info(
                     f"🏠 Home pose recorded: ({self.home_pose[0]:.2f}, {self.home_pose[1]:.2f})")
-                self.get_logger().info("✅ Startup complete! Starting exploration")
+                self.get_logger().info("Startup complete! Starting exploration")
                 # Immediately pick and send the first frontier goal
                 goal_info = self.pick_best_frontier() if hasattr(self, 'pick_best_frontier') else None
                 if goal_info is not None:
@@ -849,7 +849,7 @@ class ExplorationExecutionMixin:
             if (time.time() - self.last_scan_time) > self.lidar_stale_timeout:
                 if (time.time() - self.last_scan_stale_log_time) >= self.scan_stale_log_interval:
                     self.last_scan_stale_log_time = time.time()
-                    self.get_logger().warn("⚠️ Scan stale during EXPLORE - pausing until fresh scan arrives")
+                    self.get_logger().warn("Scan stale during EXPLORE - pausing until fresh scan arrives")
                 return
 
             if (self.strict_obstacle_handling or not self.nav2_handles_obstacles) and self.obstacle_detected:
@@ -921,7 +921,7 @@ class ExplorationExecutionMixin:
                 if self.static_stuck_escape_step == 0:
                     # Prevent backup if rear is too close to an obstacle
                     if (self.rear_obstacle_detected and self.last_rear_distance <= self.rear_emergency_distance):
-                        self.get_logger().error("🛑 Rear obstacle too close during stuck escape; skipping backup step.")
+                        self.get_logger().error("Rear obstacle too close during stuck escape; skipping backup step.")
                         self.static_stuck_escape_step = 1
                         self.static_stuck_escape_step_start = now
                         step_elapsed = 0.0
@@ -945,7 +945,7 @@ class ExplorationExecutionMixin:
                         self.static_stuck_start = 0.0
                         self.no_frontier_cycles = 0
                         self.last_goal_time = 0.0                              
-                        self.get_logger().warn("✅ Deep escape complete — resuming exploration")
+                        self.get_logger().warn("Deep escape complete — resuming exploration")
                         return
 
             if now - self.last_explore_check < self.explore_check_interval:
@@ -1071,7 +1071,7 @@ class ExplorationExecutionMixin:
                             try:
                                 cancel_future = self.goal_handle.cancel_goal_async()
                                 cancel_future.add_done_callback(
-                                    lambda f: self.get_logger().info("🛑 Nav2 goal cancel requested (replan)")
+                                    lambda f: self.get_logger().info("Nav2 goal cancel requested (replan)")
                                 )
                                 self.replan_cancel_pending = True
                             except Exception as e:
@@ -1258,7 +1258,7 @@ class ExplorationExecutionMixin:
                         try:
                             if hasattr(self, 'goal_handle') and self.goal_handle is not None:
                                 cancel_future = self.goal_handle.cancel_goal_async()
-                                cancel_future.add_done_callback(lambda f: self.get_logger().info("🛑 Nav2 goal cancel requested"))
+                                cancel_future.add_done_callback(lambda f: self.get_logger().info("Nav2 goal cancel requested"))
                                 self.goal_handle = None
                                 self.goal_in_progress = False
                         except Exception as e:
@@ -1300,7 +1300,7 @@ class ExplorationExecutionMixin:
                         try:
                             if hasattr(self, 'goal_handle') and self.goal_handle is not None:
                                 cancel_future = self.goal_handle.cancel_goal_async()
-                                cancel_future.add_done_callback(lambda f: self.get_logger().info("🛑 Nav2 goal cancel requested"))
+                                cancel_future.add_done_callback(lambda f: self.get_logger().info("Nav2 goal cancel requested"))
                                 self.goal_handle = None
                                 self.goal_in_progress = False
                         except Exception as e:
@@ -1331,7 +1331,7 @@ class ExplorationExecutionMixin:
                         try:
                             if hasattr(self, 'goal_handle') and self.goal_handle is not None:
                                 cancel_future = self.goal_handle.cancel_goal_async()
-                                cancel_future.add_done_callback(lambda f: self.get_logger().info("🛑 Nav2 goal cancel requested"))
+                                cancel_future.add_done_callback(lambda f: self.get_logger().info("Nav2 goal cancel requested"))
                                 self.goal_handle = None
                                 self.goal_in_progress = False
                         except Exception as e:
@@ -1436,7 +1436,7 @@ class ExplorationExecutionMixin:
                 
                 clear_for_hold = (time.time() - self.last_obstacle_time) >= self.obstacle_hold_time
                 if not self.obstacle_detected and clear_for_hold:
-                    self.get_logger().info("✅ Path clear after rescan! Looking for new frontier...")
+                    self.get_logger().info("Path clear after rescan! Looking for new frontier...")
                     
                     new_frontier = self.pick_best_frontier()
                     if new_frontier:
@@ -1451,10 +1451,10 @@ class ExplorationExecutionMixin:
                         self.last_goal_time = 0.0
                         self.send_goal_to_nav2(gx, gy, new_frontier.get('costmap_filtered'), frontier_xy=(fx, fy))
                     else:
-                        self.get_logger().warn("⚠️ Rescan clear but no frontier selected yet; returning to EXPLORE")
+                        self.get_logger().warn("Rescan clear but no frontier selected yet; returning to EXPLORE")
                         self.current_phase = Phase.EXPLORE
                 elif elapsed > 8.0:
-                    self.get_logger().error("⚠️ RESCAN: Path STILL blocked after 8s - retrying backup")
+                    self.get_logger().error("RESCAN: Path STILL blocked after 8s - retrying backup")
                     self.current_phase = Phase.OBSTACLE
                     self.rescan_done = False
         
@@ -1472,7 +1472,7 @@ class ExplorationExecutionMixin:
                 stop_msg = Twist()
                 self.cmd_vel_pub.publish(stop_msg)
                 
-                self.get_logger().info("✅ RECOVERY complete - resetting failure counter and picking new frontier")
+                self.get_logger().info("RECOVERY complete - resetting failure counter and picking new frontier")
                 self.last_costmap_clear_time = 0.0                   
                 self._clear_costmaps('post_recovery', clear_global=True)
                 self._lethal_fail_count = 0

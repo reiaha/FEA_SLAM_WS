@@ -26,28 +26,8 @@ from .exploration_execution_mixin import ExplorationExecutionMixin
 from .exploration_persistence_mixin import ExplorationPersistenceMixin
 from .phase_enum import Phase
 
-# --- Graceful shutdown handler for guaranteed completion logging ---
 import signal
 import sys
-def _graceful_shutdown_handler(signalnum, frame):
-    try:
-        node = ExplorationCoordinator._active_instance if hasattr(ExplorationCoordinator, '_active_instance') else None
-        if node is not None and hasattr(node, '_on_exploration_complete'):
-            node.get_logger().warn('🛑 Signal received: running graceful shutdown handler.')
-            if hasattr(node, '_completion_cells_known') and not node._completion_cells_known():
-                unknown_cells = int(getattr(node, 'last_unknown_cells', 0))
-                max_unknown = max(0, int(getattr(node, 'completion_max_unknown_cells', 0)))
-                node.get_logger().warn(
-                    f'⛔ Graceful completion skipped: unknown cells remain ({unknown_cells}>{max_unknown}).'
-                )
-            else:
-                node._on_exploration_complete()
-    except Exception as e:
-        print(f"[GracefulShutdown] Exception: {e}")
-    sys.exit(0)
-signal.signal(signal.SIGINT, _graceful_shutdown_handler)
-signal.signal(signal.SIGTERM, _graceful_shutdown_handler)
-
 
 class ExplorationCoordinator(
     ExplorationSensingMixin,
@@ -56,16 +36,13 @@ class ExplorationCoordinator(
     ExplorationPersistenceMixin,
     Node,
 ):
-    # Track the active instance for signal handler
     _active_instance = None
 
     def _declare_params(self, defaults):
-        """Declare all node parameters from a single defaults map."""
         for name, default in defaults.items():
             self.declare_parameter(name, default)
 
     def _read_param(self, name, default):
-        """Read one parameter and cast to the type of its default value."""
         value = self.get_parameter(name).value
         if isinstance(default, bool):
             return bool(value)
@@ -80,13 +57,13 @@ class ExplorationCoordinator(
             now = time.time()
             if (now - self.last_initial_pose_ignore_log_time) >= 2.0:
                 self.last_initial_pose_ignore_log_time = now
-                self.get_logger().warn("🔒 Ignoring /initialpose: initial pose is locked after startup")
+                self.get_logger().warn("Ignoring /initialpose: initial pose is locked after startup")
             return
         if self.current_phase != Phase.INIT and not self.allow_initial_pose_updates_after_init:
             now = time.time()
             if (now - self.last_initial_pose_ignore_log_time) >= 2.0:
                 self.last_initial_pose_ignore_log_time = now
-                self.get_logger().warn("🔒 Ignoring /initialpose outside INIT phase")
+                self.get_logger().warn("Ignoring /initialpose outside INIT phase")
             return
 
         # Seed path origin from the accepted initial pose so relative coordinates
@@ -115,7 +92,7 @@ class ExplorationCoordinator(
         # Disable lethal escape after initial pose
         if hasattr(self, 'disable_lethal_escape'):
             self.disable_lethal_escape()
-        self.get_logger().info("✅ Initial pose received. Exploration can begin.")
+        self.get_logger().info("Initial pose received. Exploration can begin.")
 
     def _publish_room_frame_offset(self):
         """Publish a map->room frame with the same orientation as the real world."""
@@ -134,7 +111,7 @@ class ExplorationCoordinator(
         transform.transform.rotation.w = 1.0
         
         self.tf_static_broadcaster.sendTransform(transform)
-        self.get_logger().info("📍 Published real-world aligned map->room TF (no rotation)")
+        self.get_logger().info("Published real-world aligned map->room TF (no rotation)")
 
     def __init__(self):
         super().__init__('exploration_coordinator_v2')
@@ -653,7 +630,7 @@ class ExplorationCoordinator(
             f"🧭 Costmap subscriptions: global={self.costmap_topic}, local={self.local_costmap_topic}, "
             f"global_raw={self.costmap_raw_topic}, local_raw={self.local_costmap_raw_topic}"
         )
-        self.get_logger().info("✅ SUBSCRIBED to /safety_stop (Arduino safety stop signals)")
+        self.get_logger().info("SUBSCRIBED to /safety_stop (Arduino safety stop signals)")
         
         self.rear_obstacle_detected = False
         self.last_rear_obstacle_time = 0.0
@@ -662,12 +639,12 @@ class ExplorationCoordinator(
         
         self.create_timer(0.10, self.main_loop)                                                     
         
-        self.get_logger().info("🚀 Exploration Coordinator Started (Simplified)")
+        self.get_logger().info("Exploration Coordinator Started (Simplified)")
 
     def destroy_node(self):
         """Save outputs on normal exit, but keep signal interrupt as shutdown-only."""
         if getattr(self, 'shutdown_by_signal', False):
-            self.get_logger().info('🛑 Signal shutdown requested: skipping map/CSV save on exit')
+            self.get_logger().info('Signal shutdown requested: skipping map/CSV save on exit')
             return super().destroy_node()
         try:
             self._flush_csv_data()

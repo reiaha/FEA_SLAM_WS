@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-LiDAR-Based Explorer Node
-Uses 360-degree LiDAR scans for obstacle detection and 180-degree aware navigation.
-Provides autonomous exploration to bootstrap SLAM mapping.
-"""
 
 import rclpy
 from rclpy.node import Node
@@ -62,13 +57,8 @@ class LidarExplorer(Node):
         self.control_timer = self.create_timer(0.1, self.control_loop)        
         
         self.nav2_check_timer = self.create_timer(2.0, self.check_nav2_ready)
-        
-        self.get_logger().info('🤖 LiDAR Explorer started - 180° obstacle detection active')
-        self.get_logger().info(f'   Scan topic: {self.scan_topic}')
-        self.get_logger().info(f'   Obstacle threshold: {self.obstacle_dist}m, Safe distance: {self.safe_dist}m')
     
     def scan_callback(self, msg: LaserScan):
-        """Analyze 180-degree LiDAR scan for obstacles"""
         if not msg.ranges:
             return
         
@@ -92,7 +82,6 @@ class LidarExplorer(Node):
         self.right_distance = min(right_ranges) if right_ranges else float('inf')
     
     def get_safe_ranges(self, ranges, start, end):
-        """Get valid range values (filter out inf and 0)"""
         safe = []
         if start <= end:
             for i in range(start, end):
@@ -108,31 +97,24 @@ class LidarExplorer(Node):
         return safe
     
     def map_callback(self, msg: OccupancyGrid):
-        """Check if map has been received (SLAM is working)"""
         if not self.map_received:
             data_array = list(msg.data)
             known_cells = sum(1 for cell in data_array if cell >= 0 and cell <= 100)
             
-            if known_cells > 100:                                                  
+            if known_cells > 100:
                 self.map_received = True
-                self.get_logger().info('✅ Map received! SLAM is working. Continuing exploration...')
+                self.get_logger().info('Map received')
     
     def control_loop(self):
-        """Main control loop for LiDAR-based 180° exploration"""
         if not self.nav2_ready:
             elapsed = (self.get_clock().now() - self.init_time).nanoseconds / 1e9
             if elapsed < self.nav2_init_delay:
-                remaining = self.nav2_init_delay - elapsed
-                if int(elapsed) % 3 == 0 and remaining > 1:
-                    self.get_logger().info(f'⏳ LiDAR Explorer waiting for Nav2... ({remaining:.0f}s remaining)')
                 return
             else:
-                self.get_logger().info('✅ Nav2 is operational. Starting LiDAR exploration...')
                 if self.nav_client.wait_for_server(timeout_sec=2.0):
                     self.nav2_ready = True
                     self.start_time = self.get_clock().now()
                 else:
-                    self.get_logger().warn('⚠️  Nav2 server not available yet, retrying...')
                     return
         
         obstacle_msg = Bool()
@@ -148,20 +130,17 @@ class LidarExplorer(Node):
         
         elapsed = (self.get_clock().now() - self.start_time).nanoseconds / 1e9
         if elapsed > self.timeout:
-            self.get_logger().info('⏱️ Exploration timeout reached. Stopping LiDAR explorer.')
+            self.get_logger().info('Exploration timeout reached')
             self.stop_robot()
             self.exploring = False
             return
-        
         
         cmd = Twist()
         
         if self.front_distance < self.obstacle_dist:
             if self.left_distance > self.right_distance:
-                self.get_logger().info(f'🚧 Front blocked ({self.front_distance:.2f}m) - turning LEFT')
                 cmd.angular.z = self.turn_speed
             else:
-                self.get_logger().info(f'🚧 Front blocked ({self.front_distance:.2f}m) - turning RIGHT')
                 cmd.angular.z = -self.turn_speed
         elif self.front_distance < self.safe_dist:
             speed_factor = (self.front_distance - self.obstacle_dist) / (self.safe_dist - self.obstacle_dist)
@@ -170,31 +149,26 @@ class LidarExplorer(Node):
             cmd.linear.x = self.forward_speed
             
             if self.left_distance < self.safe_dist and self.right_distance > self.safe_dist:
-                cmd.angular.z = -0.2                     
+                cmd.angular.z = -0.2
             elif self.right_distance < self.safe_dist and self.left_distance > self.safe_dist:
-                cmd.angular.z = 0.2                     
+                cmd.angular.z = 0.2
         
         self.cmd_vel_pub.publish(cmd)
     
     def stop_robot(self):
-        """Send stop command"""
         cmd = Twist()
         cmd.linear.x = 0.0
         cmd.angular.z = 0.0
         self.cmd_vel_pub.publish(cmd)
-        self.get_logger().info('🛑 Robot stopped')
     
     def check_nav2_ready(self):
-        """Check if Nav2 navigate_to_pose action server is ready"""
         if self.nav2_ready:
-            return                        
+            return
         
         if self.nav_client.server_is_ready():
             self.nav2_ready = True
-            self.exploring = False                           
+            self.exploring = False
             self.stop_robot()
-            self.get_logger().info('✅ Nav2 /navigate_to_pose is READY! Handing off cmd_vel control to frontier exploration.')
-            self.get_logger().info('   lidar_explorer will continue monitoring obstacles in background.')
         else:
             pass
 

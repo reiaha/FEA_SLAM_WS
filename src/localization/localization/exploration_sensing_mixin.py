@@ -157,7 +157,7 @@ class ExplorationSensingMixin:
             log_interval = max(0.2, float(getattr(self, 'invalid_frontier_log_interval', 2.0)))
             if (now - float(getattr(self, 'last_invalid_frontier_log_time', 0.0))) >= log_interval:
                 self.last_invalid_frontier_log_time = now
-                self.get_logger().warn(f"🚫 Dropped {invalid_count} invalid frontier marker(s)")
+                self.get_logger().warn(f"Dropped {invalid_count} invalid frontier marker(s)")
 
         new_signature = self._compute_frontier_signature(self.current_frontiers)
         if new_signature != self.frontier_signature:
@@ -267,7 +267,7 @@ class ExplorationSensingMixin:
                 return
             if self.current_phase == Phase.OBSTACLE:
                 return
-            self.get_logger().info(f"✅ Obstacle cleared (SAFETY_STOP:0)")
+            self.get_logger().info(f"Obstacle cleared")
             self.obstacle_detected = False
             return
         
@@ -277,7 +277,7 @@ class ExplorationSensingMixin:
             return
         self.obstacle_distance_m = distance
         self.last_obstacle_time = now
-        self.get_logger().error(f"🚨🚨🚨 SAFETY_STOP TRIGGERED! Obstacle at {distance:.3f}m!")
+        self.get_logger().error(f"SAFETY_STOP TRIGGERED: Obstacle at {distance:.3f}m")
         self.obstacle_detected = True
     
     def scan_cb(self, msg: LaserScan):
@@ -418,12 +418,12 @@ class ExplorationSensingMixin:
 
     def costmap_cb(self, msg: OccupancyGrid):
         if self.costmap is None:
-            self.get_logger().info("✅ Received global costmap (OccupancyGrid)")
+            self.get_logger().info("Received global costmap")
         self.costmap = msg
 
     def local_costmap_cb(self, msg: OccupancyGrid):
         if self.local_costmap is None:
-            self.get_logger().info("✅ Received local costmap (OccupancyGrid)")
+            self.get_logger().info("Received local costmap")
         self.local_costmap = msg
 
     def map_cb(self, msg: OccupancyGrid):
@@ -460,12 +460,12 @@ class ExplorationSensingMixin:
 
     def costmap_raw_cb(self, msg: Costmap):
         if not self.costmap_raw_received:
-            self.get_logger().info("✅ Received global costmap_raw (Costmap)")
+            self.get_logger().info("Received global costmap_raw")
         self.costmap_raw_received = True
 
     def local_costmap_raw_cb(self, msg: Costmap):
         if not self.local_costmap_raw_received:
-            self.get_logger().info("✅ Received local costmap_raw (Costmap)")
+            self.get_logger().info("Received local costmap_raw")
         self.local_costmap_raw_received = True
 
     def _odom_recent(self) -> bool:
@@ -588,7 +588,7 @@ class ExplorationSensingMixin:
                 origin_stale = (now - self.last_pose_change_time) >= 5.0
                 if odom_recent and origin_stale and (now - self.last_origin_warn_time) >= self.origin_warn_interval:
                     self.last_origin_warn_time = now
-                    self.get_logger().warn("⚠️ Robot still at origin (0,0) - odom/TF may not be updating")
+                    self.get_logger().warn("Robot still at origin - odom/TF may not be updating")
         except Exception:
             try:
                 fallback_frame = 'base_link' if self.base_frame != 'base_link' else 'base_footprint'

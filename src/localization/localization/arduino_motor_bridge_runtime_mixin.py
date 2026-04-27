@@ -45,7 +45,6 @@ class ArduinoMotorBridgeRuntimeMixin:
 
         self._motion_state_history.append((now, state))
 
-        # Detect ping-pong between forward and backward in a tight window.
         if state in ('FORWARD', 'BACKWARD'):
             sign = 1 if state == 'FORWARD' else -1
             self._dir_flip_history.append((now, sign))
@@ -547,10 +546,10 @@ class ArduinoMotorBridgeRuntimeMixin:
 
         if self.serial_disabled and not self.odom_fallback_active:
             self.odom_fallback_active = True
-            self.get_logger().warn('⚠️ Using FALLBACK odometry (no serial feedback from Arduino)')
+            self.get_logger().warn('Using FALLBACK odometry (no serial feedback from Arduino)')
         elif not self.serial_disabled and self.odom_fallback_active:
             self.odom_fallback_active = False
-            self.get_logger().info('✅ Serial communication restored')
+            self.get_logger().info('Serial communication restored')
 
         self.last_time = now
     
@@ -610,9 +609,6 @@ class ArduinoMotorBridgeRuntimeMixin:
             self.last_cmd_pwm_right = pwm_right
             self.last_cmd_time = now
 
-            # Reduce repetitive spam: always log command/state transitions,
-            # throttle identical repeats to a configurable interval.
-            # Group by action+source so tiny PWM jitter does not flood logs.
             signature = (str(action), str(source))
             last_sig = getattr(self, 'last_motor_log_signature', None)
             log_interval = float(getattr(self, 'motor_cmd_log_interval', 0.8))
@@ -647,12 +643,14 @@ class ArduinoMotorBridgeRuntimeMixin:
         if (now - self.last_serial_reconnect_time) >= self.serial_reconnect_interval:
             self.last_serial_reconnect_time = now
             if self._open_serial_connection():
-                self.get_logger().warn('🔌 Arduino serial reconnected after startup failure')
+                self.get_logger().warn('Arduino serial reconnected after startup failure')
             elif (now - self.last_serial_error_log_time) >= self.serial_error_log_interval:
                 self.last_serial_error_log_time = now
                 self.get_logger().warn('⏳ Arduino serial not available yet; retrying...')
 
     def _publish_ultrasonic_distance(self, distance_m: float):
+        if not bool(getattr(self, 'use_ultrasonic_safety', True)):
+            return
         msg = Float32()
         msg.data = distance_m
         self.ultrasonic_pub.publish(msg)
@@ -665,7 +663,7 @@ class ArduinoMotorBridgeRuntimeMixin:
         self.safety_stop_clear_hits += 1
         self.safety_stop_obstacle_hits = 0
         if self.safety_stop_clear_hits >= self.safety_stop_clear_confirm_count:
-            self.get_logger().warn('✅ SAFETY_STOP:0 - Obstacle cleared')
+            self.get_logger().warn('SAFETY_STOP:0 - Obstacle cleared')
 
     def _apply_ultrasonic_emergency(self, distance_cm: float, distance_m: float):
         now = time.time()
@@ -752,7 +750,7 @@ class ArduinoMotorBridgeRuntimeMixin:
                 self._imu_zero_streak = 0
                 if self.imu_hardware_dead:
                     self.imu_hardware_dead = False
-                    self.get_logger().info('✅ IMU hardware RECOVERED — switching back to gyro heading.')
+                    self.get_logger().info('IMU hardware RECOVERED — switching back to gyro heading.')
 
             imu_msg = self._Imu()
             imu_msg.header.stamp = self.get_clock().now().to_msg()
@@ -792,12 +790,13 @@ class ArduinoMotorBridgeRuntimeMixin:
         if len(parts) < 7:
             return
 
-        try:
-            distance_raw = float(parts[6])
-            if distance_raw > 0.0:
-                self._publish_ultrasonic_distance(distance_raw / 100.0)
-        except (ValueError, IndexError):
-            pass
+        if bool(getattr(self, 'use_ultrasonic_safety', True)):
+            try:
+                distance_raw = float(parts[6])
+                if distance_raw > 0.0:
+                    self._publish_ultrasonic_distance(distance_raw / 100.0)
+            except (ValueError, IndexError):
+                pass
 
         self._publish_imu_from_parts(parts)
         self._update_motor_feedback_from_parts(parts)
@@ -826,7 +825,7 @@ class ArduinoMotorBridgeRuntimeMixin:
         if (not self._open_serial_connection() and
                 (now - self.last_serial_error_log_time) >= self.serial_error_log_interval):
             self.last_serial_error_log_time = now
-            self.get_logger().error('❌ Serial reconnect failed; will retry')
+            self.get_logger().error('Serial reconnect failed; will retry')
 
     def _osc_escape_step_loop(self):
         """Timer callback (10 Hz) that drives the backup→turn sequence of an oscillation escape."""
@@ -844,7 +843,7 @@ class ArduinoMotorBridgeRuntimeMixin:
                     self._osc_escape_active = False
                     self.cmd_vel_override_until = 0.0
                     self._send_stop(source='osc_done')
-                    self.get_logger().info("✅ Oscillation escape complete (backup only) — resuming normal control")
+                    self.get_logger().info("Oscillation escape complete (backup only) — resuming normal control")
                     return
                 self._osc_escape_step       = 1
                 self._osc_escape_step_start = now
@@ -856,7 +855,7 @@ class ArduinoMotorBridgeRuntimeMixin:
                 self._osc_escape_active = False
                 self.cmd_vel_override_until = 0.0
                 self._send_stop(source='osc_done')
-                self.get_logger().info("✅ Oscillation escape complete — resuming normal control")
+                self.get_logger().info("Oscillation escape complete — resuming normal control")
 
     def _stuck_recovery_loop(self):
         if self.ser is None:

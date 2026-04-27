@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Frontier Detection Node for FEA-SLAM Robot
-Analyzes occupancy grid map and publishes frontier candidate locations
-"""
 
 import rclpy
 from rclpy.node import Node
@@ -53,10 +49,9 @@ class FrontierDetector(Node):
         self.get_logger().info('Frontier Detector initialized')
     
     def map_callback(self, msg: OccupancyGrid):
-        """Analyze map for frontiers"""
         current_time = time.time()
         if current_time - self.last_frontier_time < 1.0 / self.frontier_throttle_rate:
-            return                                 
+            return
         self.last_frontier_time = current_time
         
         self.map_data = msg
@@ -156,7 +151,7 @@ class FrontierDetector(Node):
         if len(marker_array.markers) > 0:
             self.get_logger().info(f'   First marker at: ({marker_array.markers[0].pose.position.x:.2f}, {marker_array.markers[0].pose.position.y:.2f})')
         else:
-            self.get_logger().warn('⚠️  MarkerArray is EMPTY - no markers to publish!')
+            self.get_logger().warn('MarkerArray is EMPTY - no markers to publish!')
     
     def find_frontiers(self, map_array):
         """Find frontier cells (edge between explored and unexplored)"""

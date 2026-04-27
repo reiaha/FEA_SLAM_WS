@@ -687,7 +687,7 @@ class ExplorationPlanningMixin:
                 self.relaxed_use_costmap_filter
             )
             if best_frontier:
-                self.get_logger().info("⚠️ Relaxed frontier filter enabled for this goal")
+                self.get_logger().info("️ Relaxed frontier filter enabled for this goal")
 
         if (
             best_frontier is None and
@@ -969,14 +969,14 @@ class ExplorationPlanningMixin:
         elif use_costmap_filter and not is_init_phase and (not lethal_logic_enabled):
             if (now - self.last_lethal_cell_warn_time) > 5.0:
                 self.last_lethal_cell_warn_time = now
-                self.get_logger().info("🟡 Lethal-cell blocking is disabled until first goal is reached")
+                self.get_logger().info("Lethal-cell blocking is disabled until first goal is reached")
 
         nav2_server_ready = self.nav_client.wait_for_server(timeout_sec=0.1)
         nav2_services_ready = self._nav2_services_ready()
         nav2_lifecycle_active = self._nav2_active(require_active=self.require_nav2_active, services_ready=nav2_services_ready)
         nav2_ready = nav2_server_ready and (nav2_lifecycle_active if self.require_nav2_active else True)
         if self.require_nav2_active and not nav2_ready:
-            self.get_logger().warn("⚠️ Skipping goal send: Nav2 not active")
+            self.get_logger().warn("️ Skipping goal send: Nav2 not active")
             return False
 
         try:
@@ -999,7 +999,7 @@ class ExplorationPlanningMixin:
         self._nav2_active()
 
         if not self.nav_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("❌ Nav2 server not ready")
+            self.get_logger().error("Nav2 server not ready")
             return False
 
         goal_msg = NavigateToPose.Goal()
@@ -1165,12 +1165,12 @@ class ExplorationPlanningMixin:
         Phase = self.current_phase.__class__
         self.goal_handle = future.result()
         if self.goal_handle.accepted:
-            self.get_logger().info("✅ Goal accepted by Nav2")
+            self.get_logger().info("Goal accepted by Nav2")
             self.nav2_ready = True
             result_future = self.goal_handle.get_result_async()
             result_future.add_done_callback(self.goal_result_cb)
         else:
-            self.get_logger().warn("❌ Goal rejected by Nav2")
+            self.get_logger().warn("Goal rejected by Nav2")
             self.goal_handle = None
             self.goal_in_progress = False
             self.frontiers_dirty = True
@@ -1321,7 +1321,7 @@ class ExplorationPlanningMixin:
             self.get_logger().info(f"📊 Goals reached: {self.goals_reached}/{self.min_goals_for_complete}")
             if self.goals_reached == 1 and hasattr(self, 'enable_lethal_escape'):
                 self.enable_lethal_escape()
-                self.get_logger().info("✅ First goal completed: lethal logic is now enabled")
+                self.get_logger().info("First goal completed: lethal logic is now enabled")
             if self.avoid_revisit:
                 self.visited_goals.append((robot_x, robot_y))
             if self.strict_no_revisit and self.last_goal_target is not None:
@@ -1337,7 +1337,7 @@ class ExplorationPlanningMixin:
             self.get_logger().info(f"📊 Goals reached: {self.goals_reached}/{self.min_goals_for_complete}")
             if self.goals_reached == 1 and hasattr(self, 'enable_lethal_escape'):
                 self.enable_lethal_escape()
-                self.get_logger().info("✅ First goal completed: lethal logic is now enabled")
+                self.get_logger().info("First goal completed: lethal logic is now enabled")
             if self.avoid_revisit:
                 self.visited_goals.append((robot_x, robot_y))
             if self.strict_no_revisit and self.last_goal_target is not None:
@@ -1356,7 +1356,7 @@ class ExplorationPlanningMixin:
             if self.goals_reached >= 1 and hasattr(self, '_maybe_lethal_escape'):
                 escaped = self._maybe_lethal_escape(robot_x, robot_y)
                 if escaped:
-                    self.get_logger().error("⚠️ LETHAL SPACE DETECTED — executing immediate escape sequence")
+                    self.get_logger().error("️ LETHAL SPACE DETECTED — executing immediate escape sequence")
                     return  # Skip normal failure handling, let lethal escape take control
 
             if self.last_goal_target is not None:

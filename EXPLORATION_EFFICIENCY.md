@@ -166,6 +166,11 @@ No safety trade-offs were made.
 3. **Frontier Acceptance**: Verify close/marginal frontiers are now explored (were previously skipped)
 4. **Goal Retry Speed**: Measure time between failed goal and next attempt (target: <3s vs old 10+s)
 5. **Coverage**: Run full exploration and compare mapped area with previous baseline
+6. **LiDAR-Only Obstacle Validation (Panel Demo)**:
+   - Run with ultrasonic disabled: `./START_ROBOT.sh use_ultrasonic:=false`
+   - Place obstacle in front of robot during autonomous motion
+   - Verify robot still detects/avoids obstacle from `/scan` and Nav2 costmap updates
+   - Record evidence (RViz + terminal logs) to show LiDAR-based obstacle handling remains active without ultrasonic input
 
 ---
 
@@ -176,6 +181,8 @@ cd /home/pi/FEA_SLAM_WS
 colcon build --packages-select localization fea_slam --symlink-install
 source install/setup.bash
 ./START_ROBOT.sh
+# For LiDAR-only validation (ultrasonic disabled):
+./START_ROBOT.sh use_ultrasonic:=false
 ```
 
 Build Status: ✅ **Successful** (no errors or warnings)

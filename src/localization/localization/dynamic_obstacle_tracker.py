@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
 
+#!/usr/bin/env python3
 import math
 import numpy as np
 import rclpy
@@ -60,7 +60,6 @@ class KalmanTrack:
 class DynamicObstacleTracker(Node):
     def __init__(self):
         super().__init__('dynamic_obstacle_tracker')
-
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('output_topic', '/dynamic_obstacles')
         self.declare_parameter('frame_id', 'base_footprint')
@@ -75,7 +74,6 @@ class DynamicObstacleTracker(Node):
         self.declare_parameter('process_noise', 0.5)
         self.declare_parameter('meas_noise', 0.2)
         self.declare_parameter('publish_rate', 10.0)
-
         self.scan_topic = self.get_parameter('scan_topic').value
         self.output_topic = self.get_parameter('output_topic').value
         self.frame_id = self.get_parameter('frame_id').value
@@ -100,7 +98,7 @@ class DynamicObstacleTracker(Node):
         period = 1.0 / max(1.0, publish_rate)
         self.create_timer(period, self.publish_predictions)
 
-        self.get_logger().info('✅ Dynamic obstacle tracker started')
+        self.get_logger().info('Dynamic obstacle tracker started')
 
     def scan_cb(self, msg: LaserScan):
         now = self.get_clock().now().nanoseconds / 1e9
