@@ -20,6 +20,66 @@ The objective of this study is to develop a localization framework for autonomou
 2. Integrate a frontier-based exploration algorithm to optimize autonomous area coverage and enhance real-time decision-making in unknown areas.
 3. Evaluate the proposed FEA-SLAM framework in terms of localization accuracy, mapping reliability, and exploration efficiency in static and dynamic environments.
 
+## 2. Proposed Software Architecture
+
+The FEA-SLAM framework is organized into four interdependent layers that together enable fully autonomous navigation and mapping in GPS-denied environments. Each layer has a well-defined responsibility and communicates with adjacent layers through ROS 2 topics, services, and actions.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        Sensor Layer                         │
+│  YDLiDAR (2D scan)  │  IMU  │  Wheel Odometry  │ Ultrasonic │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ /scan, /odom, /imu
+┌──────────────────────────────▼──────────────────────────────┐
+│              Perception and Localization Layer               │
+│  ScanTimestampFix → SLAM Toolbox → robot_localization EKF   │
+│         (map ↔ odom transform,  fused pose estimate)        │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ /map, /tf, /odometry/filtered
+┌──────────────────────────────▼──────────────────────────────┐
+│           Navigation and Exploration Layer                   │
+│  FrontierDetector → ExplorationCoordinator ← Nav2 Stack     │
+│  (frontier goals)     (state machine)      (planner/control)│
+│                                                             │
+│  Phase state machine:                                       │
+│  INIT → EXPLORE → OBSTACLE → RESCAN → RECOVERY → DONE      │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ /cmd_vel
+┌──────────────────────────────▼──────────────────────────────┐
+│                  Motion and Safety Layer                     │
+│  ArduinoMotorBridge  │  LiDAR obstacle gate  │  Ultrasonic  │
+│  (wheel commands)      (emergency stop/backup)  (optional)  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Layer Descriptions
+
+**Sensor Layer** — Provides all raw data entering the system. The YDLiDAR produces 2D laser scans used for both mapping and obstacle detection. IMU readings and wheel encoder odometry supply independent motion estimates that feed the state estimation pipeline.
+
+**Perception and Localization Layer** — A `ScanTimestampFix` node corrects scan header timestamps before they reach SLAM Toolbox, reducing TF timing drop issues. SLAM Toolbox incrementally builds the occupancy grid map and publishes the `map → odom` transform. The `robot_localization` EKF fuses wheel odometry and IMU data into a filtered pose estimate, providing the `odom → base_footprint` transform.
+
+**Navigation and Exploration Layer** — This is the decision-making core. The `FrontierDetector` identifies boundary cells between known free space and unknown regions and publishes them as candidate goals. The `ExplorationCoordinator` drives a six-phase state machine:
+
+| Phase | Description |
+|-------|-------------|
+| `INIT` | Waits for initial pose, map, and costmap readiness |
+| `EXPLORE` | Selects the best frontier and sends it as a Nav2 goal |
+| `OBSTACLE` | Detects close obstacles and triggers backup or recovery |
+| `RESCAN` | Rotates in place to update the map when progress stalls |
+| `RECOVERY` | Clears costmaps, retries goals, or blacklists bad frontiers |
+| `DONE` | Saves map and metrics when coverage criteria are satisfied |
+
+The Nav2 stack handles low-level path planning (NavFn/Smac planner), trajectory following (DWB/RPP controller), and recovery behaviors within each navigation attempt.
+
+**Motion and Safety Layer** — The `ArduinoMotorBridge` translates `cmd_vel` Twist messages into serial motor commands for the hardware platform. A LiDAR-based obstacle gate monitors the closest detected range and, when it falls below a configurable threshold, interrupts navigation and commands a backward escape maneuver. An optional ultrasonic sensor provides a redundant close-range emergency stop for cases where the LiDAR has blind spots.
+
+### Data and Control Flow
+
+1. Raw sensor data flows upward through the perception layer to produce a live map and filtered robot pose.
+2. The exploration layer uses the map and pose to identify frontiers, select goals, and issue action requests to Nav2.
+3. Nav2 converts goals into velocity commands that pass through the safety gate before reaching the motor bridge.
+4. Completion metrics (explored area, frontier count, coverage percentage) are logged continuously and persisted to CSV on mission end.
+
 ## Important System Parts
 
 1. Sensor Layer
